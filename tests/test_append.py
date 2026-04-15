@@ -128,12 +128,83 @@ def test_append_allow_new_adds_rows(append_args_factory, initialized_manifest, t
         pd.DataFrame({"sample_id": ["NEW_42"], "modkit_mean_meth": [0.5]}),
     )
     casetrack.cmd_append(
-        append_args_factory(results=str(results), analysis="modkit", allow_new=True)
+        append_args_factory(results=str(results), analysis="modkit",
+                            allow_new=True, yes=True)
     )
 
     df = _read(initialized_manifest)
     assert "NEW_42" in df["sample_id"].tolist()
     assert df.set_index("sample_id").loc["NEW_42", "modkit_mean_meth"] == 0.5
+
+
+def test_append_allow_new_without_yes_refuses(
+    append_args_factory, initialized_manifest, tmp_project, capsys
+):
+    """--allow-new without --yes must refuse to commit, list the ghost IDs
+    it would have added, exit 2, and leave the manifest unchanged."""
+    results = tmp_project / "r.tsv"
+    write_tsv(
+        results,
+        pd.DataFrame({
+            "sample_id": ["SAMPLE_TUOMR_042", "MC_Tumor_042"],
+            "modkit_mean_meth": [0.1, 0.2],
+        }),
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        casetrack.cmd_append(append_args_factory(
+            results=str(results), analysis="modkit", allow_new=True, yes=False,
+        ))
+    assert excinfo.value.code == 2
+
+    err = capsys.readouterr().err
+    assert "Refusing to add 2 new sample(s)" in err
+    assert "SAMPLE_TUOMR_042" in err
+    assert "MC_Tumor_042" in err
+    assert "--allow-new --yes" in err
+
+    # Manifest must not have grown.
+    df = _read(initialized_manifest)
+    assert "SAMPLE_TUOMR_042" not in df["sample_id"].tolist()
+    assert "MC_Tumor_042" not in df["sample_id"].tolist()
+    assert len(df) == 5
+
+
+def test_append_allow_new_yes_announces_additions(
+    append_args_factory, initialized_manifest, tmp_project, capsys
+):
+    results = tmp_project / "r.tsv"
+    write_tsv(
+        results,
+        pd.DataFrame({
+            "sample_id": ["NEW_42"], "modkit_mean_meth": [0.5],
+        }),
+    )
+    casetrack.cmd_append(append_args_factory(
+        results=str(results), analysis="modkit", allow_new=True, yes=True,
+    ))
+    err = capsys.readouterr().err
+    assert "Adding 1 new sample(s): NEW_42" in err
+
+
+def test_append_allow_new_yes_noop_when_no_unknowns(
+    append_args_factory, initialized_manifest, tmp_project, capsys
+):
+    """--allow-new --yes when every result id already exists is a silent no-op
+    for the announcement; the append itself still runs normally."""
+    results = tmp_project / "r.tsv"
+    write_tsv(
+        results,
+        pd.DataFrame({
+            "sample_id": ["SAMPLE_01"], "modkit_mean_meth": [0.5],
+        }),
+    )
+    casetrack.cmd_append(append_args_factory(
+        results=str(results), analysis="modkit", allow_new=True, yes=True,
+    ))
+    err = capsys.readouterr().err
+    assert "Adding" not in err  # no announcement when nothing new
+    df = _read(initialized_manifest)
+    assert df.set_index("sample_id").loc["SAMPLE_01", "modkit_mean_meth"] == 0.5
 
 
 def test_append_unknown_sample_without_allow_new_does_not_add(

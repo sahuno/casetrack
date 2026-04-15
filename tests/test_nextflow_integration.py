@@ -74,6 +74,20 @@ def test_module_references_casetrack_append_command():
     assert "--manifest" in src and "--results" in src and "--analysis" in src
 
 
+def test_module_pairs_allow_new_with_yes():
+    """The Nextflow module must pass --allow-new together with --yes so a
+    config-level opt-in serves as the confirmation. Passing --allow-new
+    alone from Nextflow would now be rejected by casetrack with exit 2."""
+    src = (NF_DIR / "casetrack.nf").read_text()
+    # Every occurrence of '--allow-new' in the module must also carry '--yes'.
+    allow_lines = [ln for ln in src.splitlines() if "--allow-new" in ln]
+    assert allow_lines, "expected at least one --allow-new occurrence in module"
+    for ln in allow_lines:
+        assert "--yes" in ln, (
+            f"--allow-new without --yes in module line: {ln!r}"
+        )
+
+
 def test_example_pipeline_includes_module():
     src = (NF_DIR / "example_pipeline.nf").read_text()
     assert "include { casetrack_append }" in src
@@ -95,8 +109,12 @@ def test_nextflow_config_has_apptainer_and_slurm_profiles():
 def _extract_casetrack_append_script(src: str) -> str:
     '''Return the literal text inside the triple-quoted `script:` block of
     the casetrack_append process. Preserves the shell command exactly.'''
+    # Scope to the casetrack_append process, then grab the first triple-
+    # quoted block that follows the `script:` label. The prelude between
+    # them can contain Groovy `def` lines, `//` comments, or be empty —
+    # we just want the shell body.
     m = re.search(
-        r"process\s+casetrack_append\s*\{.*?script:\s*(?:def\s+\w+\s*=\s*[^\n]+\n\s*)*\"{3}(?P<body>.*?)\"{3}",
+        r"process\s+casetrack_append\s*\{.*?script:\s*.*?\"{3}(?P<body>.*?)\"{3}",
         src, re.S,
     )
     assert m, "could not find script block in casetrack_append"
@@ -193,7 +211,9 @@ def test_nextflow_module_command_with_allow_new(
         "params.casetrack_extra":    "",
         "analysis":                  "modkit_methylation",
         "results_tsv":               str(results),
-        "allow_flag":                "--allow-new",
+        # Module emits both flags together when params.casetrack_allow_new
+        # is true — the Nextflow config file is itself the --yes confirmation.
+        "allow_flag":                "--allow-new --yes",
     })
     subprocess.run(
         ["bash", "-c", rendered],

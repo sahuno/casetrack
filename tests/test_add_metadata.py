@@ -29,6 +29,7 @@ def _meta_ns(manifest: Path, metadata: Path, **overrides):
         fill_only=False,
         overwrite=False,
         allow_new=False,
+        yes=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -187,6 +188,42 @@ def test_add_metadata_collision_plus_new_columns(
 # ── Unknown samples / --allow-new ──────────────────────────────────────────────
 
 
+def test_add_metadata_allow_new_without_yes_refuses(
+    initialized_manifest: Path, tmp_project: Path, capsys
+):
+    meta = tmp_project / "m.tsv"
+    write_tsv(meta, pd.DataFrame({
+        "sample_id": ["NEW_TYPO_1", "NEW_TYPO_2"],
+        "tissue": ["tumor", "normal"],
+    }))
+    with pytest.raises(SystemExit) as excinfo:
+        casetrack.cmd_add_metadata(
+            _meta_ns(initialized_manifest, meta, allow_new=True, yes=False)
+        )
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "Refusing to add 2 new sample(s)" in err
+    assert "NEW_TYPO_1" in err and "NEW_TYPO_2" in err
+    # Manifest unchanged.
+    df = _read(initialized_manifest)
+    assert len(df) == 5
+    assert "NEW_TYPO_1" not in df["sample_id"].tolist()
+
+
+def test_add_metadata_allow_new_yes_announces(
+    initialized_manifest: Path, tmp_project: Path, capsys
+):
+    meta = tmp_project / "m.tsv"
+    write_tsv(meta, pd.DataFrame({
+        "sample_id": ["NEW_42"], "tissue": ["tumor"],
+    }))
+    casetrack.cmd_add_metadata(
+        _meta_ns(initialized_manifest, meta, allow_new=True, yes=True)
+    )
+    err = capsys.readouterr().err
+    assert "Adding 1 new sample(s): NEW_42" in err
+
+
 def test_add_metadata_unknown_samples_default_skipped(
     initialized_manifest: Path, tmp_project: Path
 ):
@@ -207,7 +244,9 @@ def test_add_metadata_allow_new_adds_rows(
     write_tsv(meta, pd.DataFrame({
         "sample_id": ["NEW_42"], "tissue": ["tumor"]
     }))
-    casetrack.cmd_add_metadata(_meta_ns(initialized_manifest, meta, allow_new=True))
+    casetrack.cmd_add_metadata(
+        _meta_ns(initialized_manifest, meta, allow_new=True, yes=True)
+    )
     df = _read(initialized_manifest)
     assert "NEW_42" in df["sample_id"].tolist()
 

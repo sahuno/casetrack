@@ -52,7 +52,9 @@ process casetrack_append {
       tuple val(analysis), path(results_tsv)
 
     script:
-    def allow_flag = params.casetrack_allow_new ? '--allow-new' : ''
+    // Config-level `params.casetrack_allow_new = true` is itself the
+    // explicit confirmation, so we also pass --yes here.
+    def allow_flag = params.casetrack_allow_new ? '--allow-new --yes' : ''
     """
     ${params.casetrack_bin} append \\
         --manifest '${params.casetrack_manifest}' \\
@@ -76,9 +78,11 @@ process casetrack_add_metadata {
       path metadata_tsv
 
     script:
-    def allow_flag   = params.casetrack_allow_new ? '--allow-new' : ''
-    def fill_only    = params.containsKey('casetrack_fill_only') && params.casetrack_fill_only ? '--fill-only' : ''
-    def overwrite    = params.containsKey('casetrack_overwrite') && params.casetrack_overwrite ? '--overwrite' : ''
+    // Config-level `params.casetrack_allow_new = true` is itself the
+    // explicit confirmation, so we also pass --yes here.
+    def allow_flag = params.casetrack_allow_new ? '--allow-new --yes' : ''
+    def fill_only  = params.containsKey('casetrack_fill_only') && params.casetrack_fill_only ? '--fill-only' : ''
+    def overwrite  = params.containsKey('casetrack_overwrite') && params.casetrack_overwrite ? '--overwrite' : ''
     """
     ${params.casetrack_bin} add-metadata \\
         --manifest '${params.casetrack_manifest}' \\

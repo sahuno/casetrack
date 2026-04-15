@@ -102,6 +102,7 @@ def append_args_factory(tmp_project: Path):
             analysis="modkit",
             overwrite=False,
             allow_new=False,
+            yes=False,
         )
         defaults.update(overrides)
         return argparse.Namespace(**defaults)

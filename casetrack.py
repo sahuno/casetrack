@@ -314,7 +314,27 @@ def cmd_append(args):
         if unknown and not args.allow_new:
             print(
                 f"Warning: {len(unknown)} sample(s) in results not in manifest: {sorted(unknown)[:5]}...\n"
-                f"Use --allow-new to add them as new rows.",
+                f"Use --allow-new --yes to add them as new rows.",
+                file=sys.stderr,
+            )
+        elif unknown and args.allow_new and not args.yes:
+            preview = sorted(unknown)[:20]
+            suffix = (f"\n  ... and {len(unknown) - 20} more"
+                      if len(unknown) > 20 else "")
+            print(
+                f"Refusing to add {len(unknown)} new sample(s) without --yes.\n"
+                f"New IDs that would be added:\n  "
+                + "\n  ".join(preview) + suffix + "\n"
+                f"Re-run with --allow-new --yes to commit.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        elif unknown and args.allow_new and args.yes:
+            preview = sorted(unknown)[:5]
+            more = f" (+ {len(unknown) - 5} more)" if len(unknown) > 5 else ""
+            print(
+                f"Adding {len(unknown)} new sample(s): "
+                f"{', '.join(preview)}{more}",
                 file=sys.stderr,
             )
 
@@ -720,7 +740,27 @@ def cmd_add_metadata(args):
             print(
                 f"Warning: {len(unknown)} sample(s) in metadata not in manifest: "
                 f"{sorted(unknown)[:5]}...\n"
-                f"Use --allow-new to add them as new rows.",
+                f"Use --allow-new --yes to add them as new rows.",
+                file=sys.stderr,
+            )
+        elif unknown and args.allow_new and not args.yes:
+            preview = sorted(unknown)[:20]
+            suffix = (f"\n  ... and {len(unknown) - 20} more"
+                      if len(unknown) > 20 else "")
+            print(
+                f"Refusing to add {len(unknown)} new sample(s) without --yes.\n"
+                f"New IDs that would be added:\n  "
+                + "\n  ".join(preview) + suffix + "\n"
+                f"Re-run with --allow-new --yes to commit.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        elif unknown and args.allow_new and args.yes:
+            preview = sorted(unknown)[:5]
+            more = f" (+ {len(unknown) - 5} more)" if len(unknown) > 5 else ""
+            print(
+                f"Adding {len(unknown)} new sample(s): "
+                f"{', '.join(preview)}{more}",
                 file=sys.stderr,
             )
 
@@ -1230,7 +1270,8 @@ Examples:
     p_append.add_argument("--key", default="sample_id", help="Key column to join on (default: sample_id)")
     p_append.add_argument("--analysis", required=True, help="Name of this analysis (e.g. modkit_methylation)")
     p_append.add_argument("--overwrite", action="store_true", help="Overwrite existing columns")
-    p_append.add_argument("--allow-new", action="store_true", help="Allow new sample IDs not in manifest")
+    p_append.add_argument("--allow-new", action="store_true", help="Allow new sample IDs not in manifest (requires --yes to commit)")
+    p_append.add_argument("--yes", action="store_true", help="Confirm --allow-new additions non-interactively")
 
     # ── status ──
     p_status = subparsers.add_parser("status", help="Show completion status")
@@ -1277,7 +1318,8 @@ Examples:
     p_meta.add_argument("--key", default="sample_id", help="Key column to join on (default: sample_id)")
     p_meta.add_argument("--fill-only", action="store_true", help="On column collision, fill NaN cells only (smart merge)")
     p_meta.add_argument("--overwrite", action="store_true", help="On column collision, replace existing columns")
-    p_meta.add_argument("--allow-new", action="store_true", help="Allow new sample IDs not in manifest")
+    p_meta.add_argument("--allow-new", action="store_true", help="Allow new sample IDs not in manifest (requires --yes to commit)")
+    p_meta.add_argument("--yes", action="store_true", help="Confirm --allow-new additions non-interactively")
 
     # ── dashboard ──
     p_dash = subparsers.add_parser(
