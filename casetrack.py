@@ -14,8 +14,9 @@ Usage:
     casetrack log       --manifest manifest.tsv [--last N]
     casetrack schema    --manifest manifest.tsv [--fmt table|json]
     casetrack rerun     --manifest manifest.tsv --analysis tldr --script run_tldr.sh [--submit]
-    casetrack dashboard --manifest manifest.tsv --output dashboard.html
-    casetrack export    --manifest manifest.tsv --output out.xlsx
+    casetrack dashboard    --manifest manifest.tsv --output dashboard.html
+    casetrack add-metadata --manifest manifest.tsv --metadata clinical.tsv --key sample_id
+    casetrack export       --manifest manifest.tsv --output out.xlsx
 
 Author: Samuel Ahuno (sahuno)
 """
@@ -507,6 +508,115 @@ def cmd_schema(args):
             print(f"{analysis:<25} {cols:<40} {added_by:<12} {added}")
 
 
+def cmd_add_metadata(args):
+    """Attach metadata columns to an existing manifest without the analysis
+    append path: no `_done` timestamp, no schema entry.
+
+    Default collision policy is strict — refuse to touch existing columns.
+    Use `--fill-only` to fill NaN cells (smart merge) or `--overwrite` to
+    replace existing columns wholesale.
+    """
+    manifest_path = args.manifest
+    metadata_path = args.metadata
+    key_col = args.key
+
+    if not os.path.exists(manifest_path):
+        print(f"Error: manifest not found: {manifest_path}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(metadata_path):
+        print(f"Error: metadata file not found: {metadata_path}", file=sys.stderr)
+        sys.exit(1)
+    if args.overwrite and args.fill_only:
+        print("Error: --overwrite and --fill-only are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+
+    metadata = pd.read_csv(metadata_path, sep="\t")
+    if key_col not in metadata.columns:
+        print(
+            f"Error: key column '{key_col}' not in metadata file. "
+            f"Columns: {list(metadata.columns)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    new_cols = [c for c in metadata.columns if c != key_col]
+    if not new_cols:
+        print("Error: metadata file has no columns besides the key.", file=sys.stderr)
+        sys.exit(1)
+
+    with ManifestLock(manifest_path):
+        manifest = pd.read_csv(manifest_path, sep="\t")
+        if key_col not in manifest.columns:
+            print(
+                f"Error: key column '{key_col}' not in manifest. "
+                f"Columns: {list(manifest.columns)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        metadata_keys = set(metadata[key_col].astype(str))
+        manifest_keys = set(manifest[key_col].astype(str))
+        unknown = metadata_keys - manifest_keys
+        if unknown and not args.allow_new:
+            print(
+                f"Warning: {len(unknown)} sample(s) in metadata not in manifest: "
+                f"{sorted(unknown)[:5]}...\n"
+                f"Use --allow-new to add them as new rows.",
+                file=sys.stderr,
+            )
+
+        existing_cols = set(manifest.columns)
+        collisions = [c for c in new_cols if c in existing_cols]
+
+        if collisions and not (args.overwrite or args.fill_only):
+            print(
+                f"Error: {len(collisions)} column(s) already present in manifest: "
+                f"{collisions}\n"
+                f"Re-run with --fill-only to fill NaN cells, or --overwrite to "
+                f"replace existing values.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if collisions and args.overwrite:
+            manifest = manifest.drop(columns=collisions)
+            print(f"Overwriting existing columns: {collisions}", file=sys.stderr)
+            how = "outer" if args.allow_new else "left"
+            merged = manifest.merge(metadata, on=key_col, how=how)
+        elif collisions and args.fill_only:
+            merged = fill_nan_cells(manifest, metadata, key_col, collisions)
+            new_only = [c for c in new_cols if c not in existing_cols]
+            if new_only:
+                metadata_new = metadata[[key_col] + new_only]
+                how = "outer" if args.allow_new else "left"
+                merged = merged.merge(metadata_new, on=key_col, how=how)
+        else:
+            how = "outer" if args.allow_new else "left"
+            merged = manifest.merge(metadata, on=key_col, how=how)
+
+        merged.to_csv(manifest_path, sep="\t", index=False)
+
+    samples_updated = len(metadata_keys & manifest_keys)
+    log_provenance(manifest_path, {
+        "action": "add-metadata",
+        "metadata_file": str(metadata_path),
+        "metadata_checksum": _checksum(metadata_path),
+        "columns_added": new_cols,
+        "collisions": collisions,
+        "collision_policy": (
+            "overwrite" if args.overwrite
+            else ("fill-only" if args.fill_only else "none")
+        ),
+        "samples_updated": samples_updated,
+        "samples_new": len(unknown) if args.allow_new else 0,
+    })
+
+    print(
+        f"Added {len(new_cols)} metadata column(s) for {samples_updated} "
+        f"sample(s)."
+    )
+
+
 def _render_dashboard_html(manifest, key_col: str, done_cols: list,
                            prov_entries: list, schema: dict,
                            manifest_path: str, prov_limit: int = 100) -> str:
@@ -977,6 +1087,18 @@ Examples:
     p_schema.add_argument("--manifest", required=True, help="Path to manifest TSV")
     p_schema.add_argument("--fmt", choices=["table", "json"], default="table", help="Output format")
 
+    # ── add-metadata ──
+    p_meta = subparsers.add_parser(
+        "add-metadata",
+        help="Add metadata columns to an existing manifest (no analysis _done column)",
+    )
+    p_meta.add_argument("--manifest", required=True, help="Path to manifest TSV")
+    p_meta.add_argument("--metadata", required=True, help="Path to metadata TSV (must include key column)")
+    p_meta.add_argument("--key", default="sample_id", help="Key column to join on (default: sample_id)")
+    p_meta.add_argument("--fill-only", action="store_true", help="On column collision, fill NaN cells only (smart merge)")
+    p_meta.add_argument("--overwrite", action="store_true", help="On column collision, replace existing columns")
+    p_meta.add_argument("--allow-new", action="store_true", help="Allow new sample IDs not in manifest")
+
     # ── dashboard ──
     p_dash = subparsers.add_parser(
         "dashboard", help="Generate a self-contained HTML dashboard"
@@ -1018,6 +1140,7 @@ Examples:
         "schema": cmd_schema,
         "rerun": cmd_rerun,
         "dashboard": cmd_dashboard,
+        "add-metadata": cmd_add_metadata,
         "export": cmd_export,
     }
 
