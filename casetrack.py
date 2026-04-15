@@ -79,6 +79,60 @@ class ManifestLock:
 
 # ── Provenance Logging ─────────────────────────────────────────────────────────
 
+_GIT_STATE_CACHE = {}
+
+
+def _git_state(cwd: str = None, use_cache: bool = True) -> dict:
+    """Capture minimal git state of `cwd` (defaults to process CWD).
+
+    Returns {commit, branch, dirty, toplevel} or None if not in a repo, if
+    git is unavailable, if the calls time out, or if the caller has opted
+    out via CASETRACK_NO_GIT=1. Never raises — provenance must not break
+    because of a missing git binary.
+
+    Results are memoized per-process on `(cwd, CASETRACK_NO_GIT)` so a CLI
+    invocation that writes many provenance entries (e.g. a parallel rerun)
+    only pays for git once.
+    """
+    no_git = os.environ.get("CASETRACK_NO_GIT") or ""
+    cache_key = (cwd or os.getcwd(), no_git)
+    if use_cache and cache_key in _GIT_STATE_CACHE:
+        return _GIT_STATE_CACHE[cache_key]
+
+    if no_git:
+        _GIT_STATE_CACHE[cache_key] = None
+        return None
+
+    import subprocess
+
+    def _run(*args):
+        try:
+            return subprocess.run(
+                ["git", *args], cwd=cwd,
+                capture_output=True, text=True, timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+
+    top = _run("rev-parse", "--show-toplevel")
+    if top is None or top.returncode != 0 or not top.stdout.strip():
+        _GIT_STATE_CACHE[cache_key] = None
+        return None
+
+    commit = _run("rev-parse", "HEAD")
+    branch = _run("rev-parse", "--abbrev-ref", "HEAD")
+    status = _run("status", "--porcelain")
+
+    result = {
+        "commit": (commit.stdout.strip() if commit and commit.returncode == 0 else None),
+        "branch": (branch.stdout.strip() if branch and branch.returncode == 0 else None),
+        "dirty": bool(status.stdout.strip()) if (status and status.returncode == 0) else None,
+        "toplevel": top.stdout.strip(),
+    }
+    _GIT_STATE_CACHE[cache_key] = result
+    return result
+
+
 def log_provenance(manifest_path: str, entry: dict):
     """Append a provenance record as a JSONL line."""
     log_path = manifest_path + PROVENANCE_SUFFIX
@@ -87,6 +141,7 @@ def log_provenance(manifest_path: str, entry: dict):
     entry["hostname"] = os.environ.get("HOSTNAME", "unknown")
     entry["slurm_job_id"] = os.environ.get("SLURM_JOB_ID", None)
     entry["slurm_array_task_id"] = os.environ.get("SLURM_ARRAY_TASK_ID", None)
+    entry["git"] = _git_state()
 
     with open(log_path, "a") as f:
         f.write(json.dumps(entry, default=str) + "\n")
@@ -909,9 +964,17 @@ def _render_dashboard_html(manifest, key_col: str, done_cols: list,
             detail = " — " + "; ".join(esc(p) for p in detail_parts) if detail_parts else ""
             job_str = f" [SLURM {esc(str(job))}]" if job else ""
             analysis_str = f" <i>({esc(analysis)})</i>" if analysis else ""
+            git = entry.get("git") or {}
+            git_str = ""
+            if git.get("commit"):
+                short = git["commit"][:8]
+                dirty_mark = "*" if git.get("dirty") else ""
+                branch = git.get("branch") or ""
+                branch_str = f"@{esc(branch)}" if branch and branch != "HEAD" else ""
+                git_str = f" · <code>{esc(short)}{dirty_mark}{branch_str}</code>"
             timeline_html.append(
                 f'<li>{esc(ts)} · <b>{esc(action)}</b>{analysis_str} · {esc(user)}'
-                f'{job_str}{detail}</li>'
+                f'{job_str}{git_str}{detail}</li>'
             )
         if len(prov_entries) > prov_limit:
             timeline_html.append(
