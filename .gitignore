@@ -22,3 +22,7 @@ Thumbs.db
 .idea/
 *.swp
 *~
+
+# Local transcripts (save-last output, etc. — not project artifacts)
+.docs/
+

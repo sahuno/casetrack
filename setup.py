@@ -13,7 +13,8 @@ setup(
     extras_require={
         "excel": ["openpyxl>=3.0"],
         "parquet": ["pyarrow>=10.0"],
-        "all": ["openpyxl>=3.0", "pyarrow>=10.0"],
+        "query": ["duckdb>=0.9"],
+        "all": ["openpyxl>=3.0", "pyarrow>=10.0", "duckdb>=0.9"],
     },
     entry_points={
         "console_scripts": [
