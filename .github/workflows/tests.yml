@@ -29,6 +29,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
+          cache-dependency-path: setup.py
 
       - name: Install test + optional-export deps
         run: |
