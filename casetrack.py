@@ -16,6 +16,7 @@ Usage:
     casetrack rerun     --manifest manifest.tsv --analysis tldr --script run_tldr.sh [--submit]
     casetrack dashboard    --manifest manifest.tsv --output dashboard.html
     casetrack add-metadata --manifest manifest.tsv --metadata clinical.tsv --key sample_id
+    casetrack projects     --root ~/projects/
     casetrack export       --manifest manifest.tsv --output out.xlsx
 
 Author: Samuel Ahuno (sahuno)
@@ -506,6 +507,109 @@ def cmd_schema(args):
             added_by = info.get("added_by", "?")
             added = info.get("added", "?")
             print(f"{analysis:<25} {cols:<40} {added_by:<12} {added}")
+
+
+def _find_project_manifests(root: Path, pattern: str, max_depth: int) -> list:
+    """Yield manifest paths under `root` up to `max_depth` directories deep.
+
+    Hidden directories (dot-prefixed) and any directory literally named
+    "sandbox" are skipped.
+    """
+    root = root.resolve()
+    matches = []
+    for p in root.rglob(pattern):
+        if not p.is_file():
+            continue
+        try:
+            rel_parts = p.resolve().relative_to(root).parts
+        except ValueError:
+            continue
+        # Depth = number of path parts above the file itself.
+        depth = len(rel_parts) - 1
+        if depth > max_depth:
+            continue
+        # Skip hidden + sandbox anywhere along the path (but not in the filename).
+        if any(part.startswith(".") or part == "sandbox" for part in rel_parts[:-1]):
+            continue
+        matches.append(p)
+    return matches
+
+
+def _summarize_project(manifest_path: Path, key_col: str) -> dict:
+    """Compute the cross-project stats for a single manifest."""
+    df = pd.read_csv(manifest_path, sep="\t")
+    n_samples = len(df)
+    done_cols = [c for c in df.columns if c.endswith(DONE_COLUMN_SUFFIX)]
+    total_cells = n_samples * len(done_cols)
+    completed = int(sum(df[dc].notna().sum() for dc in done_cols))
+    pct = round(100.0 * completed / total_cells, 1) if total_cells else 0.0
+    return {
+        "name": manifest_path.parent.name,
+        "path": str(manifest_path),
+        "samples": n_samples,
+        "analyses": len(done_cols),
+        "completed_cells": completed,
+        "total_cells": total_cells,
+        "pct": pct,
+    }
+
+
+def cmd_projects(args):
+    """Scan `--root` for manifests and summarize cross-project status."""
+    root = Path(args.root)
+    if not root.exists() or not root.is_dir():
+        print(f"Error: root not found or not a directory: {root}", file=sys.stderr)
+        sys.exit(1)
+
+    manifests = _find_project_manifests(root, args.pattern, args.max_depth)
+
+    projects = []
+    for mpath in manifests:
+        try:
+            projects.append(_summarize_project(mpath, args.key))
+        except Exception as e:  # noqa: BLE001 — per-project isolation is intentional
+            print(
+                f"Warning: failed to summarize {mpath}: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+
+    projects.sort(key=lambda p: p["name"])
+
+    if not projects:
+        print(
+            f"No manifests found under {root} "
+            f"(pattern={args.pattern!r}, max-depth={args.max_depth})."
+        )
+        return
+
+    if args.fmt == "json":
+        print(json.dumps(projects, indent=2, default=str))
+        return
+
+    if args.fmt == "tsv":
+        print("project\tpath\tsamples\tanalyses\tcompleted_cells\ttotal_cells\tpct")
+        for p in projects:
+            print(
+                f"{p['name']}\t{p['path']}\t{p['samples']}\t{p['analyses']}\t"
+                f"{p['completed_cells']}\t{p['total_cells']}\t{p['pct']}"
+            )
+        return
+
+    # table
+    name_w = max(12, max(len(p["name"]) for p in projects))
+    header = f"{'Project':<{name_w}}  {'Samples':>7}  {'Analyses':>8}  {'Complete':>9}"
+    sep = "─" * (name_w + 32)
+    print("")
+    print(header)
+    print(sep)
+    for p in projects:
+        print(
+            f"{p['name']:<{name_w}}  {p['samples']:>7}  {p['analyses']:>8}  "
+            f"{p['pct']:>7.1f}% "
+            + ("█" * int(p["pct"] / 10) + "░" * (10 - int(p["pct"] / 10)))
+        )
+    print(sep)
+    print(f"{len(projects)} project(s) under {root}")
 
 
 def cmd_add_metadata(args):
@@ -1087,6 +1191,19 @@ Examples:
     p_schema.add_argument("--manifest", required=True, help="Path to manifest TSV")
     p_schema.add_argument("--fmt", choices=["table", "json"], default="table", help="Output format")
 
+    # ── projects ──
+    p_projects = subparsers.add_parser(
+        "projects", help="Cross-project overview: scan a root for manifests"
+    )
+    p_projects.add_argument("--root", required=True, help="Root directory to scan")
+    p_projects.add_argument("--pattern", default="manifest.tsv",
+                            help="Manifest filename pattern (default: manifest.tsv)")
+    p_projects.add_argument("--max-depth", type=int, default=4,
+                            help="Maximum directory depth to scan (default: 4)")
+    p_projects.add_argument("--key", default="sample_id", help="Key column name")
+    p_projects.add_argument("--fmt", choices=["table", "tsv", "json"], default="table",
+                            help="Output format")
+
     # ── add-metadata ──
     p_meta = subparsers.add_parser(
         "add-metadata",
@@ -1141,6 +1258,7 @@ Examples:
         "rerun": cmd_rerun,
         "dashboard": cmd_dashboard,
         "add-metadata": cmd_add_metadata,
+        "projects": cmd_projects,
         "export": cmd_export,
     }
 
