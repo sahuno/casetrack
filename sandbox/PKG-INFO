@@ -1,0 +1,13 @@
+Metadata-Version: 2.1
+Name: casetrack
+Version: 0.1.0
+Summary: Manifest-centric case management for bioinformatics pipelines
+Author: Samuel Ahuno
+Author-email: sahuno@mskcc.org
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: Scientific/Engineering :: Bio-Informatics
+Classifier: Environment :: Console
+Requires-Python: >=3.8
+Provides-Extra: all
+Provides-Extra: excel
+Provides-Extra: parquet

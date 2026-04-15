@@ -1,0 +1,9 @@
+README.md
+casetrack.py
+setup.py
+casetrack.egg-info/PKG-INFO
+casetrack.egg-info/SOURCES.txt
+casetrack.egg-info/dependency_links.txt
+casetrack.egg-info/entry_points.txt
+casetrack.egg-info/requires.txt
+casetrack.egg-info/top_level.txt
