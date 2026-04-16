@@ -81,6 +81,31 @@ LEVEL_ORDER = ("patient", "specimen", "assay")
 # Default pragma values for every SQLite connection casetrack opens.
 SQLITE_BUSY_TIMEOUT_MS = 30000
 
+# Emitted once per invocation; silenced by CASETRACK_NO_DEPRECATION=1.
+_DEPRECATION_EMITTED = False
+
+
+def _warn_flat_deprecation():
+    """Warn loudly (but once) that --manifest flat mode is on its way out.
+
+    Gated by the env var so CI and batch scripts can silence cleanly.
+    """
+    global _DEPRECATION_EMITTED
+    if _DEPRECATION_EMITTED:
+        return
+    if os.environ.get("CASETRACK_NO_DEPRECATION"):
+        return
+    _DEPRECATION_EMITTED = True
+    print(
+        "DeprecationWarning: flat-manifest mode (--manifest) is deprecated in "
+        "v0.3 and will be removed in v1.0.\n"
+        "  Migrate with: casetrack migrate --flat M.tsv --patient-col ... "
+        "--specimen-col ... --assay-col ... --out-dir D/\n"
+        "  Then switch to --project-dir. Silence this warning with "
+        "CASETRACK_NO_DEPRECATION=1.",
+        file=sys.stderr,
+    )
+
 
 # ── v0.3 TOML schema ───────────────────────────────────────────────────────────
 #
@@ -672,6 +697,7 @@ def _project_gitignore_contents() -> str:
 
 def cmd_init_flat(args):
     """Initialize a new flat-manifest (v0.2 style)."""
+    _warn_flat_deprecation()
     manifest_path = args.manifest
 
     if not getattr(args, "samples", None):
@@ -741,6 +767,7 @@ def cmd_append(args):
 
 def cmd_append_flat(args):
     """Append analysis results as new columns to the manifest."""
+    _warn_flat_deprecation()
     manifest_path = args.manifest
     results_path = args.results
     key_col = args.key
@@ -866,6 +893,7 @@ def cmd_status(args):
 
 def cmd_status_flat(args):
     """Show completion status across analyses."""
+    _warn_flat_deprecation()
     manifest_path = args.manifest
 
     if not os.path.exists(manifest_path):
@@ -946,6 +974,7 @@ def cmd_validate(args):
 
 def cmd_validate_flat(args):
     """Validate manifest integrity."""
+    _warn_flat_deprecation()
     manifest_path = args.manifest
     key_col = args.key
 
@@ -1019,6 +1048,7 @@ def cmd_log(args):
 
 def cmd_log_flat(args):
     """Show provenance log entries."""
+    _warn_flat_deprecation()
     manifest_path = args.manifest
     log_path = manifest_path + PROVENANCE_SUFFIX
 
@@ -1056,6 +1086,7 @@ def cmd_log_flat(args):
 
 def cmd_schema(args):
     """Show which analysis added which columns."""
+    _warn_flat_deprecation()
     manifest_path = args.manifest
     schema_path = manifest_path + SCHEMA_SUFFIX
 
@@ -1183,6 +1214,13 @@ def cmd_projects(args):
 
 
 def cmd_add_metadata(args):
+    """Dispatch `casetrack add-metadata` to flat or project mode."""
+    if getattr(args, "project_dir", None):
+        return cmd_add_metadata_project(args)
+    return cmd_add_metadata_flat(args)
+
+
+def cmd_add_metadata_flat(args):
     """Attach metadata columns to an existing manifest without the analysis
     append path: no `_done` timestamp, no schema entry.
 
@@ -1190,6 +1228,7 @@ def cmd_add_metadata(args):
     Use `--fill-only` to fill NaN cells (smart merge) or `--overwrite` to
     replace existing columns wholesale.
     """
+    _warn_flat_deprecation()
     manifest_path = args.manifest
     metadata_path = args.metadata
     key_col = args.key
@@ -1319,6 +1358,8 @@ def _sql_escape(s: str) -> str:
 def cmd_query(args):
     """Run a SQL query against one manifest (--manifest) or a union of many
     (--root) via DuckDB. The manifest is exposed as table `_` by default."""
+    if getattr(args, "manifest", None):
+        _warn_flat_deprecation()
     try:
         import duckdb as _duckdb
     except ImportError:
@@ -1638,6 +1679,7 @@ def _render_dashboard_html(manifest, key_col: str, done_cols: list,
 
 def cmd_dashboard(args):
     """Generate a self-contained HTML dashboard from the manifest."""
+    _warn_flat_deprecation()
     manifest_path = args.manifest
     output_path = args.output
 
@@ -1688,6 +1730,7 @@ def cmd_dashboard(args):
 
 def cmd_rerun(args):
     """Generate (or submit) SLURM commands for samples missing a given analysis."""
+    _warn_flat_deprecation()
     manifest_path = args.manifest
     analysis = args.analysis
 
@@ -1785,6 +1828,7 @@ def cmd_rerun(args):
 
 def cmd_export(args):
     """Export manifest to other formats."""
+    _warn_flat_deprecation()
     manifest_path = args.manifest
     output_path = args.output
 
@@ -2745,6 +2789,230 @@ def cmd_append_project(args):
     )
 
 
+# ── v0.3 add-metadata (bulk UPDATE / INSERT) ──────────────────────────────────
+#
+# `casetrack add-metadata --project-dir DIR --level LEVEL --metadata TSV`
+# is the bulk companion to `register`. The TSV must start with the level's
+# key column; remaining columns are treated as metadata to merge into the
+# target table under fill-only (default) or --overwrite semantics.
+#
+# Rows whose key doesn't exist require `--allow-new --yes` to insert. Every
+# inserted row must also carry a valid parent_key; we do not create parent
+# stubs from add-metadata (use `register --allow-new-parent` for that).
+
+
+class _MetadataRouting(Exception):
+    """Raised inside the add-metadata transaction on missing keys without
+    --allow-new, so begin_immediate rolls back any schema mutations."""
+
+    def __init__(self, missing_keys: set, missing_parents: set):
+        self.missing_keys = missing_keys
+        self.missing_parents = missing_parents
+        super().__init__(
+            f"{len(missing_keys)} missing key(s), "
+            f"{len(missing_parents)} missing parent(s)"
+        )
+
+
+def cmd_add_metadata_project(args):
+    project_dir, schema = _resolve_project(args.project_dir)
+    level = args.level
+    if level not in LEVEL_ORDER:
+        print(
+            f"Error: --level must be one of {list(LEVEL_ORDER)}, got {level!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.overwrite and args.fill_only:
+        print("Error: --overwrite and --fill-only are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+    if args.allow_new and not args.yes:
+        print(
+            "Error: --allow-new requires --yes to commit inserts.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    metadata_path = Path(args.metadata)
+    if not metadata_path.exists():
+        print(f"Error: metadata file not found: {metadata_path}", file=sys.stderr)
+        sys.exit(1)
+
+    level_spec = schema["levels"][level]
+    table = f"{level}s"
+    key_col = level_spec["key"]
+    parent_key_col = level_spec.get("parent_key")
+    parent_level = level_spec.get("parent")
+
+    metadata = pd.read_csv(metadata_path, sep="\t")
+    if key_col not in metadata.columns:
+        print(
+            f"Error: key column {key_col!r} not in {metadata_path}. "
+            f"Columns: {list(metadata.columns)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    meta_cols = [c for c in metadata.columns if c != key_col]
+    if not meta_cols:
+        print(
+            f"Error: {metadata_path} has no columns besides {key_col!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Validate every column is declared in the schema.
+    declared_cols = set(level_spec["columns"])
+    unknown = [c for c in meta_cols if c not in declared_cols]
+    if unknown:
+        print(
+            f"Error: columns not declared in casetrack.toml: {unknown}\n"
+            f"Declare them under [levels.{level}.columns] first, or use "
+            f"`casetrack append` (which auto-adds analysis columns).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # If inserting, the parent FK column must be in the TSV for specimen/assay.
+    if args.allow_new and parent_key_col and parent_key_col not in metadata.columns:
+        print(
+            f"Error: --allow-new at --level {level} requires column "
+            f"{parent_key_col!r} in {metadata_path} (parent FK).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    db_path = project_dir / PROJECT_DB_NAME
+    conn = open_project_db(db_path)
+    executed_sql: list[str] = []
+    n_updated = 0
+    n_inserted = 0
+
+    try:
+        with begin_immediate(conn):
+            existing_keys = {
+                str(r[0]) for r in conn.execute(
+                    f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
+                ).fetchall()
+            }
+            tsv_keys = metadata[key_col].astype(str).tolist()
+            tsv_key_set = set(tsv_keys)
+            missing_keys = tsv_key_set - existing_keys
+
+            # If we're inserting, validate parents first.
+            missing_parents: set = set()
+            if missing_keys and args.allow_new and parent_level:
+                new_rows = metadata[metadata[key_col].astype(str).isin(missing_keys)]
+                parent_col = parent_key_col
+                parents_needed = set(new_rows[parent_col].astype(str))
+                parent_table = f"{parent_level}s"
+                parents_have = {
+                    str(r[0]) for r in conn.execute(
+                        f"SELECT {_quote_ident(parent_col)} FROM {_quote_ident(parent_table)}"
+                    ).fetchall()
+                }
+                missing_parents = parents_needed - parents_have
+
+            if missing_keys and not args.allow_new:
+                raise _MetadataRouting(missing_keys, set())
+            if missing_parents:
+                raise _MetadataRouting(set(), missing_parents)
+
+            # UPDATEs for existing keys.
+            update_keys = [k for k in tsv_keys if k in existing_keys]
+            if update_keys:
+                if args.overwrite:
+                    set_clauses = ", ".join(f"{_quote_ident(c)} = ?" for c in meta_cols)
+                else:
+                    # Default = fill-only (matches v0.2 add-metadata default).
+                    set_clauses = ", ".join(
+                        f"{_quote_ident(c)} = COALESCE({_quote_ident(c)}, ?)"
+                        for c in meta_cols
+                    )
+                update_sql = (
+                    f"UPDATE {_quote_ident(table)} SET {set_clauses} "
+                    f"WHERE {_quote_ident(key_col)} = ?"
+                )
+                executed_sql.append(update_sql)
+                idx_by_key = {
+                    str(metadata.iloc[i][key_col]): i for i in range(len(metadata))
+                }
+                for k in update_keys:
+                    row = metadata.iloc[idx_by_key[k]]
+                    values = tuple(_coerce_for_sqlite(row[c]) for c in meta_cols)
+                    values += (k,)
+                    conn.execute(update_sql, values)
+                    n_updated += 1
+
+            # INSERTs for new keys.
+            if args.allow_new and missing_keys:
+                new_rows = metadata[metadata[key_col].astype(str).isin(missing_keys)]
+                insert_cols = [key_col] + meta_cols
+                quoted_cols = ", ".join(_quote_ident(c) for c in insert_cols)
+                placeholders = ", ".join("?" * len(insert_cols))
+                insert_sql = (
+                    f"INSERT INTO {_quote_ident(table)} "
+                    f"({quoted_cols}) VALUES ({placeholders})"
+                )
+                executed_sql.append(insert_sql)
+                for _, row in new_rows.iterrows():
+                    values = tuple(
+                        _coerce_for_sqlite(row[c]) for c in insert_cols
+                    )
+                    conn.execute(insert_sql, values)
+                    n_inserted += 1
+
+    except _MetadataRouting as e:
+        conn.close()
+        if e.missing_keys:
+            preview = sorted(e.missing_keys)[:5]
+            print(
+                f"Error: {len(e.missing_keys)} key(s) in {metadata_path} do not "
+                f"exist in table {table!r}: {preview}"
+                f"{'…' if len(e.missing_keys) > 5 else ''}\n"
+                f"Pass --allow-new --yes to create new rows.",
+                file=sys.stderr,
+            )
+        else:
+            preview = sorted(e.missing_parents)[:5]
+            print(
+                f"Error: {len(e.missing_parents)} parent {parent_level}(s) not found: "
+                f"{preview}{'…' if len(e.missing_parents) > 5 else ''}\n"
+                f"Register them first with `casetrack register --level "
+                f"{parent_level} --id ...`.",
+                file=sys.stderr,
+            )
+        sys.exit(2)
+    except sqlite3.IntegrityError as e:
+        conn.close()
+        print(f"Error: add-metadata aborted — {type(e).__name__}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if conn:
+            conn.close()
+
+    log_project_provenance(project_dir, {
+        "action": "add_metadata",
+        "level": level,
+        "metadata_file": str(metadata_path),
+        "metadata_checksum": _checksum(str(metadata_path)),
+        "columns": meta_cols,
+        "rows_updated": n_updated,
+        "rows_inserted": n_inserted,
+        "mode": "overwrite" if args.overwrite else ("fill_only" if args.fill_only else "fill_only"),
+        "transaction_id": _new_transaction_id(),
+        "sql": executed_sql,
+        "schema_v_before": schema["project"]["schema_v"],
+        "schema_v_after": schema["project"]["schema_v"],
+    })
+
+    print(
+        f"add-metadata → {level}: "
+        f"updated={n_updated}, inserted={n_inserted}, columns={len(meta_cols)}."
+    )
+
+
 # ── v0.3 status ────────────────────────────────────────────────────────────────
 #
 # Implements `casetrack status --project-dir` per proposal 0001 §7.1. Four
@@ -3323,15 +3591,28 @@ Examples:
     # ── add-metadata ──
     p_meta = subparsers.add_parser(
         "add-metadata",
-        help="Add metadata columns to an existing manifest (no analysis _done column)",
+        help="Bulk-add metadata to a manifest (flat) or a project level (v0.3 SQLite)",
     )
-    p_meta.add_argument("--manifest", required=True, help="Path to manifest TSV")
-    p_meta.add_argument("--metadata", required=True, help="Path to metadata TSV (must include key column)")
-    p_meta.add_argument("--key", default="sample_id", help="Key column to join on (default: sample_id)")
-    p_meta.add_argument("--fill-only", action="store_true", help="On column collision, fill NaN cells only (smart merge)")
-    p_meta.add_argument("--overwrite", action="store_true", help="On column collision, replace existing columns")
-    p_meta.add_argument("--allow-new", action="store_true", help="Allow new sample IDs not in manifest (requires --yes to commit)")
-    p_meta.add_argument("--yes", action="store_true", help="Confirm --allow-new additions non-interactively")
+    g_meta_target = p_meta.add_mutually_exclusive_group(required=True)
+    g_meta_target.add_argument("--manifest", help="[flat mode] Path to manifest TSV")
+    g_meta_target.add_argument("--project-dir", help="[project mode] Casetrack project directory")
+    p_meta.add_argument("--metadata", required=True,
+                        help="Path to metadata TSV (must include level's key column)")
+    p_meta.add_argument("--key", default="sample_id",
+                        help="[flat mode] Key column to join on (default: sample_id)")
+    p_meta.add_argument(
+        "--level",
+        choices=list(LEVEL_ORDER),
+        help="[project mode] Target level (required in project mode)",
+    )
+    p_meta.add_argument("--fill-only", action="store_true",
+                        help="On column collision, fill NaN cells only (default in project mode)")
+    p_meta.add_argument("--overwrite", action="store_true",
+                        help="On column collision, replace existing values")
+    p_meta.add_argument("--allow-new", action="store_true",
+                        help="Allow new keys not already in manifest/table (requires --yes)")
+    p_meta.add_argument("--yes", action="store_true",
+                        help="Confirm --allow-new additions non-interactively")
 
     # ── dashboard ──
     p_dash = subparsers.add_parser(
