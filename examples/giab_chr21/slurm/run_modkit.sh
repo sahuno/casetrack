@@ -40,7 +40,10 @@ CASETRACK_BIN="${CASETRACK_BIN:-casetrack}"
 MODKIT_CONTAINER="${MODKIT_CONTAINER:-}"
 CHR_LIMIT="${CHR_LIMIT:-}"
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)"
+# SLURM copies the submitted script; use the explicit scripts dir from
+# submit_all.sh rather than resolving via BASH_SOURCE[0].
+: "${DEMO_SCRIPTS_DIR:?run_modkit: DEMO_SCRIPTS_DIR is required (exported by submit_all.sh)}"
+HERE="$(cd "${DEMO_SCRIPTS_DIR}" && cd .. && pwd)"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RESULTS_DIR="${PROJECT_DIR}/results/modkit/${ASSAY_ID}"
 LOG_DIR="${PROJECT_DIR}/logs"

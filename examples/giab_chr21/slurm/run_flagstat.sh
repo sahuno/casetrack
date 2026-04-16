@@ -38,7 +38,11 @@ SAMTOOLS_BIN="${SAMTOOLS_BIN:-samtools}"
 SAMTOOLS_CONTAINER="${SAMTOOLS_CONTAINER:-}"
 CASETRACK_BIN="${CASETRACK_BIN:-casetrack}"
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)"
+# SLURM copies the submitted script to /var/spool/slurmd/scripts/, so
+# BASH_SOURCE[0] resolves to the copy and can't reach the repo. submit_all.sh
+# exports DEMO_SCRIPTS_DIR pointing at examples/giab_chr21/scripts/.
+: "${DEMO_SCRIPTS_DIR:?run_flagstat: DEMO_SCRIPTS_DIR is required (exported by submit_all.sh)}"
+HERE="$(cd "${DEMO_SCRIPTS_DIR}" && cd .. && pwd)"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RESULTS_DIR="${PROJECT_DIR}/results/flagstat/${ASSAY_ID}"
 LOG_DIR="${PROJECT_DIR}/logs"

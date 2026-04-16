@@ -17,6 +17,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${HERE}/.." && pwd)"
 SHEET="${ROOT}/sample_sheet.tsv"
 
+# Exported to the compute-node job so it can find the summarizer scripts —
+# SLURM copies the run_*.sh scripts to /var/spool/slurmd/scripts/, which
+# breaks $(dirname "${BASH_SOURCE[0]}") as a way to locate siblings.
+export DEMO_SCRIPTS_DIR="${ROOT}/scripts"
+
 SUBMIT=""
 if [[ "${1:-}" == "--submit" ]]; then
     SUBMIT=1
