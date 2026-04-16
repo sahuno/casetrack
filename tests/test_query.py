@@ -298,8 +298,8 @@ def test_query_bad_sql_exit_2(tmp_project, samples_file, capsys):
 def test_query_missing_duckdb_friendly_error(
     tmp_project, samples_file, monkeypatch, capsys
 ):
-    """When duckdb isn't installed, casetrack query must print a helpful
-    install hint, not a traceback."""
+    """duckdb is a hard dependency. If it's missing the install is broken,
+    but we still print a clear install-repair hint instead of a traceback."""
     manifest = _seed_manifest(tmp_project, samples_file)
     monkeypatch.setitem(sys.modules, "duckdb", None)  # future import raises
     with pytest.raises(SystemExit) as excinfo:
@@ -308,9 +308,9 @@ def test_query_missing_duckdb_friendly_error(
         ))
     assert excinfo.value.code == 1
     err = capsys.readouterr().err
-    assert "duckdb is required" in err
+    assert "duckdb is missing" in err
+    assert "required dependency" in err
     assert "pip install" in err
-    assert "casetrack[query]" in err
 
 
 # ── CLI smoke ──────────────────────────────────────────────────────────────────

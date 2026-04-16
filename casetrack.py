@@ -206,6 +206,11 @@ def fill_nan_cells(manifest: "pd.DataFrame", results: "pd.DataFrame",
         new_values = merged_keys.map(rcol)
         mask = merged[col].isna() & new_values.notna()
         if mask.any():
+            # Promote target to object when dtypes differ — otherwise pandas 3.0
+            # raises on e.g. assigning timestamp strings into an all-NaN float64
+            # column pre-created by `init --cols`.
+            if merged[col].dtype != new_values.dtype:
+                merged[col] = merged[col].astype(object)
             merged.loc[mask, col] = new_values.loc[mask]
     return merged
 
@@ -643,11 +648,12 @@ def cmd_projects(args):
     for mpath in manifests:
         try:
             projects.append(_summarize_project(mpath, args.key))
-        except Exception as e:  # noqa: BLE001 — per-project isolation is intentional
+        except Exception as e:  # noqa: BLE001 — surface the offending path before exiting.
             print(
-                f"Warning: failed to summarize {mpath}: {type(e).__name__}: {e}",
+                f"Error: failed to summarize {mpath}: {type(e).__name__}: {e}",
                 file=sys.stderr,
             )
+            sys.exit(1)
 
     projects.sort(key=lambda p: p["name"])
 
@@ -826,16 +832,15 @@ def cmd_query(args):
     """Run a SQL query against one manifest (--manifest) or a union of many
     (--root) via DuckDB. The manifest is exposed as table `_` by default."""
     try:
-        import duckdb  # noqa: F401
+        import duckdb as _duckdb
     except ImportError:
         print(
-            "Error: duckdb is required for 'casetrack query'.\n"
-            "Install with: pip install 'casetrack[query]'  (or: pip install duckdb)",
+            "Error: duckdb is missing but is a required dependency of casetrack.\n"
+            "Your install is broken — reinstall with: pip install --force-reinstall casetrack\n"
+            "(or install duckdb directly: pip install duckdb)",
             file=sys.stderr,
         )
         sys.exit(1)
-
-    import duckdb as _duckdb
 
     sql = args.sql
     alias = args.as_name or "_"

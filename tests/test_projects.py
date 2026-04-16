@@ -206,7 +206,7 @@ def test_projects_custom_pattern(tmp_path: Path, capsys):
 # ── Resilience ─────────────────────────────────────────────────────────────────
 
 
-def test_projects_corrupted_manifest_warns_and_continues(tmp_path: Path, capsys):
+def test_projects_corrupted_manifest_fails_hard(tmp_path: Path, capsys):
     ok = tmp_path / "ok_project"
     ok.mkdir()
     _init(ok / "manifest.tsv", ["A", "B"])
@@ -217,13 +217,12 @@ def test_projects_corrupted_manifest_warns_and_continues(tmp_path: Path, capsys)
     (bad / "manifest.tsv").write_bytes(b"\x00\xff\x00\xff binary garbage \x00")
 
     capsys.readouterr()
-    casetrack.cmd_projects(_proj_ns(tmp_path, fmt="json"))
+    with pytest.raises(SystemExit) as excinfo:
+        casetrack.cmd_projects(_proj_ns(tmp_path, fmt="json"))
+    assert excinfo.value.code == 1
     captured = capsys.readouterr()
-    assert "Warning: failed to summarize" in captured.err
-    data = json.loads(captured.out)
-    names = {p["name"] for p in data}
-    assert "ok_project" in names
-    assert "bad_project" not in names
+    assert "Error: failed to summarize" in captured.err
+    assert str(bad / "manifest.tsv") in captured.err
 
 
 def test_projects_empty_root_message(tmp_path: Path, capsys):

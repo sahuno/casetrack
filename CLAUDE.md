@@ -26,11 +26,8 @@ Manifest-centric case management CLI for bioinformatics pipelines on HPC (SLURM)
 # Install (user-level)
 pip install -e ".[all]" --user
 
-# Run tests (169 passing, ~15s)
+# Run tests (~13s)
 python3 -m pytest tests/ -q
-
-# Optional: install duckdb for `casetrack query`
-pip install duckdb
 ```
 
 ## Architecture (v0.2 — current)
