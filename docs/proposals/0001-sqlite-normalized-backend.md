@@ -3,12 +3,27 @@
 | | |
 |---|---|
 | **Author** | Samuel Ahuno ([ekwame001@gmail.com](mailto:ekwame001@gmail.com)) |
-| **Status** | Draft |
+| **Status** | **Accepted** (all §19 decisions signed off 2026-04-15) |
 | **Date** | 2026-04-15 |
 | **Target release** | v0.3.0 |
+| **Target HPC** | IRIS @ MSKCC (WekaFS shared storage, SLURM scheduler, Apptainer containers) |
 | **Supersedes** | the implicit flat-TSV model of v0.1–v0.2 |
 | **History** | An earlier draft (closed PR #2) kept TSV as the source of truth. Direct feedback ("TSV is good for human view, not for backend") pushed this design toward a real embedded database with TSV as an on-demand export. |
 | **Related** | [PR #1: `casetrack query` (DuckDB)](https://github.com/sahuno/casetrack/pull/1) — the query engine used here |
+
+## 0. Accepted decisions (2026-04-15)
+
+Answers to §19 locked in:
+
+| # | Question | Accepted answer |
+|---|---|---|
+| 1 | Hierarchy depth | **Three levels hardcoded** (patient / specimen / assay). N-level deferred to v0.4 if a real project needs it. |
+| 2 | FK enforcement | **Strict**. Unknown parent → exit 2 with preview; `--allow-new-parent --yes` pair creates inline. |
+| 3 | Flat-manifest deprecation | Supported through v0.3.x with a loud warning; **removed in v1.0** (~6 months post-v0.3.0). |
+| 4 | Migration tolerance | **Fail-closed** on ambiguous columns. Caller must disambiguate via `--metadata-map`. Migrations run rarely and should force explicit decisions. |
+| 5 | HPC concurrency tier | **Tier 1** — WAL + `busy_timeout=30000` + two new guardrail commands: `casetrack doctor` (parallel-write stress test) and `casetrack recover` (rebuild DB from `provenance.jsonl`). Target FS is WekaFS, which supports POSIX locks across nodes. |
+| 6 | Git-track `casetrack.db` | `.gitignore` by default. Git tracks `casetrack.toml` (schema) + `provenance.jsonl` (history); the DB is reproducible from those two. |
+| 7 | Analysis-column type source | **Hybrid**: infer from the summary TSV by default, accept `--col-type name:TYPE` overrides on `casetrack append`. |
 
 ## 1. Summary
 
@@ -225,9 +240,11 @@ Two kinds of columns:
 
 ### 7.2 New commands
 
-- **`casetrack migrate --flat X.tsv --patient-col … --specimen-col … --assay-col … --out-dir NEW/`** — convert a v0.2 flat manifest into a v0.3 project. Routing heuristic unchanged from the earlier draft.
-- **`casetrack register --project-dir DIR --level LEVEL --id ID --parent PARENT_ID --meta k=v,k=v`** — add a single row at any level, useful for "specimen collected, register before any assay exists".
+- **`casetrack migrate --flat X.tsv --patient-col … --specimen-col … --assay-col … --out-dir NEW/`** — convert a v0.2 flat manifest into a v0.3 project. **Fail-closed** on columns the routing heuristic can't place (§13); user provides `--metadata-map` overrides.
+- **`casetrack register --project-dir DIR --level LEVEL --id ID --parent PARENT_ID --meta k=v,k=v`** — add a single row at any level.
 - **`casetrack schema {show,apply,dump,check}`** — manage the TOML↔DB schema lifecycle.
+- **`casetrack doctor --project-dir DIR`** — concurrency smoke-test. Forks N worker processes that simultaneously `INSERT` into a scratch table, measures lock contention + retries, warns loudly if POSIX lock semantics look broken on the target filesystem. Intended to be run once per HPC project at kickoff. See §9.3.
+- **`casetrack recover --project-dir DIR [--from provenance.jsonl]`** — rebuild `casetrack.db` from the append-only event log. The escape hatch if the DB is ever corrupted. Since every mutation is logged with its exact SQL, replay is deterministic. See §9.4.
 
 ### 7.3 Deprecated
 
@@ -284,15 +301,55 @@ Example entry:
 
 ### 9.2 HPC shared-filesystem reality
 
-SQLite + WAL on NFS/Lustre/GPFS is a known cautious case. POSIX advisory locks aren't universally reliable across nodes. For casetrack's target scale (24–200 samples, dozens of concurrent SLURM array tasks), empirical reports say this works fine in practice, but corruption is possible under adversarial concurrency.
+SQLite + WAL on NFS/Lustre/GPFS is a known cautious case — POSIX advisory locks aren't universally reliable across nodes. The target deployment is **WekaFS** on MSKCC IRIS, which implements compliant POSIX lock semantics across nodes and is purpose-built for parallel HPC I/O. Tier 1 is safe for this deployment. Teams on other filesystems run `casetrack doctor` at project kickoff to verify.
 
-**Mitigation tiers** — ship with tier 1, escalate if real pipelines hit issues:
+### 9.3 `casetrack doctor` — kickoff concurrency test (guardrail #1)
 
-1. **Tier 1 (v0.3.0)**: WAL + `busy_timeout=30000` + documented caveat. Works for the common case. Failure mode is a 30s hang then a clear error; bad job can retry.
-2. **Tier 2 (follow-up if needed)**: per-task JSONL deltas flushed to SQLite by a merger step at end of job. Eliminates cross-node concurrent writes entirely. Adds a sync-lag property.
-3. **Tier 3 (research-scale only)**: broker process holding the DB, jobs communicate via a socket/pipe.
+One-shot smoke test. Fork `--workers` workers, run `--writes` INSERTs each against a scratch table in the project DB, measure contention and corruption:
 
-### 9.3 Read model
+```
+$ casetrack doctor --project-dir ./my_proj --workers 32 --writes 100
+Testing SQLite concurrency on /data1/greenbab/.../my_proj/ ...
+  Filesystem:            wekafs (0x18031977)
+  Spawning 32 workers × 100 INSERTs = 3200 total ...
+  Elapsed:               4.2s
+  Successful commits:    3200/3200
+  Busy-retries observed: 28
+  Max retry wait:        412 ms
+  ✓ SQLite concurrency healthy on this filesystem.
+```
+
+Exits non-zero with a clear escalation message on any `SQLITE_CORRUPT`, `SQLITE_MISUSE`, or silent partial commit. Intended to run once per project alongside `casetrack init` on a new cluster.
+
+### 9.4 `casetrack recover` — rebuild from provenance (guardrail #2)
+
+`provenance.jsonl` records every mutation with its exact SQL (§8). If the DB is ever corrupted, recover rebuilds it by replaying the log:
+
+```
+$ casetrack recover --project-dir ./my_proj
+Rebuilding casetrack.db from 1,247 provenance entries ...
+  Schema DDL applied:         5
+  INSERTs replayed:         810
+  UPDATEs replayed:         432
+  Transaction groups:       214
+  Final schema_v:             7
+  ✓ Recovered DB matches last-known schema_v from provenance log.
+```
+
+Because `provenance.jsonl` is append-only and written **after** the DB commit succeeds, replay is deterministic and idempotent. This is the safety net that makes Tier 1 a responsible default — the failure mode is "a few hours of inconvenience", not "data loss".
+
+### 9.5 `busy_timeout=30000` — quiet retries (guardrail #3)
+
+Every SQLite connection sets `PRAGMA busy_timeout = 30000` on open. If a writer finds the DB locked by another writer, it retries quietly for up to 30 seconds before raising. For casetrack's workload (~1 second transactions, dozens of concurrent SLURM tasks), retries are invisible in the normal case and provide graceful back-pressure under peak contention.
+
+### 9.6 Future tiers (only if needed)
+
+Escalate only if `casetrack doctor` fails on a team's filesystem or production pipelines hit corruption:
+
+- **Tier 2**: per-task JSONL deltas flushed to SQLite by a merger step at end of job. Eliminates cross-node concurrent writes entirely. Adds sync-lag.
+- **Tier 3** (research-scale only): broker process holding the DB, jobs communicate via socket/pipe.
+
+### 9.7 Read model
 
 `casetrack status`, `casetrack query`, `casetrack dashboard` are read-only, so WAL lets them run concurrently with any number of writers. No locking needed.
 
@@ -550,19 +607,6 @@ Rewritten to:
 
 Same deterministic seed, same synthetic cohort shape as today.
 
-## 19. Decisions requested
+## 19. Decisions — ACCEPTED
 
-Four things to sign off before implementation (same four as the previous draft; answers carry over):
-
-1. **Hierarchy depth (Q5)**: hardcode 3 levels in v0.3, or generalize to N levels day-one?
-2. **FK enforcement posture (Q1)**: strict-by-default + opt-in, or warn-and-continue?
-3. **Flat-manifest deprecation horizon (Q9)**: remove in v1.0 (~6 months) acceptable?
-4. **Migration heuristic tolerance**: fail-closed on ambiguous columns, or route-to-assay + warn?
-
-Plus three new decisions specific to the SQLite backend:
-
-5. **Concurrency tier (Q7)**: ship Tier 1 (WAL + documented caveat) only, or pre-invest in Tier 2 (per-task JSONL deltas) before v0.3.0?
-6. **Git-track `casetrack.db` (Q8)**: `.gitignore` by default (recommended), or expose as a per-team choice in the template?
-7. **Analysis-column type source (Q6)**: pure-infer-from-TSV (simplest), or require an optional `--col-type name:TYPE` flag for each column in the summarize step?
-
-Sign off and I'll open the implementation tracking issue with phase-by-phase tasks matching §16.
+All seven decisions signed off on 2026-04-15. See §0 at the top of this document for the authoritative table. Implementation tracking lives in the companion GitHub issue; task breakdown follows the §16 phased rollout (α → β → release → v1.0).
