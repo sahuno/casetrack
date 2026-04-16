@@ -1,1 +1,5 @@
-/data1/greenbab/projects/GIAB_ont/GIAB_data/giab_2025.01/sample_sheet_chr21_bams.tsv
+patient_id	sample_id	condition	assay_type	bam_path
+HG002	HG002_PAW70337	reference	ONT_WGS	/data1/greenbab/projects/GIAB_ont/GIAB_data/giab_2025.01/data/processed/hg38/chr21_bams/HG002_PAW70337.hg38.chr21.bam
+HG002	HG002_PAW71238	reference	ONT_WGS	/data1/greenbab/projects/GIAB_ont/GIAB_data/giab_2025.01/data/processed/hg38/chr21_bams/HG002_PAW71238.hg38.chr21.bam
+HG006	HG006_PAY77227	reference	ONT_WGS	/data1/greenbab/projects/GIAB_ont/GIAB_data/giab_2025.01/data/processed/hg38/chr21_bams/HG006_PAY77227.hg38.chr21.bam
+HG006	HG006_PBA16846	reference	ONT_WGS	/data1/greenbab/projects/GIAB_ont/GIAB_data/giab_2025.01/data/processed/hg38/chr21_bams/HG006_PBA16846.hg38.chr21.bam

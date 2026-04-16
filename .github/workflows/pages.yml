@@ -33,22 +33,54 @@ jobs:
           python -m pip install "pandas>=1.5.0" numpy
           python -m pip install -e .
 
-      - name: Render demo dashboard
+      - name: Render v0.3 GIAB demo dashboard
         run: |
           mkdir -p site
-          python scripts/generate_demo_dashboard.py --output site/index.html
-          # Include the checked-in copy too, and a tiny landing blurb.
-          cp docs/examples/dashboard_demo.html site/dashboard_demo.html
+          # Mock path — bootstraps a v0.3 project from the real GIAB chr21
+          # sample sheet, synthesizes deterministic flagstat/modkit/sniffles
+          # summaries, appends them, and writes dashboard.html. No cluster,
+          # no real BAMs touched (the mock summarizers work from assay_id
+          # hashes), CI-friendly.
+          bash examples/giab_chr21/run_mock_demo.sh "${RUNNER_TEMP}/giab_demo"
+          cp "${RUNNER_TEMP}/giab_demo/dashboard.html" site/index.html
+
+      - name: Render v0.2 flat-mode demo (legacy, archived under /legacy/)
+        run: |
+          # Kept so the v0.2 dashboard shape is still visible for anyone
+          # migrating. Flat mode prints a deprecation warning — silence it
+          # for this non-interactive render.
+          mkdir -p site/legacy
+          CASETRACK_NO_DEPRECATION=1 python scripts/generate_demo_dashboard.py \
+              --output site/legacy/index.html
+          # Also include the checked-in reference copy.
+          cp docs/examples/dashboard_demo.html site/legacy/reference.html
+
+      - name: Landing page
+        run: |
           cat > site/about.html <<'HTML'
           <!doctype html><meta charset="utf-8">
           <title>casetrack demo dashboard</title>
-          <body style="font:14px -apple-system,Roboto,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#1a202c">
-          <h1>casetrack demo dashboard</h1>
-          <p>This page is a rendered example of <code>casetrack dashboard</code>
-          against a simulated ONT long-read project (24 samples, 6 analyses).
-          The HTML is fully self-contained — no network, no JavaScript
-          libraries. <a href="./">Open the dashboard &rarr;</a></p>
-          <p>Source: <a href="https://github.com/sahuno/casetrack">github.com/sahuno/casetrack</a></p>
+          <body style="font:14px -apple-system,Roboto,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;color:#1a202c">
+          <h1>casetrack demo dashboards</h1>
+          <p>Rendered examples of <code>casetrack dashboard</code>, regenerated
+          from the mock demos on every push to <code>main</code>. All HTML is
+          self-contained — no network, no JavaScript libraries.</p>
+          <h2>v0.3 project mode (recommended)</h2>
+          <p><a href="./"><strong>Open the v0.3 demo &rarr;</strong></a></p>
+          <p>Nested patient &rarr; specimen &rarr; assay structure on the real
+          <a href="https://www.nist.gov/programs-projects/genome-bottle">GIAB</a>
+          ONT chr21 cohort (HG002 + HG006, four flowcells). Three analyses
+          (<code>flagstat</code>, <code>modkit</code>, <code>sniffles</code>)
+          rendered from deterministic mock summaries so it runs in CI.</p>
+          <h2>v0.2 flat mode (deprecated)</h2>
+          <p><a href="./legacy/"><strong>Open the v0.2 demo &rarr;</strong></a>
+            &nbsp; (<a href="./legacy/reference.html">checked-in reference copy</a>)</p>
+          <p>Still rendered so migrators can compare shapes. Flat mode is
+          scheduled for removal in <strong>v1.0</strong>.</p>
+          <h2>Source</h2>
+          <p><a href="https://github.com/sahuno/casetrack">github.com/sahuno/casetrack</a>
+            &middot; <a href="https://github.com/sahuno/casetrack/releases">releases</a>
+            &middot; <a href="https://github.com/sahuno/casetrack/blob/main/docs/MIGRATION_v0.2_to_v0.3.md">migration guide</a></p>
           </body>
           HTML
 
