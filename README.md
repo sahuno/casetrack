@@ -23,6 +23,31 @@ cohort_v3/
 └── sandbox/             # preserved source TSVs (migration artifact)
 ```
 
+## How people actually use this
+
+`casetrack` is a **CLI that wraps a SQLite DB**. It's installed once (globally
+or per-env) and used against many projects. Three layers — keep them separate:
+
+| Layer | Where it lives | How many | What it is |
+|---|---|---|---|
+| **1. `casetrack` package** | Wherever pip put it | One per env | The CLI itself — install once with `pip install casetrack` |
+| **2. Casetrack projects** | Your data filesystem (`/data1/.../cohort_X/`) | Many per user, one per cohort | A directory with `casetrack.toml`, `casetrack.db`, `provenance.jsonl` |
+| **3. Your pipeline code** | Your own git repo (Snakemake / Nextflow / bash / etc.) | Many per user, one per pipeline | Orchestration + summary scripts — ends each job with `casetrack append --project-dir ...` |
+
+Users do **not** clone this repo to use casetrack — they install it once, create
+project directories wherever their data lives, and call it from their own
+pipeline code. The `examples/giab_chr21/` directory is a **demo and
+reference** for the three-phase SLURM pattern; it's not a template you need
+to copy wholesale.
+
+Three recommended patterns by user shape:
+
+| User shape | Where pipeline lives | What to do |
+|---|---|---|
+| **Researcher with their own analysis repo** | `~/projects/alice_pipeline/` | End each SLURM job with `casetrack append --project-dir ...`. Your git history is the audit trail — casetrack already records `git.commit`/`branch`/`dirty` of the CWD in every provenance entry. |
+| **Team with a Nextflow / Snakemake workflow** | Shared workflow repo | Use the `casetrack_append_project` process in [`examples/nextflow/casetrack.nf`](examples/nextflow/casetrack.nf). The workflow's own git history is the audit trail. |
+| **Trying the demo / kicking the tires** | `examples/giab_chr21/` | Run `bash examples/giab_chr21/run_mock_demo.sh` or copy-adapt `slurm/run_*.sh`. `submit_all.sh` snapshots the wrappers it ran into `<project>/scripts/` so a later reader can see what produced each row without needing the casetrack repo nearby. |
+
 ## Contents
 
 - [Install](#install)

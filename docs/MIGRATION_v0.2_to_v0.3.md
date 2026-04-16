@@ -11,6 +11,42 @@ changes you'll see after it.
 
 ---
 
+## First — how the pieces fit together
+
+Before migrating anything, it helps to be explicit about the three layers
+involved:
+
+| Layer | Where it lives | Count per user |
+|---|---|---|
+| **1. `casetrack` package** | `pip install`'s site-packages | One per Python env |
+| **2. Casetrack projects** | Anywhere on your data FS (`/data1/.../cohort/`) | Many |
+| **3. Your pipeline code** | Your own git repo | Many |
+
+You install the CLI once. You create a project directory per cohort. You
+call the CLI from your own pipeline code, which lives in whatever repo
+you already version-control.
+
+You do **not** clone the casetrack repo per project. The `examples/` in
+the casetrack repo are reference — copy-adapt the bits you need into your
+own pipeline; don't run casetrack's CI demo on your real data.
+
+Three common usage shapes:
+
+- **Your own analysis repo** (shell / SLURM scripts in your git): end each
+  job with `casetrack append --project-dir $PROJECT_DIR --analysis X
+  --results Y.tsv`. casetrack auto-captures `git.commit`/`branch`/`dirty`
+  of the CWD in every provenance entry, so your repo IS the audit trail.
+- **Nextflow / Snakemake workflow**: include `examples/nextflow/
+  casetrack.nf` (or equivalent for Snakemake) and call
+  `casetrack_append_project` after each compute step. Your workflow repo
+  is the audit trail.
+- **Kicking the tires / running the demo**: `bash examples/giab_chr21/
+  run_mock_demo.sh` (no cluster) or the `slurm/submit_all.sh` flow. The
+  demo snapshots the wrapper scripts into `<project>/scripts/` so the
+  project is self-contained even when read in isolation — a convenience
+  for a repo-adjacent demo, not required for real pipelines you
+  version-control yourself.
+
 ## TL;DR — happy-path migration
 
 ```bash
