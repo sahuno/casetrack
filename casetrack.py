@@ -733,6 +733,13 @@ def cmd_init_flat(args):
 
 
 def cmd_append(args):
+    """Dispatch `casetrack append` to flat (--manifest) or project (--project-dir) mode."""
+    if getattr(args, "project_dir", None):
+        return cmd_append_project(args)
+    return cmd_append_flat(args)
+
+
+def cmd_append_flat(args):
     """Append analysis results as new columns to the manifest."""
     manifest_path = args.manifest
     results_path = args.results
@@ -2495,6 +2502,228 @@ def cmd_register(args):
         print(f"Registered {level} {args.id!r}.")
 
 
+# ── v0.3 append ────────────────────────────────────────────────────────────────
+#
+# Implements `casetrack append --project-dir DIR` per proposal 0001 §7.1 & Q7.
+# Writes go to the table corresponding to --level (default: schema's
+# analysis_defaults.default_level, which the shipped templates set to "assay").
+#
+# Type inference (Q7 hybrid): infer the SQLite type from the summary TSV's
+# pandas dtype; users override via `--col-type name:TYPE,...`.
+
+
+def _parse_col_type_overrides(spec: str | None) -> dict:
+    """Parse '--col-type col1:REAL,col2:INTEGER' into {col: TYPE}."""
+    out: dict = {}
+    if not spec:
+        return out
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise ValueError(f"--col-type: expected 'col:TYPE', got {chunk!r}")
+        name, ctype = chunk.split(":", 1)
+        name, ctype = name.strip(), ctype.strip().upper()
+        if not name:
+            raise ValueError(f"--col-type: empty column name in {chunk!r}")
+        if ctype not in VALID_COLUMN_TYPES:
+            raise ValueError(
+                f"--col-type {name!r}: unsupported type {ctype!r}; "
+                f"must be one of {sorted(VALID_COLUMN_TYPES)}"
+            )
+        out[name] = ctype
+    return out
+
+
+def _get_table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """Return the column names of `table` in declared order."""
+    return [row[1] for row in conn.execute(
+        f"PRAGMA table_info({_quote_ident(table)})"
+    ).fetchall()]
+
+
+def _default_analysis_level(schema: dict) -> str:
+    return (
+        schema.get("analysis_defaults", {}).get("default_level")
+        or "assay"
+    )
+
+
+class _MissingKeys(Exception):
+    """Raised inside the append transaction when the results TSV references
+    keys that don't exist in the target table — begin_immediate rolls back
+    any ALTER TABLEs that had already been applied."""
+
+    def __init__(self, missing: set):
+        super().__init__(f"{len(missing)} missing keys")
+        self.missing = missing
+
+
+def cmd_append_project(args):
+    """Attach analysis results to rows at --level, extending the schema as needed."""
+    project_dir, schema = _resolve_project(args.project_dir)
+    level = args.level or _default_analysis_level(schema)
+    if level not in LEVEL_ORDER:
+        print(
+            f"Error: --level must be one of {list(LEVEL_ORDER)}, got {level!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    level_spec = schema["levels"][level]
+    key_col = level_spec["key"]
+    table = f"{level}s"
+    analysis = args.analysis
+
+    results_path = Path(args.results)
+    if not results_path.exists():
+        print(f"Error: results file not found: {results_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        col_type_overrides = _parse_col_type_overrides(getattr(args, "col_type", None))
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    results = pd.read_csv(results_path, sep="\t")
+    if key_col not in results.columns:
+        print(
+            f"Error: key column {key_col!r} not in {results_path}. "
+            f"Columns: {list(results.columns)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    analysis_cols = [c for c in results.columns if c != key_col]
+    if not analysis_cols:
+        print(
+            f"Error: {results_path} has no columns besides {key_col!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    done_col = f"{analysis}{DONE_COLUMN_SUFFIX}"
+    if done_col not in results.columns:
+        results[done_col] = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+        analysis_cols.append(done_col)
+
+    # Build the final column→type map (overrides > done-col → TEXT > pandas dtype).
+    col_type_map: dict = {}
+    for col in analysis_cols:
+        if col in col_type_overrides:
+            col_type_map[col] = col_type_overrides[col]
+        elif col == done_col:
+            col_type_map[col] = "TEXT"
+        else:
+            col_type_map[col] = _infer_column_type(results[col])
+
+    # Reject override names that aren't in the TSV — most commonly a typo.
+    unknown_overrides = set(col_type_overrides) - set(analysis_cols)
+    if unknown_overrides:
+        print(
+            f"Error: --col-type references columns not in {results_path}: "
+            f"{sorted(unknown_overrides)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    db_path = project_dir / PROJECT_DB_NAME
+    conn = open_project_db(db_path)
+    executed_sql: list[str] = []
+    columns_added: list[str] = []
+    rows_updated = 0
+
+    try:
+        with begin_immediate(conn):
+            # Every row's key must already exist — append never auto-creates.
+            # Users who need inline creation can use `casetrack register`
+            # --allow-new-parent first.
+            existing_keys = {
+                r[0] for r in conn.execute(
+                    f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
+                ).fetchall()
+            }
+            tsv_keys = set(results[key_col].astype(str))
+            missing = tsv_keys - {str(k) for k in existing_keys}
+            if missing:
+                raise _MissingKeys(missing)
+
+            # Add any new columns up-front so subsequent UPDATE can reference them.
+            existing_cols = set(_get_table_columns(conn, table))
+            for col in analysis_cols:
+                if col not in existing_cols:
+                    ctype = col_type_map[col]
+                    ddl = (
+                        f"ALTER TABLE {_quote_ident(table)} "
+                        f"ADD COLUMN {_quote_ident(col)} {ctype}"
+                    )
+                    conn.execute(ddl)
+                    executed_sql.append(ddl)
+                    columns_added.append(col)
+
+            # Build one UPDATE per row. With --overwrite: unconditional SET.
+            # Otherwise COALESCE(col, ?) preserves any pre-existing non-null value.
+            if args.overwrite:
+                set_clauses = ", ".join(f"{_quote_ident(c)} = ?" for c in analysis_cols)
+            else:
+                set_clauses = ", ".join(
+                    f"{_quote_ident(c)} = COALESCE({_quote_ident(c)}, ?)"
+                    for c in analysis_cols
+                )
+            update_sql = (
+                f"UPDATE {_quote_ident(table)} SET {set_clauses} "
+                f"WHERE {_quote_ident(key_col)} = ?"
+            )
+
+            for _, row in results.iterrows():
+                values = tuple(_coerce_for_sqlite(row[c]) for c in analysis_cols)
+                values += (row[key_col],)
+                conn.execute(update_sql, values)
+                rows_updated += 1
+
+            executed_sql.append(update_sql)
+    except _MissingKeys as e:
+        conn.close()
+        preview = sorted(e.missing)[:5]
+        print(
+            f"Error: {len(e.missing)} key(s) in {results_path} do not exist in "
+            f"table {table!r}: {preview}{'…' if len(e.missing) > 5 else ''}\n"
+            f"Register them first with 'casetrack register --level {level} --id ... "
+            f"--parent ...' before appending.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except sqlite3.IntegrityError as e:
+        conn.close()
+        print(f"Error: append aborted — {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if conn:
+            conn.close()
+
+    log_project_provenance(project_dir, {
+        "action": "append",
+        "level": level,
+        "analysis": analysis,
+        "columns_added": columns_added,
+        "rows_affected": rows_updated,
+        "results_file": str(results_path),
+        "results_checksum": _checksum(str(results_path)),
+        "col_type_overrides": col_type_overrides,
+        "transaction_id": _new_transaction_id(),
+        "sql": executed_sql,
+        "schema_v_before": schema["project"]["schema_v"],
+        "schema_v_after": schema["project"]["schema_v"],
+    })
+
+    added_note = f" (+{len(columns_added)} new column{'s' if len(columns_added) != 1 else ''})" if columns_added else ""
+    print(
+        f"Appended {analysis!r} to {rows_updated} {level} row(s){added_note}."
+    )
+
+
 # ── CLI Parser ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -2561,14 +2790,36 @@ Examples:
     )
 
     # ── append ──
-    p_append = subparsers.add_parser("append", help="Append analysis results to manifest")
-    p_append.add_argument("--manifest", required=True, help="Path to manifest TSV")
+    p_append = subparsers.add_parser(
+        "append",
+        help="Append analysis results to a manifest (flat) or project (v0.3 SQLite)",
+    )
+    g_append_target = p_append.add_mutually_exclusive_group(required=True)
+    g_append_target.add_argument("--manifest", help="[flat mode] Path to manifest TSV")
+    g_append_target.add_argument(
+        "--project-dir",
+        help="[project mode] Casetrack project directory",
+    )
     p_append.add_argument("--results", required=True, help="Path to results TSV")
-    p_append.add_argument("--key", default="sample_id", help="Key column to join on (default: sample_id)")
-    p_append.add_argument("--analysis", required=True, help="Name of this analysis (e.g. modkit_methylation)")
-    p_append.add_argument("--overwrite", action="store_true", help="Overwrite existing columns")
-    p_append.add_argument("--allow-new", action="store_true", help="Allow new sample IDs not in manifest (requires --yes to commit)")
-    p_append.add_argument("--yes", action="store_true", help="Confirm --allow-new additions non-interactively")
+    p_append.add_argument("--key", default="sample_id",
+                          help="[flat mode] Key column to join on (default: sample_id)")
+    p_append.add_argument("--analysis", required=True,
+                          help="Name of this analysis (e.g. modkit_methylation)")
+    p_append.add_argument(
+        "--level",
+        choices=list(LEVEL_ORDER),
+        help="[project mode] Target level (default: analysis_defaults.default_level)",
+    )
+    p_append.add_argument(
+        "--col-type",
+        help="[project mode] Override inferred types, e.g. 'mean_meth:REAL,n_reads:INTEGER'",
+    )
+    p_append.add_argument("--overwrite", action="store_true",
+                          help="Overwrite existing non-null cells (default: fill-only)")
+    p_append.add_argument("--allow-new", action="store_true",
+                          help="[flat mode] Allow new sample IDs not in manifest (requires --yes)")
+    p_append.add_argument("--yes", action="store_true",
+                          help="[flat mode] Confirm --allow-new additions non-interactively")
 
     # ── status ──
     p_status = subparsers.add_parser("status", help="Show completion status")
