@@ -73,10 +73,12 @@ if [[ -n "${CHR_LIMIT}" ]]; then
     REGION_ARGS="--region ${CHR_LIMIT}"
 fi
 
+MOD_BASES="${MOD_BASES:-5mC 5hmC}"
 ${MODKIT} pileup \
     ${BAM_PATH} \
     ${BEDMETHYL} \
-    --ref ${REF_FASTA} \
+    --reference ${REF_FASTA} \
+    --modified-bases ${MOD_BASES} \
     --cpg \
     ${REGION_ARGS} \
     --threads ${SLURM_CPUS_PER_TASK:-8}
