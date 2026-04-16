@@ -4,6 +4,60 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-04-16
+
+Docs, demo, and SLURM-wrapper polish. No library behavior changes; the
+v0.3 CLI surface is unchanged.
+
+### Added
+
+- **`examples/giab_chr21/`** — real-data demo on the Genome-in-a-Bottle
+  ONT cohort (HG002 + HG006 × two flowcells × chr21-restricted BAMs).
+  Runs both paths:
+  - **Mock demo** (`run_mock_demo.sh`): end-to-end in under a minute,
+    no cluster required — init, register, synthesize deterministic
+    flagstat/modkit/sniffles summaries, append, dashboard, example query.
+  - **Real SLURM pipeline** (`slurm/run_{flagstat,modkit,sniffles}.sh` +
+    `submit_all.sh`): three-phase wrappers with apptainer-or-native
+    tool support and `DEMO_SCRIPTS_DIR` to survive SLURM's
+    `/var/spool/slurmd/scripts/` staging. Committed + verified against
+    the real GIAB chr21 BAMs end-to-end (3 analyses × 4 assays).
+- **`giab_ont` TOML template** — patient/specimen/assay schema tuned for
+  ONT reference cohorts: trio_role, reference_source, cell_line,
+  chemistry (R9/R10 enum), basecaller_model, flowcell_id, bam_path.
+- **`examples/giab_chr21/scripts/summarize_{flagstat,modkit,sniffles}.py`**
+  — real parsers for each tool's output; mock equivalents live alongside.
+- **`submit_all.sh` snapshots wrapper scripts** into `<project>/scripts/`
+  along with the casetrack git commit hash (`.source_commit`) and a
+  `.source_dirty` marker. Makes the project dir self-documenting when
+  read in isolation. Convenience for demo/repo-adjacent use cases; not
+  required for users with their own versioned pipeline repos.
+- **`tests/test_giab_ont_demo.py`** (+11 tests, total 410) — template
+  parse, bootstrap idempotency, deterministic mock summarizers, real
+  parsers exercised against canned fixtures (flagstat text, bedMethyl,
+  sniffles VCF plain + gzipped).
+
+### Changed
+
+- **SLURM wrappers**: `#SBATCH --account=greenbab --partition=componc_cpu`
+  defaults; `run_modkit.sh` bumped to 64 GB / 8 CPUs / 8 h walltime.
+- **`run_modkit.sh`**: uses modkit 0.6+ syntax — `--modified-bases
+  5mC 5hmC --cpg --reference REF` (was the older `--ref --cpg` form).
+- **`README.md`**: new "How people actually use this" section with the
+  three-layer usage model (package / project / pipeline) and three
+  recommended patterns by user shape.
+- **`docs/MIGRATION_v0.2_to_v0.3.md`**: prepended "First — how the
+  pieces fit together" to make the same model explicit up front.
+
+### Fixed
+
+- `run_flagstat.sh` / `run_modkit.sh` / `run_sniffles.sh` now require
+  `DEMO_SCRIPTS_DIR` (exported by `submit_all.sh`) to locate the
+  summarizer scripts, since SLURM copies the submitted run script
+  out of the repo to `/var/spool/slurmd/scripts/` and
+  `${BASH_SOURCE[0]}` no longer points at the repo path. Root-cause
+  fix caught by four early GIAB test jobs that failed at Phase 2.
+
 ## [0.3.0] — 2026-04-16
 
 SQLite-backed project mode. 399 pytest tests. Flat-manifest mode remains

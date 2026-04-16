@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="casetrack",
-    version="0.3.0",
+    version="0.3.1",
     description="Lifecycle data management for bioinformatics pipelines — manifest-centric "
                 "on flat TSVs (v0.2) or SQLite-backed with normalized patient/specimen/assay "
                 "hierarchy (v0.3).",
