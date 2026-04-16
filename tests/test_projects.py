@@ -110,12 +110,14 @@ def test_projects_tsv_summary(tmp_path: Path, capsys):
     casetrack.cmd_projects(_proj_ns(tmp_path, fmt="tsv"))
     out = capsys.readouterr().out.strip().splitlines()
     header = out[0].split("\t")
-    assert header == ["project", "path", "samples", "analyses",
+    # v0.3 added a `kind` column between `project` and `path`; index-based
+    # assertions below work off column indices rather than the old positions.
+    assert header == ["project", "kind", "path", "samples", "analyses",
                       "completed_cells", "total_cells", "pct"]
-    rows = {line.split("\t")[0]: line.split("\t") for line in out[1:]}
-    assert rows["alzheimers_rnaseq"][2] == "4"   # samples
-    assert rows["brca_immune"][3] == "2"         # analyses
-    assert rows["l1_mouse_ont"][6] == "0.0"      # pct
+    rows = {line.split("\t")[0]: dict(zip(header, line.split("\t"))) for line in out[1:]}
+    assert rows["alzheimers_rnaseq"]["samples"] == "4"
+    assert rows["brca_immune"]["analyses"] == "2"
+    assert rows["l1_mouse_ont"]["pct"] == "0.0"
 
 
 def test_projects_table_renders(tmp_path: Path, capsys):

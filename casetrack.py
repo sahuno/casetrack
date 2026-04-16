@@ -1085,6 +1085,13 @@ def cmd_log_flat(args):
 
 
 def cmd_schema(args):
+    """Dispatch `casetrack schema` to flat or project mode."""
+    if getattr(args, "project_dir", None):
+        return cmd_schema_project(args)
+    return cmd_schema_flat(args)
+
+
+def cmd_schema_flat(args):
     """Show which analysis added which columns."""
     _warn_flat_deprecation()
     manifest_path = args.manifest
@@ -1144,6 +1151,7 @@ def _summarize_project(manifest_path: Path, key_col: str) -> dict:
     completed = int(sum(df[dc].notna().sum() for dc in done_cols))
     pct = round(100.0 * completed / total_cells, 1) if total_cells else 0.0
     return {
+        "kind": "v0.2",
         "name": manifest_path.parent.name,
         "path": str(manifest_path),
         "samples": n_samples,
@@ -1155,16 +1163,33 @@ def _summarize_project(manifest_path: Path, key_col: str) -> dict:
 
 
 def cmd_projects(args):
-    """Scan `--root` for manifests and summarize cross-project status."""
+    """Scan `--root` for projects (both v0.2 flat manifests and v0.3
+    casetrack.toml projects) and summarize cross-project status."""
     root = Path(args.root)
     if not root.exists() or not root.is_dir():
         print(f"Error: root not found or not a directory: {root}", file=sys.stderr)
         sys.exit(1)
 
-    manifests = _find_project_manifests(root, args.pattern, args.max_depth)
+    projects: list[dict] = []
 
-    projects = []
+    # v0.3 projects: casetrack.toml with sibling casetrack.db.
+    for toml_path in _find_v03_projects(root, args.max_depth):
+        try:
+            projects.append(_summarize_v03_project(toml_path))
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"Error: failed to summarize {toml_path}: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # v0.2 flat manifests — skip any dir that already reports as v0.3 so we
+    # don't double-count the sandbox/source_manifest.tsv left by `migrate`.
+    v03_dirs = {Path(p["path"]).parent.resolve() for p in projects}
+    manifests = _find_project_manifests(root, args.pattern, args.max_depth)
     for mpath in manifests:
+        if any(mpath.resolve().is_relative_to(d) for d in v03_dirs):
+            continue
         try:
             projects.append(_summarize_project(mpath, args.key))
         except Exception as e:  # noqa: BLE001 — surface the offending path before exiting.
@@ -1188,25 +1213,29 @@ def cmd_projects(args):
         return
 
     if args.fmt == "tsv":
-        print("project\tpath\tsamples\tanalyses\tcompleted_cells\ttotal_cells\tpct")
+        print("project\tkind\tpath\tsamples\tanalyses\tcompleted_cells\ttotal_cells\tpct")
         for p in projects:
             print(
-                f"{p['name']}\t{p['path']}\t{p['samples']}\t{p['analyses']}\t"
-                f"{p['completed_cells']}\t{p['total_cells']}\t{p['pct']}"
+                f"{p['name']}\t{p.get('kind','v0.2')}\t{p['path']}\t{p['samples']}\t"
+                f"{p['analyses']}\t{p['completed_cells']}\t{p['total_cells']}\t{p['pct']}"
             )
         return
 
     # table
     name_w = max(12, max(len(p["name"]) for p in projects))
-    header = f"{'Project':<{name_w}}  {'Samples':>7}  {'Analyses':>8}  {'Complete':>9}"
-    sep = "─" * (name_w + 32)
+    header = (
+        f"{'Project':<{name_w}}  {'Kind':<5}  {'Samples':>7}  "
+        f"{'Analyses':>8}  {'Complete':>9}"
+    )
+    sep = "─" * (name_w + 40)
     print("")
     print(header)
     print(sep)
     for p in projects:
+        kind = p.get("kind", "v0.2")
         print(
-            f"{p['name']:<{name_w}}  {p['samples']:>7}  {p['analyses']:>8}  "
-            f"{p['pct']:>7.1f}% "
+            f"{p['name']:<{name_w}}  {kind:<5}  {p['samples']:>7}  "
+            f"{p['analyses']:>8}  {p['pct']:>7.1f}% "
             + ("█" * int(p["pct"] / 10) + "░" * (10 - int(p["pct"] / 10)))
         )
     print(sep)
@@ -1729,6 +1758,13 @@ def cmd_dashboard(args):
 
 
 def cmd_rerun(args):
+    """Dispatch `casetrack rerun` to flat or project mode."""
+    if getattr(args, "project_dir", None):
+        return cmd_rerun_project(args)
+    return cmd_rerun_flat(args)
+
+
+def cmd_rerun_flat(args):
     """Generate (or submit) SLURM commands for samples missing a given analysis."""
     _warn_flat_deprecation()
     manifest_path = args.manifest
@@ -2789,6 +2825,384 @@ def cmd_append_project(args):
     )
 
 
+# ── v0.3 schema {show, dump, check, apply} ────────────────────────────────────
+#
+# `casetrack schema --project-dir D <action>` — manage the TOML↔DB schema
+# lifecycle (proposal 0001 §7.2).
+#   show   — print the current casetrack.toml
+#   dump   — regenerate TOML from the live DB (useful if TOML was lost)
+#   check  — report TOML↔DB drift (declared-missing / undeclared columns)
+#   apply  — add any TOML-declared columns that are missing in the DB via
+#            ALTER TABLE; bumps schema_v on change.
+
+
+_DB_TYPE_TO_TOML = {
+    "TEXT": "TEXT",
+    "INTEGER": "INTEGER",
+    "REAL": "REAL",
+    "BOOLEAN": "BOOLEAN",
+    "DATE": "DATE",
+    "": "TEXT",  # no declared type → TEXT (SQLite default affinity)
+}
+
+
+def _get_table_column_types(conn: sqlite3.Connection, table: str) -> dict:
+    """Return {colname: declared_type} for `table` via PRAGMA table_info."""
+    out = {}
+    for row in conn.execute(f"PRAGMA table_info({_quote_ident(table)})").fetchall():
+        # row = (cid, name, type, notnull, dflt_value, pk)
+        out[row[1]] = (row[2] or "").upper()
+    return out
+
+
+def cmd_schema_project(args):
+    action = getattr(args, "action", None) or "show"
+    if action not in {"show", "dump", "check", "apply"}:
+        print(
+            f"Error: unknown schema action {action!r}; must be show|dump|check|apply",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    project_dir, schema = _resolve_project(args.project_dir)
+    toml_path = project_dir / PROJECT_TOML_NAME
+
+    if action == "show":
+        print(toml_path.read_text(), end="")
+        return
+
+    if action == "dump":
+        conn = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            print(_dump_schema_from_db(conn, schema["project"]["name"],
+                                       schema["project"].get("schema_v", 1)))
+        finally:
+            conn.close()
+        return
+
+    if action in ("check", "apply"):
+        issues = _schema_drift(project_dir, schema)
+        if action == "check":
+            if not issues:
+                print("Schema OK: TOML matches DB.")
+                return
+            print(f"Schema drift ({len(issues)} issue(s)):", file=sys.stderr)
+            for i in issues:
+                print(f"  - {_format_drift_issue(i)}", file=sys.stderr)
+            sys.exit(1)
+        return _schema_apply(project_dir, schema, issues)
+
+
+def _schema_drift(project_dir: Path, schema: dict) -> list[dict]:
+    """Return a structured list of drift entries {'kind', 'table', 'column', ...}."""
+    issues: list[dict] = []
+    conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    try:
+        for level in LEVEL_ORDER:
+            table = f"{level}s"
+            declared = schema["levels"][level]["columns"]
+            actual = _get_table_column_types(conn, table)
+            for col, spec in declared.items():
+                if col not in actual:
+                    issues.append({
+                        "kind": "missing_in_db",
+                        "table": table,
+                        "column": col,
+                        "type": spec["type"],
+                    })
+            for col in actual:
+                if col in declared:
+                    continue
+                if col.endswith(DONE_COLUMN_SUFFIX):
+                    # Analysis-added columns legitimately live in the DB only.
+                    continue
+                # Check if this column was introduced by an `append` entry in
+                # provenance — that's how v0.3 tracks dynamic analysis columns.
+                if _is_analysis_column(project_dir / PROJECT_PROVENANCE_NAME, col):
+                    continue
+                issues.append({
+                    "kind": "undeclared_in_db",
+                    "table": table,
+                    "column": col,
+                })
+    finally:
+        conn.close()
+    return issues
+
+
+def _format_drift_issue(issue: dict) -> str:
+    table = issue["table"]
+    col = issue["column"]
+    if issue["kind"] == "missing_in_db":
+        return f"{table}.{col} ({issue['type']}) — declared in TOML but not in DB (run `schema apply`)"
+    if issue["kind"] == "undeclared_in_db":
+        return f"{table}.{col} — exists in DB but not declared in TOML (declare it or drop it)"
+    return f"{table}.{col} — unknown drift: {issue}"
+
+
+def _is_analysis_column(prov_path: Path, col: str) -> bool:
+    cols_by_analysis = _collect_analysis_columns_from_provenance(prov_path)
+    return any(col in cols for cols in cols_by_analysis.values())
+
+
+def _schema_apply(project_dir: Path, schema: dict, issues: list[dict]) -> None:
+    """Apply `missing_in_db` drift via ALTER TABLE ADD COLUMN. Bump schema_v."""
+    to_add = [i for i in issues if i["kind"] == "missing_in_db"]
+    if not to_add:
+        print("Schema up to date; nothing to apply.")
+        return
+
+    conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    executed_sql: list[str] = []
+    try:
+        with begin_immediate(conn):
+            for i in to_add:
+                ddl = (
+                    f"ALTER TABLE {_quote_ident(i['table'])} "
+                    f"ADD COLUMN {_quote_ident(i['column'])} {i['type']}"
+                )
+                conn.execute(ddl)
+                executed_sql.append(ddl)
+    finally:
+        conn.close()
+
+    # Bump schema_v in the TOML.
+    toml_path = project_dir / PROJECT_TOML_NAME
+    old_v = schema["project"].get("schema_v", 1)
+    new_v = old_v + 1
+    toml_text = toml_path.read_text()
+    # Simple line-level substitution — the templates write schema_v on its
+    # own line. If this fails we fall back to leaving the file alone; the
+    # provenance entry still records the intended version.
+    import re
+    patched = re.sub(
+        r"(?m)^schema_v\s*=\s*\d+\s*$",
+        f"schema_v = {new_v}",
+        toml_text,
+        count=1,
+    )
+    if patched != toml_text:
+        toml_path.write_text(patched)
+
+    log_project_provenance(project_dir, {
+        "action": "schema_apply",
+        "transaction_id": _new_transaction_id(),
+        "columns_added": [(i["table"], i["column"], i["type"]) for i in to_add],
+        "sql": executed_sql,
+        "schema_v_before": old_v,
+        "schema_v_after": new_v,
+    })
+
+    print(
+        f"Applied {len(to_add)} schema change(s); schema_v {old_v} → {new_v}."
+    )
+    for i in to_add:
+        print(f"  + {i['table']}.{i['column']} {i['type']}")
+
+
+def _dump_schema_from_db(conn: sqlite3.Connection, project_name: str, schema_v: int) -> str:
+    """Reverse-engineer a casetrack.toml from the live DB's PRAGMA data."""
+    now = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    lines = [
+        "[project]",
+        f'name     = "{project_name}"',
+        f"schema_v = {schema_v}",
+        f'created  = "{now}"',
+        "",
+    ]
+    parents = {"patient": (None, None), "specimen": ("patient", "patient_id"),
+               "assay": ("specimen", "specimen_id")}
+    for level in LEVEL_ORDER:
+        table = f"{level}s"
+        key_col = f"{level}_id"
+        cols = conn.execute(f"PRAGMA table_info({_quote_ident(table)})").fetchall()
+        lines.append(f"[levels.{level}]")
+        lines.append(f'key        = "{key_col}"')
+        parent, parent_key = parents[level]
+        if parent:
+            lines.append(f'parent     = "{parent}"')
+            lines.append(f'parent_key = "{parent_key}"')
+        lines.append("")
+        lines.append(f"[levels.{level}.columns]")
+        for _cid, name, ctype, notnull, _dflt, pk in cols:
+            # Skip analysis-added columns — they belong in provenance, not schema.
+            if name.endswith(DONE_COLUMN_SUFFIX):
+                continue
+            normalized = _DB_TYPE_TO_TOML.get((ctype or "").upper(), "TEXT")
+            props = [f'type = "{normalized}"']
+            if pk or notnull:
+                props.append("required = true")
+            if pk:
+                props.append("unique = true")
+            lines.append(f"{name} = {{ {', '.join(props)} }}")
+        lines.append("")
+    lines += [
+        "[analysis_defaults]",
+        'default_level = "assay"',
+        "",
+        "[engine]",
+        "wal             = true",
+        f"busy_timeout_ms = {SQLITE_BUSY_TIMEOUT_MS}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# ── v0.3 projects --root (v0.3 + v0.2 detection) ───────────────────────────────
+#
+# Walk a root directory, finding both flat-mode manifest.tsv files AND v0.3
+# projects (casetrack.toml + casetrack.db). Summaries come from the same
+# `_summarize_project` function for flat mode; v0.3 projects get their own
+# summarizer that talks to SQLite.
+
+
+def _find_v03_projects(root: Path, max_depth: int) -> list:
+    """Return casetrack.toml paths under `root` that have a sibling
+    casetrack.db. A TOML without a DB is treated as a partial / broken
+    project and skipped — the `projects` overview is meant for live state."""
+    root = root.resolve()
+    matches = []
+    for toml in root.rglob(PROJECT_TOML_NAME):
+        if not toml.is_file():
+            continue
+        try:
+            rel_parts = toml.resolve().relative_to(root).parts
+        except ValueError:
+            continue
+        depth = len(rel_parts) - 1
+        if depth > max_depth:
+            continue
+        if any(part.startswith(".") or part == "sandbox" for part in rel_parts[:-1]):
+            continue
+        if not (toml.parent / PROJECT_DB_NAME).exists():
+            continue
+        matches.append(toml)
+    return matches
+
+
+def _summarize_v03_project(toml_path: Path) -> dict:
+    project_dir = toml_path.parent
+    schema = load_schema(toml_path)
+    conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    try:
+        counts = {
+            level: conn.execute(
+                f"SELECT COUNT(*) FROM {_quote_ident(f'{level}s')}"
+            ).fetchone()[0]
+            for level in LEVEL_ORDER
+        }
+        done_by_level = _discover_done_columns(conn)
+        done_total = sum(len(v) for v in done_by_level.values())
+        total_cells = sum(
+            len(done_by_level[lv]) * counts[lv] for lv in LEVEL_ORDER
+        )
+        completed = 0
+        for level in LEVEL_ORDER:
+            table = f"{level}s"
+            for dc in done_by_level[level]:
+                (n,) = conn.execute(
+                    f"SELECT COUNT(*) FROM {_quote_ident(table)} "
+                    f"WHERE {_quote_ident(dc)} IS NOT NULL"
+                ).fetchone()
+                completed += n
+    finally:
+        conn.close()
+
+    pct = round(100.0 * completed / total_cells, 1) if total_cells else 0.0
+    return {
+        "kind": "v0.3",
+        "name": project_dir.name,
+        "path": str(toml_path),
+        # `samples` = assays count so the overview table compares apples-
+        # to-apples with v0.2 (one flat row ≈ one assay in v0.3).
+        "samples": counts["assay"],
+        "patients": counts["patient"],
+        "specimens": counts["specimen"],
+        "assays": counts["assay"],
+        "analyses": done_total,
+        "completed_cells": completed,
+        "total_cells": total_cells,
+        "pct": pct,
+        "schema_v": schema["project"].get("schema_v"),
+    }
+
+
+# ── v0.3 rerun (assays missing an analysis) ───────────────────────────────────
+
+
+def cmd_rerun_project(args):
+    project_dir, schema = _resolve_project(args.project_dir)
+    if not args.list_only and not args.script:
+        print("Error: --script is required unless --list-only is used.", file=sys.stderr)
+        sys.exit(1)
+    level = args.level or _default_analysis_level(schema)
+    if level not in LEVEL_ORDER:
+        print(f"Error: --level must be one of {list(LEVEL_ORDER)}, got {level!r}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    level_spec = schema["levels"][level]
+    table = f"{level}s"
+    key_col = level_spec["key"]
+    done_col = f"{args.analysis}{DONE_COLUMN_SUFFIX}"
+
+    conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    try:
+        actual_cols = set(_get_table_columns(conn, table))
+        if done_col not in actual_cols:
+            # Analysis has never been run — every row is "missing".
+            missing_keys = [
+                r[0] for r in conn.execute(
+                    f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)} "
+                    f"ORDER BY {_quote_ident(key_col)}"
+                ).fetchall()
+            ]
+        else:
+            missing_keys = [
+                r[0] for r in conn.execute(
+                    f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)} "
+                    f"WHERE {_quote_ident(done_col)} IS NULL "
+                    f"ORDER BY {_quote_ident(key_col)}"
+                ).fetchall()
+            ]
+    finally:
+        conn.close()
+
+    if not missing_keys:
+        print(f"No {level}s missing analysis {args.analysis!r}.")
+        return
+
+    if args.list_only:
+        for k in missing_keys:
+            print(k)
+        return
+
+    extra = f" {args.extra}" if args.extra else ""
+    submitted = 0
+    failed = 0
+    for k in missing_keys:
+        cmd = f"sbatch --export=ALL,{key_col.upper()}={k},PROJECT_DIR={project_dir} {args.script}{extra}"
+        if args.submit:
+            rc = subprocess_run(cmd)
+            if rc == 0:
+                submitted += 1
+            else:
+                failed += 1
+        else:
+            print(cmd)
+
+    if args.submit:
+        print(f"Submitted {submitted} job(s); {failed} failed." if failed
+              else f"Submitted {submitted} job(s).")
+        if failed:
+            sys.exit(1)
+
+
+def subprocess_run(cmd: str) -> int:
+    """Run a shell command, return its exit code. Thin wrapper for testability."""
+    import subprocess
+    return subprocess.run(cmd, shell=True).returncode
+
+
 # ── v0.3 add-metadata (bulk UPDATE / INSERT) ──────────────────────────────────
 #
 # `casetrack add-metadata --project-dir DIR --level LEVEL --metadata TSV`
@@ -3552,9 +3966,22 @@ Examples:
     )
 
     # ── schema ──
-    p_schema = subparsers.add_parser("schema", help="Show column-to-analysis mapping")
-    p_schema.add_argument("--manifest", required=True, help="Path to manifest TSV")
-    p_schema.add_argument("--fmt", choices=["table", "json"], default="table", help="Output format")
+    p_schema = subparsers.add_parser(
+        "schema",
+        help="Show / dump / check / apply schema (flat: column-to-analysis map)",
+    )
+    g_schema_target = p_schema.add_mutually_exclusive_group(required=True)
+    g_schema_target.add_argument("--manifest", help="[flat mode] Path to manifest TSV")
+    g_schema_target.add_argument("--project-dir", help="[project mode] Casetrack project directory")
+    p_schema.add_argument(
+        "action",
+        nargs="?",
+        choices=["show", "dump", "check", "apply"],
+        default=None,
+        help="[project mode] What to do (default: show)",
+    )
+    p_schema.add_argument("--fmt", choices=["table", "json"], default="table",
+                          help="[flat mode] Output format")
 
     # ── query ──
     p_query = subparsers.add_parser(
@@ -3625,15 +4052,22 @@ Examples:
     # ── rerun ──
     p_rerun = subparsers.add_parser(
         "rerun",
-        help="Emit or submit sbatch commands for samples missing a given analysis",
+        help="Emit/submit sbatch commands for rows missing a given analysis",
     )
-    p_rerun.add_argument("--manifest", required=True, help="Path to manifest TSV")
+    g_rerun_target = p_rerun.add_mutually_exclusive_group(required=True)
+    g_rerun_target.add_argument("--manifest", help="[flat mode] Path to manifest TSV")
+    g_rerun_target.add_argument("--project-dir", help="[project mode] Casetrack project directory")
     p_rerun.add_argument("--analysis", required=True, help="Analysis whose _done column to check")
-    p_rerun.add_argument("--script", required=True, help="sbatch script path (receives sample_id, manifest)")
-    p_rerun.add_argument("--key", default="sample_id", help="Key column name (default: sample_id)")
+    p_rerun.add_argument("--script", help="sbatch script path (required unless --list-only)")
+    p_rerun.add_argument("--key", default="sample_id", help="[flat mode] Key column (default: sample_id)")
+    p_rerun.add_argument(
+        "--level",
+        choices=list(LEVEL_ORDER),
+        help="[project mode] Which level's _done column to check (default: assay)",
+    )
     p_rerun.add_argument("--submit", action="store_true", help="Actually invoke sbatch (default: dry-run)")
-    p_rerun.add_argument("--list-only", action="store_true", help="Print bare sample IDs, not sbatch commands")
-    p_rerun.add_argument("--extra", help="Extra args appended to each sbatch command (quoted string)")
+    p_rerun.add_argument("--list-only", action="store_true", help="Print bare IDs, not sbatch commands")
+    p_rerun.add_argument("--extra", help="Extra args appended to each sbatch command")
 
     # ── export ──
     p_export = subparsers.add_parser("export", help="Export manifest to other formats")
