@@ -35,6 +35,19 @@ python3 "${ROOT}/bootstrap.py" \
     --sample-sheet "${SHEET}" \
     --project-dir "${PROJECT_DIR}"
 
+# ── 1b. Snapshot the wrapper scripts into the project for audit ──────────────
+# The SLURM wrappers + summarizers live in the casetrack repo; without a
+# local copy next to the results, the project dir alone doesn't answer
+# "what code produced these numbers?". Snapshot them, and record the
+# git commit hash they came from.
+SNAP="${PROJECT_DIR}/scripts"
+mkdir -p "${SNAP}/slurm" "${SNAP}/summarize"
+cp -f "${HERE}"/run_*.sh "${HERE}/submit_all.sh" "${SNAP}/slurm/"
+cp -f "${ROOT}/scripts/"summarize_*.py "${SNAP}/summarize/" 2>/dev/null || true
+( cd "${ROOT}" && git rev-parse HEAD 2>/dev/null ) > "${SNAP}/.source_commit" || true
+( cd "${ROOT}" && git status --porcelain examples/giab_chr21 2>/dev/null ) > "${SNAP}/.source_dirty"
+echo "Snapshotted wrapper scripts to ${SNAP}/ (commit $(cat ${SNAP}/.source_commit 2>/dev/null || echo unknown))"
+
 # ── 2. Fan out per-analysis sbatch commands ───────────────────────────────────
 # skip header (NR>1), emit (assay_id, bam_path) tuples.
 while IFS=$'\t' read -r patient_id assay_id condition assay_type bam_path; do
@@ -54,6 +67,13 @@ while IFS=$'\t' read -r patient_id assay_id condition assay_type bam_path; do
             exports+=",REF_FASTA=${REF_FASTA}"
             # chr21 restriction for the demo BAMs.
             exports+=",CHR_LIMIT=chr21"
+        fi
+        if [[ "${analysis}" == "sniffles" ]]; then
+            if [[ -z "${REF_FASTA:-}" ]]; then
+                echo "Skipping sniffles for ${assay_id}: REF_FASTA not set" >&2
+                continue
+            fi
+            exports+=",REF_FASTA=${REF_FASTA}"
         fi
         # --chdir so the SBATCH #output/logs/ path lands inside the project dir.
         mkdir -p "${PROJECT_DIR}/logs"

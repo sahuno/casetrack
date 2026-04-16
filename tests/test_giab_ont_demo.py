@@ -250,6 +250,73 @@ chr21\t400\t401\th\t.\t+\t400\t401\t0,0,0\t15\t10.0\t1\t14\t0\t0\t0\t0\t0
 """
 
 
+# ── summarize_sniffles.py (real VCF parser, canned input) ─────────────────────
+
+
+SNIFFLES_VCF_FIXTURE = """\
+##fileformat=VCFv4.2
+##source=Sniffles2_2.4
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type">
+##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="Length">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE
+chr21\t1000\ts1\tN\t<INS>\t30\tPASS\tSVTYPE=INS;SVLEN=500\tGT\t0/1
+chr21\t2000\ts2\tN\t<DEL>\t30\tPASS\tSVTYPE=DEL;SVLEN=-120\tGT\t0/1
+chr21\t3000\ts3\tN\t<INV>\t30\tPASS\tSVTYPE=INV;SVLEN=800\tGT\t0/1
+chr21\t4000\ts4\tN\t<DUP>\t30\tPASS\tSVTYPE=DUP;SVLEN=200\tGT\t0/1
+chr21\t5000\ts5\tN\tN]chr22:1000]\t30\tPASS\tSVTYPE=BND\tGT\t0/1
+chr21\t6000\ts6\tN\t<DEL>\t30\tPASS\tSVTYPE=DEL;SVLEN=-80\tGT\t0/1
+"""
+
+
+def test_summarize_sniffles_parses_vcf(tmp_path: Path):
+    vcf = tmp_path / "sample.vcf"
+    vcf.write_text(SNIFFLES_VCF_FIXTURE)
+
+    out = tmp_path / "out.tsv"
+    subprocess.run(
+        [sys.executable,
+         str(DEMO_DIR / "scripts" / "summarize_sniffles.py"),
+         "--assay-id", "A1",
+         "--input", str(vcf),
+         "--output", str(out)],
+        check=True,
+    )
+    df = pd.read_csv(out, sep="\t")
+    row = df.iloc[0]
+    assert row["assay_id"] == "A1"
+    assert row["n_svs_total"] == 6
+    assert row["n_ins"] == 1
+    assert row["n_del"] == 2
+    assert row["n_inv"] == 1
+    # DUP merges into BND in the summary (so INS+DEL+INV+BND sums to total).
+    assert row["n_bnd"] == 2
+    assert row["n_ins"] + row["n_del"] + row["n_inv"] + row["n_bnd"] == row["n_svs_total"]
+    # SVLEN values present: 500, 120, 800, 200, 80 → median = 200
+    assert row["sv_size_median"] == 200
+
+
+def test_summarize_sniffles_gzipped_input(tmp_path: Path):
+    import gzip
+    vcf = tmp_path / "sample.vcf.gz"
+    with gzip.open(vcf, "wt") as f:
+        f.write(SNIFFLES_VCF_FIXTURE)
+
+    out = tmp_path / "out.tsv"
+    subprocess.run(
+        [sys.executable,
+         str(DEMO_DIR / "scripts" / "summarize_sniffles.py"),
+         "--assay-id", "A1",
+         "--input", str(vcf),
+         "--output", str(out)],
+        check=True,
+    )
+    df = pd.read_csv(out, sep="\t")
+    assert df.iloc[0]["n_svs_total"] == 6
+
+
+# ── summarize_modkit.py (real bedMethyl parser, canned input) ─────────────────
+
+
 def test_summarize_modkit_parses_bedmethyl(tmp_path: Path):
     bed = tmp_path / "sample.bedMethyl"
     bed.write_text(BEDMETHYL_FIXTURE)
