@@ -1790,6 +1790,430 @@ def cmd_export(args):
     print(f"Exported {len(manifest)} samples to {output_path}")
 
 
+# ── v0.3 Migration (flat TSV → SQLite project) ─────────────────────────────────
+#
+# Implements `casetrack migrate` per proposal 0001 §13.1. Flow:
+#   1. Read flat TSV + required level-key columns.
+#   2. Classify each non-key column to patient/specimen/assay.
+#        - --metadata-map is an explicit override.
+#        - Otherwise: column is assigned to the coarsest level at which its
+#          value is constant within every group (ignoring NaN). Never
+#          ambiguous by construction — every column lands exactly once.
+#   3. Infer a SQLite column type from the pandas dtype.
+#   4. Write casetrack.toml, init the DB, insert rows per level inside one
+#      transaction. FK violations during insert abort with rollback.
+#   5. Emit .migration_report.{tsv,md}; copy source TSV to sandbox/.
+
+
+class MigrationError(RuntimeError):
+    """Raised on migration pre-flight or routing failures."""
+
+
+def _parse_metadata_map(spec: str | None) -> dict:
+    """Parse 'patient:a,b;specimen:c,d' into {level: set(cols)}.
+
+    Unknown levels raise MigrationError. Empty/None spec returns empty dict.
+    """
+    out = {level: set() for level in LEVEL_ORDER}
+    if not spec:
+        return out
+    for chunk in spec.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise MigrationError(
+                f"--metadata-map: expected 'level:col1,col2', got {chunk!r}"
+            )
+        level, cols = chunk.split(":", 1)
+        level = level.strip()
+        if level not in LEVEL_ORDER:
+            raise MigrationError(
+                f"--metadata-map: unknown level {level!r}; must be one of {list(LEVEL_ORDER)}"
+            )
+        for col in cols.split(","):
+            col = col.strip()
+            if col:
+                out[level].add(col)
+    return out
+
+
+def _classify_column(df: "pd.DataFrame", col: str, patient_col: str, specimen_col: str) -> tuple[str, str]:
+    """Decide which level a column belongs to from constant-within-group analysis.
+
+    Returns (level, reason). `reason` is a short string that goes into the
+    audit report so the user can understand every routing decision.
+    """
+    if _is_constant_per_group(df, col, patient_col):
+        return "patient", "constant within every patient"
+    if _is_constant_per_group(df, col, specimen_col):
+        return "specimen", "constant within every specimen"
+    return "assay", "varies within specimens"
+
+
+def _is_constant_per_group(df: "pd.DataFrame", col: str, group_col: str) -> bool:
+    """True iff every group in `group_col` has ≤1 non-NaN unique value of `col`."""
+    for _, group in df.groupby(group_col, dropna=False):
+        if group[col].dropna().nunique() > 1:
+            return False
+    return True
+
+
+def _infer_column_type(series: "pd.Series") -> str:
+    """Map a pandas column dtype to one of {TEXT, INTEGER, REAL, BOOLEAN, DATE}."""
+    dtype = series.dtype
+    if pd.api.types.is_bool_dtype(dtype):
+        return "BOOLEAN"
+    if pd.api.types.is_integer_dtype(dtype):
+        return "INTEGER"
+    if pd.api.types.is_float_dtype(dtype):
+        # Could be an int column with NaN. REAL is safest without re-parsing.
+        return "REAL"
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        return "DATE"
+    return "TEXT"
+
+
+def _render_migration_toml(
+    project_name: str,
+    patient_col: str,
+    specimen_col: str,
+    assay_col: str,
+    classifications: dict,
+    types: dict,
+) -> str:
+    """Render a schema TOML string from the migration plan."""
+    now = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    lines = [
+        "[project]",
+        f'name     = "{project_name}"',
+        "schema_v = 1",
+        f'created  = "{now}"',
+        "",
+    ]
+
+    level_columns: dict[str, list[tuple[str, str]]] = {lv: [] for lv in LEVEL_ORDER}
+    # Each level's key column is required + unique.
+    level_columns["patient"].append((patient_col, "TEXT"))
+    level_columns["specimen"].append((specimen_col, "TEXT"))
+    level_columns["specimen"].append((patient_col, "TEXT"))  # FK
+    level_columns["assay"].append((assay_col, "TEXT"))
+    level_columns["assay"].append((specimen_col, "TEXT"))  # FK
+
+    for col, level in classifications.items():
+        level_columns[level].append((col, types[col]))
+
+    keys = {"patient": patient_col, "specimen": specimen_col, "assay": assay_col}
+    parents = {"patient": None, "specimen": "patient", "assay": "specimen"}
+    parent_keys = {"patient": None, "specimen": patient_col, "assay": specimen_col}
+
+    for level in LEVEL_ORDER:
+        lines.append(f"[levels.{level}]")
+        lines.append(f'key        = "{keys[level]}"')
+        if parents[level]:
+            lines.append(f'parent     = "{parents[level]}"')
+            lines.append(f'parent_key = "{parent_keys[level]}"')
+        lines.append("")
+        lines.append(f"[levels.{level}.columns]")
+        seen = set()
+        for col, ctype in level_columns[level]:
+            if col in seen:
+                continue
+            seen.add(col)
+            props = [f'type = "{ctype}"']
+            if col == keys[level]:
+                props += ["required = true", "unique = true"]
+            elif col == parent_keys[level]:
+                props += ["required = true"]
+            lines.append(f"{col} = {{ {', '.join(props)} }}")
+        lines.append("")
+
+    lines += [
+        "[analysis_defaults]",
+        'default_level = "assay"',
+        "",
+        "[engine]",
+        "wal             = true",
+        f"busy_timeout_ms = {SQLITE_BUSY_TIMEOUT_MS}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _insert_rows_by_level(
+    conn: sqlite3.Connection,
+    df: "pd.DataFrame",
+    patient_col: str,
+    specimen_col: str,
+    assay_col: str,
+    classifications: dict,
+) -> dict:
+    """Insert deduplicated rows into patients → specimens → assays.
+
+    Returns {level: n_inserted}. Runs in the caller's transaction.
+    """
+    counts = {"patient": 0, "specimen": 0, "assay": 0}
+
+    # Group columns by their assigned level (keys/FKs implicit).
+    level_cols = {lv: [] for lv in LEVEL_ORDER}
+    for col, level in classifications.items():
+        level_cols[level].append(col)
+
+    # Patients: one row per unique patient_id. Collapse metadata by taking the
+    # first non-NaN value in each patient group.
+    patient_rows = _dedupe_group(df, [patient_col], level_cols["patient"])
+    _insert_rows(conn, "patients", patient_rows, [patient_col] + level_cols["patient"])
+    counts["patient"] = len(patient_rows)
+
+    # Specimens: one row per unique specimen_id, carrying its patient_id FK.
+    specimen_rows = _dedupe_group(
+        df, [specimen_col, patient_col], level_cols["specimen"]
+    )
+    _insert_rows(
+        conn,
+        "specimens",
+        specimen_rows,
+        [specimen_col, patient_col] + level_cols["specimen"],
+    )
+    counts["specimen"] = len(specimen_rows)
+
+    # Assays: every row of the flat TSV is one assay row.
+    assay_cols = [assay_col, specimen_col] + level_cols["assay"]
+    assay_rows = df[assay_cols].where(pd.notnull(df[assay_cols]), None).to_dict(orient="records")
+    _insert_rows(conn, "assays", assay_rows, assay_cols)
+    counts["assay"] = len(assay_rows)
+
+    return counts
+
+
+def _dedupe_group(df: "pd.DataFrame", key_cols: list, value_cols: list) -> list[dict]:
+    """For each unique combination of `key_cols`, take the first non-NaN of each `value_col`."""
+    out = []
+    for key_vals, group in df.groupby(key_cols, dropna=False):
+        row = dict(zip(key_cols, key_vals if isinstance(key_vals, tuple) else (key_vals,)))
+        for col in value_cols:
+            non_na = group[col].dropna()
+            row[col] = non_na.iloc[0] if not non_na.empty else None
+        out.append(row)
+    return out
+
+
+def _insert_rows(conn: sqlite3.Connection, table: str, rows: list[dict], cols: list) -> None:
+    if not rows:
+        return
+    placeholders = ", ".join("?" * len(cols))
+    quoted_cols = ", ".join(_quote_ident(c) for c in cols)
+    sql = f"INSERT INTO {_quote_ident(table)} ({quoted_cols}) VALUES ({placeholders})"
+    values = [tuple(_coerce_for_sqlite(r.get(c)) for c in cols) for r in rows]
+    conn.executemany(sql, values)
+
+
+def _coerce_for_sqlite(value):
+    """pandas NaN → None; numpy bool/int/float → python scalar."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "item"):  # numpy scalar
+        return value.item()
+    return value
+
+
+def _write_migration_reports(
+    out_dir: Path,
+    source_path: Path,
+    classifications: dict,
+    types: dict,
+    reasons: dict,
+    counts: dict,
+    patient_col: str,
+    specimen_col: str,
+    assay_col: str,
+) -> None:
+    """Emit .migration_report.tsv (machine-readable) and .migration_report.md."""
+    tsv_path = out_dir / ".migration_report.tsv"
+    md_path = out_dir / ".migration_report.md"
+
+    rows = []
+    for col, level in sorted(classifications.items()):
+        rows.append({
+            "column": col,
+            "assigned_level": level,
+            "sqlite_type": types[col],
+            "reason": reasons[col],
+        })
+    pd.DataFrame(rows).to_csv(tsv_path, sep="\t", index=False)
+
+    md_lines = [
+        f"# Casetrack migration report — {datetime.datetime.now().strftime(TIMESTAMP_FMT)}",
+        "",
+        f"- **Source**: `{source_path}`",
+        f"- **Level keys**: patient=`{patient_col}`, specimen=`{specimen_col}`, assay=`{assay_col}`",
+        f"- **Rows inserted**: patients={counts['patient']}, "
+        f"specimens={counts['specimen']}, assays={counts['assay']}",
+        "",
+        "## Column routing",
+        "",
+        "| column | level | type | reason |",
+        "| --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        md_lines.append(
+            f"| `{row['column']}` | {row['assigned_level']} | "
+            f"{row['sqlite_type']} | {row['reason']} |"
+        )
+    md_lines.append("")
+    md_lines.append(
+        "> If a column was routed to the wrong level, re-run with "
+        "`--metadata-map 'patient:colA;specimen:colB'` to override."
+    )
+    md_path.write_text("\n".join(md_lines) + "\n")
+
+
+def cmd_migrate(args):
+    """Convert a v0.2 flat manifest into a v0.3 casetrack project."""
+    source_path = Path(args.flat)
+    out_dir = Path(args.out_dir)
+    patient_col = args.patient_col
+    specimen_col = args.specimen_col
+    assay_col = args.assay_col
+
+    if not source_path.exists():
+        print(f"Error: flat manifest not found: {source_path}", file=sys.stderr)
+        sys.exit(1)
+
+    db_path = out_dir / PROJECT_DB_NAME
+    if db_path.exists() and not args.force:
+        print(
+            f"Error: {db_path} already exists. Use --force to overwrite.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        metadata_map = _parse_metadata_map(args.metadata_map)
+    except MigrationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    df = pd.read_csv(source_path, sep="\t")
+    for col in (patient_col, specimen_col, assay_col):
+        if col not in df.columns:
+            print(
+                f"Error: required column {col!r} not in {source_path}. "
+                f"Available: {list(df.columns)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    level_key_cols = {patient_col, specimen_col, assay_col}
+    classifications: dict = {}
+    reasons: dict = {}
+    types: dict = {}
+    for col in df.columns:
+        if col in level_key_cols:
+            continue
+        # Manual override wins.
+        override_level = None
+        for level, cols in metadata_map.items():
+            if col in cols:
+                override_level = level
+                break
+        if override_level is not None:
+            classifications[col] = override_level
+            reasons[col] = f"--metadata-map override → {override_level}"
+        else:
+            level, reason = _classify_column(df, col, patient_col, specimen_col)
+            classifications[col] = level
+            reasons[col] = reason
+        types[col] = _infer_column_type(df[col])
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    project_name = args.project_name or out_dir.resolve().name
+
+    toml_text = _render_migration_toml(
+        project_name, patient_col, specimen_col, assay_col, classifications, types
+    )
+    toml_path = out_dir / PROJECT_TOML_NAME
+    toml_path.write_text(toml_text)
+
+    try:
+        schema = load_schema(toml_path)
+    except SchemaError as e:
+        print(f"Error: generated schema failed validation: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if db_path.exists():
+        db_path.unlink()
+        for suffix in ("-wal", "-shm"):
+            leftover = Path(str(db_path) + suffix)
+            if leftover.exists():
+                leftover.unlink()
+
+    conn = open_project_db(db_path)
+    try:
+        with begin_immediate(conn):
+            for ddl in schema_to_ddl(schema):
+                conn.execute(ddl)
+        with begin_immediate(conn):
+            counts = _insert_rows_by_level(
+                conn, df, patient_col, specimen_col, assay_col, classifications
+            )
+    except sqlite3.IntegrityError as e:
+        conn.close()
+        print(
+            f"Error: migration aborted — {type(e).__name__}: {e}\n"
+            f"Hint: check for FK violations (specimens without patients, etc.) "
+            f"or duplicate IDs in the source TSV.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    finally:
+        if conn:
+            conn.close()
+
+    # Post-migration artifacts.
+    prov_path = out_dir / PROJECT_PROVENANCE_NAME
+    if not prov_path.exists():
+        prov_path.touch()
+    gitignore_path = out_dir / PROJECT_GITIGNORE_NAME
+    if not gitignore_path.exists():
+        gitignore_path.write_text(_project_gitignore_contents())
+
+    sandbox = out_dir / "sandbox"
+    sandbox.mkdir(exist_ok=True)
+    shutil.copy2(source_path, sandbox / "source_manifest.tsv")
+
+    _write_migration_reports(
+        out_dir, source_path, classifications, types, reasons,
+        counts, patient_col, specimen_col, assay_col,
+    )
+
+    log_project_provenance(out_dir, {
+        "action": "migrate",
+        "transaction_id": _new_transaction_id(),
+        "source": str(source_path),
+        "source_checksum": _checksum(str(source_path)),
+        "rows_inserted": counts,
+        "column_classifications": classifications,
+        "column_types": types,
+        "schema_v_before": 0,
+        "schema_v_after": schema["project"]["schema_v"],
+    })
+
+    print(
+        f"Migrated {source_path} → {out_dir}/\n"
+        f"  patients  : {counts['patient']} rows\n"
+        f"  specimens : {counts['specimen']} rows\n"
+        f"  assays    : {counts['assay']} rows\n"
+        f"Routing: {len(classifications)} non-key columns classified "
+        f"(see .migration_report.md)."
+    )
+
+
 # ── CLI Parser ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -1958,6 +2382,30 @@ Examples:
     p_export.add_argument("--manifest", required=True, help="Path to manifest TSV")
     p_export.add_argument("--output", required=True, help="Output path (.xlsx, .csv, .json, .parquet)")
 
+    # ── migrate ──
+    p_migrate = subparsers.add_parser(
+        "migrate",
+        help="Convert a v0.2 flat manifest TSV into a v0.3 casetrack project",
+    )
+    p_migrate.add_argument("--flat", required=True, help="Path to source flat manifest TSV")
+    p_migrate.add_argument("--patient-col", required=True, help="Column name in --flat that holds patient_id")
+    p_migrate.add_argument("--specimen-col", required=True, help="Column name in --flat that holds specimen_id")
+    p_migrate.add_argument("--assay-col", required=True, help="Column name in --flat that holds assay_id")
+    p_migrate.add_argument(
+        "--metadata-map",
+        help="Manual overrides, e.g. 'patient:age,brca_status;specimen:tissue_site'",
+    )
+    p_migrate.add_argument("--out-dir", required=True, help="Output project directory")
+    p_migrate.add_argument(
+        "--project-name",
+        help="Project name written into casetrack.toml (default: out-dir basename)",
+    )
+    p_migrate.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing casetrack.db in --out-dir",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1977,6 +2425,7 @@ Examples:
         "projects": cmd_projects,
         "query": cmd_query,
         "export": cmd_export,
+        "migrate": cmd_migrate,
     }
 
     commands[args.command](args)
