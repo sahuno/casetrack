@@ -858,6 +858,13 @@ def cmd_append_flat(args):
 
 
 def cmd_status(args):
+    """Dispatch `casetrack status` to flat or project mode."""
+    if getattr(args, "project_dir", None):
+        return cmd_status_project(args)
+    return cmd_status_flat(args)
+
+
+def cmd_status_flat(args):
     """Show completion status across analyses."""
     manifest_path = args.manifest
 
@@ -931,6 +938,13 @@ def cmd_status(args):
 
 
 def cmd_validate(args):
+    """Dispatch `casetrack validate` to flat or project mode."""
+    if getattr(args, "project_dir", None):
+        return cmd_validate_project(args)
+    return cmd_validate_flat(args)
+
+
+def cmd_validate_flat(args):
     """Validate manifest integrity."""
     manifest_path = args.manifest
     key_col = args.key
@@ -997,6 +1011,13 @@ def cmd_validate(args):
 
 
 def cmd_log(args):
+    """Dispatch `casetrack log` to flat or project mode."""
+    if getattr(args, "project_dir", None):
+        return cmd_log_project(args)
+    return cmd_log_flat(args)
+
+
+def cmd_log_flat(args):
     """Show provenance log entries."""
     manifest_path = args.manifest
     log_path = manifest_path + PROVENANCE_SUFFIX
@@ -2724,6 +2745,403 @@ def cmd_append_project(args):
     )
 
 
+# ── v0.3 status ────────────────────────────────────────────────────────────────
+#
+# Implements `casetrack status --project-dir` per proposal 0001 §7.1. Four
+# group-by modes — analysis (default), assay, specimen, patient — all driven
+# by discovering `_done` columns on each table and querying via SQL.
+
+
+def _discover_done_columns(conn: sqlite3.Connection) -> dict:
+    """Return {level: [done_col, ...]} for every `_done` column on each table."""
+    out: dict = {}
+    for level in LEVEL_ORDER:
+        table = f"{level}s"
+        out[level] = [
+            c for c in _get_table_columns(conn, table)
+            if c.endswith(DONE_COLUMN_SUFFIX)
+        ]
+    return out
+
+
+def cmd_status_project(args):
+    project_dir, schema = _resolve_project(args.project_dir)
+    conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    try:
+        group_by = args.group_by or "analysis"
+        done_by_level = _discover_done_columns(conn)
+        counts_by_level = {
+            level: conn.execute(
+                f"SELECT COUNT(*) FROM {_quote_ident(f'{level}s')}"
+            ).fetchone()[0]
+            for level in LEVEL_ORDER
+        }
+
+        if group_by == "analysis":
+            report = _status_by_analysis(conn, done_by_level, counts_by_level)
+        elif group_by == "assay":
+            report = _status_by_row(conn, "assay", done_by_level["assay"])
+        elif group_by == "specimen":
+            report = _status_by_rollup(conn, "specimen", done_by_level)
+        elif group_by == "patient":
+            report = _status_by_rollup(conn, "patient", done_by_level)
+        else:
+            print(f"Error: unknown --group-by {group_by!r}", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        conn.close()
+
+    _emit_status(report, fmt=args.fmt, project_dir=project_dir, group_by=group_by,
+                 counts=counts_by_level)
+
+
+def _status_by_analysis(conn, done_by_level, counts_by_level) -> list[dict]:
+    rows = []
+    for level in LEVEL_ORDER:
+        table = f"{level}s"
+        total = counts_by_level[level]
+        for done_col in done_by_level[level]:
+            (done,) = conn.execute(
+                f"SELECT COUNT(*) FROM {_quote_ident(table)} "
+                f"WHERE {_quote_ident(done_col)} IS NOT NULL"
+            ).fetchone()
+            pct = round(100.0 * done / total, 1) if total else 0.0
+            rows.append({
+                "analysis": done_col[: -len(DONE_COLUMN_SUFFIX)],
+                "level": level,
+                "done": done,
+                "total": total,
+                "pct": pct,
+            })
+    rows.sort(key=lambda r: (r["level"], r["analysis"]))
+    return rows
+
+
+def _status_by_row(conn, level: str, done_cols: list) -> list[dict]:
+    """One row per entity at `level`, listing which analyses are done."""
+    if not done_cols:
+        return []
+    table = f"{level}s"
+    key = f"{level}_id"
+    select_cols = [key] + done_cols
+    sql_cols = ", ".join(_quote_ident(c) for c in select_cols)
+    rows = []
+    for r in conn.execute(
+        f"SELECT {sql_cols} FROM {_quote_ident(table)} ORDER BY {_quote_ident(key)}"
+    ).fetchall():
+        entity_id, *done_vals = r
+        done_names = [
+            dc[: -len(DONE_COLUMN_SUFFIX)]
+            for dc, v in zip(done_cols, done_vals)
+            if v is not None
+        ]
+        rows.append({
+            level + "_id": entity_id,
+            "analyses_done": done_names,
+            "n_done": len(done_names),
+            "n_total": len(done_cols),
+        })
+    return rows
+
+
+def _status_by_rollup(conn, level: str, done_by_level: dict) -> list[dict]:
+    """Per-entity at `level`, count children and completed assay-level analyses.
+
+    For --group-by specimen: counts assays per specimen and how many of each
+    assay-level analysis are done within the specimen.
+    For --group-by patient: same, walked through specimens.
+    """
+    if level == "specimen":
+        outer_table, outer_key = "specimens", "specimen_id"
+        join_sql = (
+            "specimens LEFT JOIN assays "
+            "ON assays.specimen_id = specimens.specimen_id"
+        )
+        group_col = "specimens.specimen_id"
+    elif level == "patient":
+        outer_table, outer_key = "patients", "patient_id"
+        join_sql = (
+            "patients "
+            "LEFT JOIN specimens ON specimens.patient_id = patients.patient_id "
+            "LEFT JOIN assays ON assays.specimen_id = specimens.specimen_id"
+        )
+        group_col = "patients.patient_id"
+    else:
+        raise ValueError(f"unsupported rollup level: {level}")
+
+    assay_done_cols = done_by_level["assay"]
+    assay_counts = ", ".join(
+        f"SUM(CASE WHEN assays.{_quote_ident(dc)} IS NOT NULL THEN 1 ELSE 0 END) "
+        f"AS {_quote_ident('done_' + dc)}"
+        for dc in assay_done_cols
+    )
+    count_children = {
+        "specimen": "COUNT(assays.assay_id) AS n_assays",
+        "patient":  "COUNT(DISTINCT specimens.specimen_id) AS n_specimens, "
+                    "COUNT(assays.assay_id) AS n_assays",
+    }[level]
+
+    select_parts = [group_col, count_children]
+    if assay_counts:
+        select_parts.append(assay_counts)
+
+    sql = (
+        f"SELECT {', '.join(select_parts)} FROM {join_sql} "
+        f"GROUP BY {group_col} ORDER BY {group_col}"
+    )
+
+    rows = []
+    cursor = conn.execute(sql)
+    col_names = [d[0] for d in cursor.description]
+    for r in cursor.fetchall():
+        row = dict(zip(col_names, r))
+        entity_id = row[outer_key]
+        rec: dict = {outer_key: entity_id}
+        if level == "patient":
+            rec["n_specimens"] = row["n_specimens"]
+        rec["n_assays"] = row["n_assays"]
+        rec["assay_analyses_done"] = {
+            dc[: -len(DONE_COLUMN_SUFFIX)]: row[f"done_{dc}"]
+            for dc in assay_done_cols
+        }
+        rows.append(rec)
+    return rows
+
+
+def _emit_status(report, *, fmt: str, project_dir: Path, group_by: str,
+                 counts: dict) -> None:
+    if fmt == "json":
+        print(json.dumps(report, indent=2, default=str))
+        return
+
+    if fmt == "tsv":
+        if not report:
+            return
+        keys = list(report[0].keys())
+        print("\t".join(keys))
+        for row in report:
+            print("\t".join(_tsv_cell(row[k]) for k in keys))
+        return
+
+    # Table (default)
+    print(f"\nProject:   {project_dir}")
+    print(f"Group by:  {group_by}")
+    print(f"Counts:    patients={counts['patient']}, "
+          f"specimens={counts['specimen']}, assays={counts['assay']}")
+    print("─" * 60)
+    if not report:
+        print(f"No data found for --group-by {group_by}.")
+        return
+
+    if group_by == "analysis":
+        print(f"{'Analysis':<28} {'Level':<10} {'Done':>6} {'Total':>6} {'%':>7}")
+        print("─" * 60)
+        for row in report:
+            bar_len = 10
+            filled = int(bar_len * row["pct"] / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            print(f"{row['analysis']:<28} {row['level']:<10} {row['done']:>6} "
+                  f"{row['total']:>6} {row['pct']:>6.1f}% {bar}")
+    elif group_by == "assay":
+        print(f"{'Assay':<20} {'Done':>4}/{'Total':<5} Analyses")
+        print("─" * 60)
+        for row in report:
+            print(f"{row['assay_id']:<20} {row['n_done']:>4}/{row['n_total']:<5} "
+                  f"{', '.join(row['analyses_done']) if row['analyses_done'] else '-'}")
+    else:  # specimen / patient rollup
+        key = f"{group_by}_id"
+        if group_by == "patient":
+            print(f"{'Patient':<18} {'Specimens':>10} {'Assays':>8}  Analyses (done on assays)")
+        else:
+            print(f"{'Specimen':<18} {'Assays':>8}  Analyses (done on assays)")
+        print("─" * 60)
+        for row in report:
+            analyses = ", ".join(
+                f"{name}={n}" for name, n in sorted(row["assay_analyses_done"].items())
+            ) or "-"
+            if group_by == "patient":
+                print(f"{row[key]:<18} {row['n_specimens']:>10} {row['n_assays']:>8}  {analyses}")
+            else:
+                print(f"{row[key]:<18} {row['n_assays']:>8}  {analyses}")
+
+
+def _tsv_cell(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ",".join(str(v) for v in value)
+    if isinstance(value, dict):
+        return ",".join(f"{k}={v}" for k, v in value.items())
+    return str(value)
+
+
+# ── v0.3 validate ──────────────────────────────────────────────────────────────
+
+
+def _collect_analysis_columns_from_provenance(prov_path: Path) -> dict:
+    """Return {analysis_name: set(columns_added)} from every `append` in the log."""
+    out: dict = {}
+    if not prov_path.exists():
+        return out
+    for line in prov_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("action") != "append":
+            continue
+        analysis = entry.get("analysis")
+        if not analysis:
+            continue
+        out.setdefault(analysis, set()).update(entry.get("columns_added", []))
+    return out
+
+
+def cmd_validate_project(args):
+    project_dir, schema = _resolve_project(args.project_dir)
+    conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    issues: list[str] = []
+    try:
+        # 1. TOML ↔ DB column drift. Declared cols must exist in the DB.
+        for level in LEVEL_ORDER:
+            table = f"{level}s"
+            declared = schema["levels"][level]["columns"]
+            actual = set(_get_table_columns(conn, table))
+            for colname in declared:
+                if colname not in actual:
+                    issues.append(
+                        f"{table}: column {colname!r} declared in TOML but missing in DB"
+                    )
+
+        # 2. Referential integrity — PRAGMA foreign_key_check returns orphan rows.
+        for row in conn.execute("PRAGMA foreign_key_check").fetchall():
+            table, rowid, parent, fk_id = row
+            issues.append(
+                f"orphan row in {table} (rowid={rowid}): FK #{fk_id} to "
+                f"{parent} points nowhere"
+            )
+
+        # 3. Orphan `_done` columns — a `{x}_done` column with no data
+        # companions added by the same analysis. Cross-referenced against
+        # `columns_added` entries in provenance.jsonl so we don't rely on
+        # fragile name-prefix heuristics.
+        columns_by_analysis = _collect_analysis_columns_from_provenance(
+            project_dir / PROJECT_PROVENANCE_NAME
+        )
+        for level in LEVEL_ORDER:
+            table = f"{level}s"
+            done = [
+                c for c in _get_table_columns(conn, table)
+                if c.endswith(DONE_COLUMN_SUFFIX)
+            ]
+            for dc in done:
+                analysis = dc[: -len(DONE_COLUMN_SUFFIX)]
+                companions = [
+                    c for c in columns_by_analysis.get(analysis, set())
+                    if c != dc
+                ]
+                if companions:
+                    continue
+                (has_data,) = conn.execute(
+                    f"SELECT COUNT(*) FROM {_quote_ident(table)} "
+                    f"WHERE {_quote_ident(dc)} IS NOT NULL"
+                ).fetchone()
+                if has_data:
+                    issues.append(
+                        f"{table}.{dc} has {has_data} completion(s) but no "
+                        f"data column from analysis {analysis!r} in provenance"
+                    )
+    finally:
+        conn.close()
+
+    if issues:
+        print(f"Validation found {len(issues)} issue(s):", file=sys.stderr)
+        for i, issue in enumerate(issues, 1):
+            print(f"  {i}. {issue}", file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        f"Project OK: {project_dir} "
+        f"(schema_v={schema['project']['schema_v']}, no integrity issues)."
+    )
+
+
+# ── v0.3 log ───────────────────────────────────────────────────────────────────
+
+
+def cmd_log_project(args):
+    project_dir, _schema = _resolve_project(args.project_dir)
+    prov_path = project_dir / PROJECT_PROVENANCE_NAME
+    if not prov_path.exists():
+        print(f"No provenance log at {prov_path}", file=sys.stderr)
+        sys.exit(1)
+
+    entries = [
+        json.loads(ln)
+        for ln in prov_path.read_text().splitlines()
+        if ln.strip()
+    ]
+
+    if args.level:
+        entries = [e for e in entries if e.get("level") == args.level]
+    if args.transaction:
+        entries = [e for e in entries if e.get("transaction_id") == args.transaction]
+
+    entries.sort(key=lambda e: e.get("timestamp", ""))
+
+    if args.last:
+        entries = entries[-args.last:]
+
+    if not entries:
+        print("(no matching provenance entries)")
+        return
+
+    for e in entries:
+        print(_format_project_log_entry(e))
+
+
+def _format_project_log_entry(entry: dict) -> str:
+    ts = entry.get("timestamp", "?")
+    action = entry.get("action", "?")
+    user = entry.get("user", "?")
+    job = entry.get("slurm_job_id") or ""
+    level = entry.get("level") or ""
+    txn = entry.get("transaction_id", "")
+
+    job_str = f" [SLURM {job}]" if job else ""
+    level_str = f" {level}" if level else ""
+    txn_str = f" {txn}" if txn else ""
+
+    if action == "init_project":
+        tpl = entry.get("template", "?")
+        v = entry.get("schema_v_after", "?")
+        return f"  {ts}  INIT_PROJECT  {user}{job_str} — template={tpl}, schema_v={v}"
+    if action == "migrate":
+        counts = entry.get("rows_inserted", {})
+        return (f"  {ts}  MIGRATE  {user}{job_str}{txn_str} — "
+                f"patients={counts.get('patient','?')}, "
+                f"specimens={counts.get('specimen','?')}, "
+                f"assays={counts.get('assay','?')}")
+    if action == "register":
+        id_ = entry.get("id", "?")
+        parent = entry.get("parent") or ""
+        stub = " (+new parent)" if entry.get("parent_created") else ""
+        parent_str = f" parent={parent}" if parent else ""
+        return (f"  {ts}  REGISTER{level_str}  {user}{job_str}{txn_str} — "
+                f"id={id_}{parent_str}{stub}")
+    if action == "append":
+        analysis = entry.get("analysis", "?")
+        added = entry.get("columns_added", [])
+        rows = entry.get("rows_affected", "?")
+        added_str = f" (+{len(added)} cols)" if added else ""
+        return (f"  {ts}  APPEND{level_str}  {user}{job_str}{txn_str} — "
+                f"analysis={analysis}, rows={rows}{added_str}")
+    return f"  {ts}  {action.upper()}{level_str}  {user}{job_str}{txn_str}"
+
+
 # ── CLI Parser ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -2822,21 +3240,48 @@ Examples:
                           help="[flat mode] Confirm --allow-new additions non-interactively")
 
     # ── status ──
-    p_status = subparsers.add_parser("status", help="Show completion status")
-    p_status.add_argument("--manifest", required=True, help="Path to manifest TSV")
-    p_status.add_argument("--key", default="sample_id", help="Key column name")
-    p_status.add_argument("--analysis", help="Filter to a specific analysis")
-    p_status.add_argument("--fmt", choices=["table", "tsv", "json"], default="table", help="Output format")
+    p_status = subparsers.add_parser(
+        "status", help="Show completion status (flat or project mode)"
+    )
+    g_status_target = p_status.add_mutually_exclusive_group(required=True)
+    g_status_target.add_argument("--manifest", help="[flat mode] Path to manifest TSV")
+    g_status_target.add_argument("--project-dir", help="[project mode] Casetrack project directory")
+    p_status.add_argument("--key", default="sample_id", help="[flat mode] Key column name")
+    p_status.add_argument("--analysis", help="[flat mode] Filter to a specific analysis")
+    p_status.add_argument(
+        "--group-by",
+        choices=["analysis", "assay", "specimen", "patient"],
+        help="[project mode] Group by (default: analysis)",
+    )
+    p_status.add_argument("--fmt", choices=["table", "tsv", "json"], default="table",
+                          help="Output format")
 
     # ── validate ──
-    p_validate = subparsers.add_parser("validate", help="Validate manifest integrity")
-    p_validate.add_argument("--manifest", required=True, help="Path to manifest TSV")
-    p_validate.add_argument("--key", default="sample_id", help="Key column name")
+    p_validate = subparsers.add_parser(
+        "validate", help="Validate a manifest (flat) or project (v0.3 SQLite)"
+    )
+    g_validate_target = p_validate.add_mutually_exclusive_group(required=True)
+    g_validate_target.add_argument("--manifest", help="[flat mode] Path to manifest TSV")
+    g_validate_target.add_argument("--project-dir", help="[project mode] Casetrack project directory")
+    p_validate.add_argument("--key", default="sample_id", help="[flat mode] Key column name")
 
     # ── log ──
-    p_log = subparsers.add_parser("log", help="Show provenance log")
-    p_log.add_argument("--manifest", required=True, help="Path to manifest TSV")
+    p_log = subparsers.add_parser(
+        "log", help="Show provenance log (flat or project mode)"
+    )
+    g_log_target = p_log.add_mutually_exclusive_group(required=True)
+    g_log_target.add_argument("--manifest", help="[flat mode] Path to manifest TSV")
+    g_log_target.add_argument("--project-dir", help="[project mode] Casetrack project directory")
     p_log.add_argument("--last", type=int, help="Show only the last N entries")
+    p_log.add_argument(
+        "--level",
+        choices=list(LEVEL_ORDER),
+        help="[project mode] Filter to entries touching a specific level",
+    )
+    p_log.add_argument(
+        "--transaction",
+        help="[project mode] Filter to entries with a specific transaction_id",
+    )
 
     # ── schema ──
     p_schema = subparsers.add_parser("schema", help="Show column-to-analysis mapping")
