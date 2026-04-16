@@ -3148,6 +3148,486 @@ def _summarize_v03_project(toml_path: Path) -> dict:
     }
 
 
+# ── v0.3 doctor (concurrency stress test) ─────────────────────────────────────
+#
+# Proposal 0001 §9.3. Forks workers that concurrently INSERT into a scratch
+# table in the project DB, measures contention, and verifies no corruption.
+# Intended to run once per project at kickoff on a new cluster / filesystem.
+
+
+def _doctor_worker(db_path_str: str, writes: int, worker_id: int) -> dict:
+    """Run `writes` INSERTs into the __doctor_scratch table. Returns stats."""
+    conn = sqlite3.connect(db_path_str)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA foreign_keys = ON")
+    ok = 0
+    fail = 0
+    errors: list[str] = []
+    import time as _t
+    t0 = _t.perf_counter()
+    try:
+        for i in range(writes):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO __doctor_scratch (worker, i, ts) VALUES (?, ?, ?)",
+                    (worker_id, i, _t.time()),
+                )
+                conn.commit()
+                ok += 1
+            except sqlite3.Error as e:
+                fail += 1
+                if len(errors) < 3:
+                    errors.append(f"{type(e).__name__}: {e}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+    finally:
+        conn.close()
+    return {
+        "worker_id": worker_id,
+        "ok": ok,
+        "fail": fail,
+        "errors": errors,
+        "elapsed_s": _t.perf_counter() - t0,
+    }
+
+
+def _filesystem_name(path: Path) -> str:
+    """Best-effort filesystem type ID via statfs (Linux)."""
+    try:
+        import ctypes
+        import ctypes.util
+
+        # Prefer the `os.statvfs` route plus /proc/mounts for the fs name.
+        mounts_path = Path("/proc/mounts")
+        if mounts_path.exists():
+            target = str(path.resolve())
+            best = ""
+            best_len = -1
+            for line in mounts_path.read_text().splitlines():
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt = parts[1]
+                fs = parts[2]
+                if target.startswith(mnt) and len(mnt) > best_len:
+                    best = fs
+                    best_len = len(mnt)
+            if best:
+                return best
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown"
+
+
+def cmd_doctor_project(args):
+    project_dir, _schema = _resolve_project(args.project_dir)
+    db_path = project_dir / PROJECT_DB_NAME
+    workers = args.workers or 8
+    writes = args.writes or 50
+
+    # Create the scratch table in the main DB. Drop any leftover from a
+    # prior aborted doctor run.
+    conn = open_project_db(db_path)
+    try:
+        conn.execute("DROP TABLE IF EXISTS __doctor_scratch")
+        conn.execute("""
+            CREATE TABLE __doctor_scratch (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                worker INTEGER NOT NULL,
+                i INTEGER NOT NULL,
+                ts REAL NOT NULL
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+    fs_name = _filesystem_name(db_path)
+    total = workers * writes
+    print(f"Testing SQLite concurrency on {project_dir}/ ...")
+    print(f"  Filesystem:            {fs_name}")
+    print(f"  Spawning {workers} workers × {writes} INSERTs = {total} total ...")
+
+    import multiprocessing as _mp
+    import time as _t
+
+    t0 = _t.perf_counter()
+    ctx = _mp.get_context("fork")
+    with ctx.Pool(processes=workers) as pool:
+        results = pool.starmap(
+            _doctor_worker,
+            [(str(db_path), writes, w) for w in range(workers)],
+        )
+    elapsed = _t.perf_counter() - t0
+
+    ok = sum(r["ok"] for r in results)
+    fail = sum(r["fail"] for r in results)
+    all_errors: list[str] = []
+    for r in results:
+        all_errors.extend(r["errors"])
+
+    # Verify count matches what we successfully committed.
+    conn = open_project_db(db_path)
+    try:
+        (n_rows,) = conn.execute(
+            "SELECT COUNT(*) FROM __doctor_scratch"
+        ).fetchone()
+        # Clean up.
+        conn.execute("DROP TABLE __doctor_scratch")
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(f"  Elapsed:               {elapsed:.1f}s")
+    print(f"  Successful commits:    {ok}/{total}")
+    print(f"  Failed commits:        {fail}")
+    print(f"  Rows committed in DB:  {n_rows}")
+
+    healthy = (
+        fail == 0
+        and ok == total
+        and n_rows == total
+        and not any("CORRUPT" in e or "MISUSE" in e for e in all_errors)
+    )
+    if healthy:
+        print(f"  ✓ SQLite concurrency healthy on this filesystem.")
+        return
+
+    print(f"  ✗ Concurrency issues detected:", file=sys.stderr)
+    if ok != n_rows:
+        print(
+            f"    - {ok} commits reported success but only {n_rows} rows in DB "
+            f"(silent partial commit)",
+            file=sys.stderr,
+        )
+    for e in all_errors[:5]:
+        print(f"    - {e}", file=sys.stderr)
+    print(
+        "  If you see CORRUPT / MISUSE errors or silent partial commits, "
+        "this filesystem's POSIX lock semantics are unreliable. Consider "
+        "moving the project to a POSIX-compliant fs (WekaFS is known good) "
+        "or escalate to Tier 2 concurrency (per-task JSONL + merger).",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+# ── v0.3 recover (rebuild DB from provenance) ─────────────────────────────────
+#
+# Proposal 0001 §9.4. Replays provenance.jsonl entries to reconstruct
+# casetrack.db. Self-contained for init_project / register / schema_apply.
+# For append / add_metadata / migrate: replays by re-reading the source file
+# that was logged in provenance, after verifying its checksum. If the source
+# has moved or changed, the entry is reported and the user asked to fix it.
+
+
+def cmd_recover_project(args):
+    project_dir = Path(args.project_dir)
+    if not project_dir.is_dir():
+        print(f"Error: project directory not found: {project_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    prov_path = Path(getattr(args, "from_", None) or project_dir / PROJECT_PROVENANCE_NAME)
+    if not prov_path.exists():
+        print(f"Error: provenance log not found: {prov_path}", file=sys.stderr)
+        sys.exit(1)
+
+    entries = []
+    for line in prov_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            print(f"Error: malformed provenance line: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if not entries:
+        print("No provenance entries to replay.")
+        return
+
+    db_path = project_dir / PROJECT_DB_NAME
+    for suffix in ("", "-wal", "-shm"):
+        p = Path(str(db_path) + suffix)
+        if p.exists():
+            if not args.force:
+                print(
+                    f"Error: {p} already exists. Use --force to overwrite the "
+                    f"current DB before replaying provenance.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            p.unlink()
+
+    stats = {
+        "init_project": 0, "register": 0, "schema_apply": 0,
+        "append": 0, "migrate": 0, "add_metadata": 0,
+        "skipped": 0,
+    }
+    warnings: list[str] = []
+
+    conn = None
+    try:
+        for entry in entries:
+            action = entry.get("action")
+            if action == "init_project":
+                conn = _recover_init_project(db_path, entry)
+                stats["init_project"] += 1
+            elif action == "register":
+                if conn is None:
+                    raise RuntimeError("register entry seen before init_project")
+                _recover_register(conn, entry)
+                stats["register"] += 1
+            elif action == "schema_apply":
+                if conn is None:
+                    raise RuntimeError("schema_apply seen before init_project")
+                _recover_schema_apply(conn, entry)
+                stats["schema_apply"] += 1
+            elif action == "append":
+                msg = _recover_append(conn, project_dir, entry)
+                if msg:
+                    warnings.append(msg)
+                    stats["skipped"] += 1
+                else:
+                    stats["append"] += 1
+            elif action == "add_metadata":
+                msg = _recover_add_metadata(conn, project_dir, entry)
+                if msg:
+                    warnings.append(msg)
+                    stats["skipped"] += 1
+                else:
+                    stats["add_metadata"] += 1
+            elif action == "migrate":
+                msg = _recover_migrate(conn, project_dir, entry)
+                if msg:
+                    warnings.append(msg)
+                    stats["skipped"] += 1
+                else:
+                    stats["migrate"] += 1
+            else:
+                warnings.append(f"unknown action {action!r}; skipping")
+                stats["skipped"] += 1
+    finally:
+        if conn is not None:
+            conn.close()
+
+    print(f"Rebuilt {db_path} from {len(entries)} provenance entries:")
+    for k, v in stats.items():
+        if v:
+            print(f"  {k:<18} {v}")
+    for w in warnings:
+        print(f"  [warn] {w}", file=sys.stderr)
+
+    if stats["skipped"] and not args.permit_partial:
+        print(
+            "\nOne or more entries could not be replayed. Re-run with "
+            "--permit-partial to accept the partial rebuild, or restore the "
+            "missing source files and retry.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
+def _recover_init_project(db_path: Path, entry: dict) -> sqlite3.Connection:
+    """Recreate the three tables from the CREATE TABLE statements captured
+    in the init_project provenance entry."""
+    conn = open_project_db(db_path)
+    with begin_immediate(conn):
+        for stmt in entry.get("sql", []):
+            conn.execute(stmt)
+    return conn
+
+
+def _recover_register(conn: sqlite3.Connection, entry: dict) -> None:
+    level = entry["level"]
+    table = f"{level}s"
+    key_col = f"{level}_id"
+    row_id = entry["id"]
+    parent_id = entry.get("parent")
+    parent_created = entry.get("parent_created", False)
+    meta = entry.get("meta") or {}
+
+    with begin_immediate(conn):
+        if parent_created:
+            # Infer parent level from the hierarchy, not the entry (keeps
+            # us decoupled from how the entry was produced).
+            parents = {"specimen": "patient", "assay": "specimen"}
+            parent_level = parents[level]
+            parent_table = f"{parent_level}s"
+            parent_key = f"{parent_level}_id"
+            conn.execute(
+                f"INSERT INTO {_quote_ident(parent_table)} "
+                f"({_quote_ident(parent_key)}) VALUES (?)",
+                (parent_id,),
+            )
+        row = {key_col: row_id}
+        if level in ("specimen", "assay"):
+            parent_key_col = "patient_id" if level == "specimen" else "specimen_id"
+            row[parent_key_col] = parent_id
+        row.update(meta)
+        cols = list(row.keys())
+        placeholders = ", ".join("?" * len(cols))
+        quoted = ", ".join(_quote_ident(c) for c in cols)
+        conn.execute(
+            f"INSERT INTO {_quote_ident(table)} ({quoted}) VALUES ({placeholders})",
+            tuple(row[c] for c in cols),
+        )
+
+
+def _recover_schema_apply(conn: sqlite3.Connection, entry: dict) -> None:
+    with begin_immediate(conn):
+        for stmt in entry.get("sql", []):
+            conn.execute(stmt)
+
+
+def _check_source_file(entry_path: str, recorded_checksum: str | None) -> tuple[Path | None, str | None]:
+    """Return (path, None) if the source file is present and checksum matches.
+    Return (None, warning) otherwise."""
+    p = Path(entry_path)
+    if not p.exists():
+        return None, f"source file missing: {entry_path}"
+    if recorded_checksum:
+        actual = _checksum(str(p))
+        if actual != recorded_checksum:
+            return None, (
+                f"source checksum mismatch for {entry_path} "
+                f"(recorded {recorded_checksum}, got {actual})"
+            )
+    return p, None
+
+
+def _recover_append(conn: sqlite3.Connection, project_dir: Path,
+                    entry: dict) -> str | None:
+    path, err = _check_source_file(entry.get("results_file", ""),
+                                    entry.get("results_checksum"))
+    if err:
+        return f"append({entry.get('analysis')}): {err}"
+
+    level = entry.get("level") or "assay"
+    level_spec = _level_spec_from_provenance_or_db(conn, level)
+    key_col = level_spec["key"]
+    table = f"{level}s"
+    analysis = entry.get("analysis", "unknown")
+
+    results = pd.read_csv(path, sep="\t")
+    analysis_cols = [c for c in results.columns if c != key_col]
+    done_col = f"{analysis}{DONE_COLUMN_SUFFIX}"
+    # Re-add columns that appear in entry.columns_added (fresh DB has base only).
+    with begin_immediate(conn):
+        existing = set(_get_table_columns(conn, table))
+        for col_spec in entry.get("columns_added", []):
+            # columns_added is a list of column names in v0.3's format.
+            col = col_spec if isinstance(col_spec, str) else col_spec[1]
+            if col in existing:
+                continue
+            # Infer a type by looking at the source TSV, or use TEXT for done.
+            if col == done_col:
+                ctype = "TEXT"
+            elif col in results.columns:
+                ctype = _infer_column_type(results[col])
+            else:
+                ctype = "TEXT"
+            conn.execute(
+                f"ALTER TABLE {_quote_ident(table)} "
+                f"ADD COLUMN {_quote_ident(col)} {ctype}"
+            )
+            existing.add(col)
+
+        if done_col not in results.columns:
+            results[done_col] = entry.get("timestamp", "")
+            analysis_cols.append(done_col)
+
+        set_clauses = ", ".join(
+            f"{_quote_ident(c)} = COALESCE({_quote_ident(c)}, ?)" for c in analysis_cols
+        )
+        update_sql = (
+            f"UPDATE {_quote_ident(table)} SET {set_clauses} "
+            f"WHERE {_quote_ident(key_col)} = ?"
+        )
+        for _, row in results.iterrows():
+            values = tuple(_coerce_for_sqlite(row[c]) for c in analysis_cols)
+            values += (row[key_col],)
+            conn.execute(update_sql, values)
+    return None
+
+
+def _level_spec_from_provenance_or_db(conn: sqlite3.Connection, level: str) -> dict:
+    return {"key": f"{level}_id"}
+
+
+def _recover_add_metadata(conn: sqlite3.Connection, project_dir: Path,
+                          entry: dict) -> str | None:
+    path, err = _check_source_file(entry.get("metadata_file", ""),
+                                    entry.get("metadata_checksum"))
+    if err:
+        return f"add_metadata({entry.get('level')}): {err}"
+
+    level = entry["level"]
+    table = f"{level}s"
+    key_col = f"{level}_id"
+    metadata = pd.read_csv(path, sep="\t")
+    cols = [c for c in metadata.columns if c != key_col]
+
+    with begin_immediate(conn):
+        existing_keys = {
+            str(r[0]) for r in conn.execute(
+                f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
+            ).fetchall()
+        }
+        set_clauses = ", ".join(
+            f"{_quote_ident(c)} = COALESCE({_quote_ident(c)}, ?)" for c in cols
+        )
+        update_sql = (
+            f"UPDATE {_quote_ident(table)} SET {set_clauses} "
+            f"WHERE {_quote_ident(key_col)} = ?"
+        )
+        insert_cols = [key_col] + cols
+        placeholders = ", ".join("?" * len(insert_cols))
+        insert_sql = (
+            f"INSERT INTO {_quote_ident(table)} "
+            f"({', '.join(_quote_ident(c) for c in insert_cols)}) "
+            f"VALUES ({placeholders})"
+        )
+        for _, row in metadata.iterrows():
+            k = str(row[key_col])
+            if k in existing_keys:
+                values = tuple(_coerce_for_sqlite(row[c]) for c in cols) + (k,)
+                conn.execute(update_sql, values)
+            else:
+                values = tuple(_coerce_for_sqlite(row[c]) for c in insert_cols)
+                conn.execute(insert_sql, values)
+    return None
+
+
+def _recover_migrate(conn: sqlite3.Connection, project_dir: Path,
+                     entry: dict) -> str | None:
+    """Re-run migration from sandbox/source_manifest.tsv preserved at migrate-time."""
+    source = project_dir / "sandbox" / "source_manifest.tsv"
+    path, err = _check_source_file(str(source), entry.get("source_checksum"))
+    if err:
+        return f"migrate: {err}"
+
+    df = pd.read_csv(path, sep="\t")
+    classifications = entry.get("column_classifications", {})
+    # Determine level key columns from the classifications' absence — they are
+    # the columns NOT in classifications (since classifications excludes keys).
+    # Fallback to the standard names.
+    patient_col = "patient_id"
+    specimen_col = "specimen_id"
+    assay_col = "assay_id"
+
+    with begin_immediate(conn):
+        _insert_rows_by_level(
+            conn, df, patient_col, specimen_col, assay_col, classifications,
+        )
+    return None
+
+
 # ── v0.3 dashboard (nested HTML) ──────────────────────────────────────────────
 #
 # Nested HTML: cohort summary → one <details> per patient → nested <details>
@@ -4657,6 +5137,35 @@ Examples:
         help="Confirm --allow-new-parent creation non-interactively",
     )
 
+    # ── doctor ──
+    p_doctor = subparsers.add_parser(
+        "doctor",
+        help="[v0.3] Stress-test SQLite concurrency on the project's filesystem",
+    )
+    p_doctor.add_argument("--project-dir", required=True, help="Casetrack project directory")
+    p_doctor.add_argument("--workers", type=int, default=8,
+                          help="Concurrent writer processes (default: 8)")
+    p_doctor.add_argument("--writes", type=int, default=50,
+                          help="INSERTs per worker (default: 50)")
+
+    # ── recover ──
+    p_recover = subparsers.add_parser(
+        "recover",
+        help="[v0.3] Rebuild casetrack.db by replaying provenance.jsonl",
+    )
+    p_recover.add_argument("--project-dir", required=True, help="Casetrack project directory")
+    p_recover.add_argument(
+        "--from", dest="from_",
+        help="Alternative provenance path (default: <project>/provenance.jsonl)",
+    )
+    p_recover.add_argument("--force", action="store_true",
+                           help="Overwrite the existing casetrack.db before replay")
+    p_recover.add_argument(
+        "--permit-partial",
+        action="store_true",
+        help="Exit 0 even if some entries couldn't be replayed (default: exit 2)",
+    )
+
     # ── migrate ──
     p_migrate = subparsers.add_parser(
         "migrate",
@@ -4702,6 +5211,8 @@ Examples:
         "export": cmd_export,
         "migrate": cmd_migrate,
         "register": cmd_register,
+        "doctor": cmd_doctor_project,
+        "recover": cmd_recover_project,
     }
 
     commands[args.command](args)
