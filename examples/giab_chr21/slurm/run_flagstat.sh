@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=flagstat
 #SBATCH --account=greenbab
-#SBATCH --partition=cpu
+#SBATCH --partition=componc_cpu
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
 #SBATCH --time=00:30:00
