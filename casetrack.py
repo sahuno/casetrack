@@ -1385,8 +1385,16 @@ def _sql_escape(s: str) -> str:
 
 
 def cmd_query(args):
-    """Run a SQL query against one manifest (--manifest) or a union of many
-    (--root) via DuckDB. The manifest is exposed as table `_` by default."""
+    """Run a SQL query against a v0.3 project (--project-dir), one flat
+    manifest (--manifest), or a union of many (--root) via DuckDB.
+
+    Project mode: casetrack.db is ATTACH-ed read-only as `proj`. Views on
+    `patients`, `specimens`, `assays`, and `_` (the assays⋈specimens⋈
+    patients join) live in the default in-memory catalog so queries read
+    naturally.
+    """
+    if getattr(args, "project_dir", None):
+        return cmd_query_project(args)
     if getattr(args, "manifest", None):
         _warn_flat_deprecation()
     try:
@@ -1863,6 +1871,13 @@ def cmd_rerun_flat(args):
 
 
 def cmd_export(args):
+    """Dispatch `casetrack export` to flat or project mode."""
+    if getattr(args, "project_dir", None):
+        return cmd_export_project(args)
+    return cmd_export_flat(args)
+
+
+def cmd_export_flat(args):
     """Export manifest to other formats."""
     _warn_flat_deprecation()
     manifest_path = args.manifest
@@ -3126,6 +3141,235 @@ def _summarize_v03_project(toml_path: Path) -> dict:
     }
 
 
+# ── v0.3 query (DuckDB ATTACH of casetrack.db) ────────────────────────────────
+#
+# Uses duckdb's sqlite_scanner (bundled in modern duckdb) — no external install
+# step needed. The casetrack.db is attached READ_ONLY so a running query can
+# never corrupt a live writer's WAL.
+
+
+def _prepare_v03_query_connection(db_path: Path):
+    """Open a DuckDB connection with casetrack.db attached + helper views.
+
+    Views published in the default (in-memory) catalog:
+      - patients, specimens, assays  (pass-through of each SQLite table)
+      - _  = assays ⋈ specimens ⋈ patients (inner join, one row per assay)
+    """
+    import duckdb as _duckdb
+    con = _duckdb.connect(":memory:")
+    try:
+        con.execute("INSTALL sqlite")
+    except Exception:
+        # Install may fail in air-gapped environments — extension may
+        # already be shipped. LOAD will surface any real issue next.
+        pass
+    con.execute("LOAD sqlite")
+    con.execute(f"ATTACH '{_sql_escape(str(db_path))}' AS proj (TYPE SQLITE, READ_ONLY)")
+    for level in LEVEL_ORDER:
+        table = f"{level}s"
+        con.execute(
+            f"CREATE VIEW {_quote_ident(table)} AS "
+            f"SELECT * FROM proj.{_quote_ident(table)}"
+        )
+    con.execute("""
+        CREATE VIEW "_" AS
+        SELECT *
+        FROM assays
+        JOIN specimens USING (specimen_id)
+        JOIN patients USING (patient_id)
+    """)
+    return con
+
+
+def cmd_query_project(args):
+    try:
+        import duckdb as _duckdb  # noqa: F401
+    except ImportError:
+        print(
+            "Error: duckdb is missing but is a required dependency of casetrack.\n"
+            "Your install is broken — reinstall with: pip install --force-reinstall casetrack",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    project_dir, _schema = _resolve_project(args.project_dir)
+    db_path = project_dir / PROJECT_DB_NAME
+    con = _prepare_v03_query_connection(db_path)
+    try:
+        try:
+            cursor = con.execute(args.sql)
+        except Exception as e:
+            print(f"Error: SQL failed — {type(e).__name__}: {e}", file=sys.stderr)
+            sys.exit(2)
+        rows = cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+    finally:
+        con.close()
+
+    _emit_query_rows(rows, cols, fmt=args.fmt, output=args.output)
+
+
+def _emit_query_rows(rows, cols, *, fmt: str, output: str | None) -> None:
+    """Render query results to stdout or `output` in the chosen format."""
+    import io
+
+    if fmt == "json":
+        dict_rows = [dict(zip(cols, r)) for r in rows]
+        text = json.dumps(dict_rows, indent=2, default=str)
+    elif fmt in ("tsv", "csv"):
+        sep = "\t" if fmt == "tsv" else ","
+        buf = io.StringIO()
+        buf.write(sep.join(cols) + "\n")
+        for r in rows:
+            buf.write(sep.join("" if v is None else str(v) for v in r) + "\n")
+        text = buf.getvalue()
+    else:  # table
+        widths = [max(len(c), *(len(str(v if v is not None else "")) for v in col_vals))
+                  for c, col_vals in zip(cols, zip(*rows) if rows else [[] for _ in cols])]
+        lines = [
+            "  ".join(c.ljust(w) for c, w in zip(cols, widths)),
+            "  ".join("-" * w for w in widths),
+        ]
+        for r in rows:
+            lines.append("  ".join(
+                ("" if v is None else str(v)).ljust(w) for v, w in zip(r, widths)
+            ))
+        text = "\n".join(lines)
+
+    if output:
+        Path(output).write_text(text if text.endswith("\n") else text + "\n")
+    else:
+        print(text)
+
+
+# ── v0.3 export ────────────────────────────────────────────────────────────────
+#
+# `casetrack export --project-dir D --output OUT [--shape {tables,joined}]
+#   [--sql "SELECT ..."]`
+#
+# shape=tables (default): writes one file per level table under OUT/ (or
+#   OUT.{patient,specimen,assay}.<ext> if OUT is a file prefix). Format is
+#   inferred from the extension, with a directory-or-prefix override.
+# shape=joined: writes the assays⋈specimens⋈patients join to a single file.
+# --sql: run arbitrary SQL, write the result (overrides shape).
+# --tables: restrict shape=tables to a subset, e.g. --tables patients,assays.
+#
+# Same format matrix as flat export: .tsv, .csv, .json, .xlsx, .parquet.
+
+
+def cmd_export_project(args):
+    project_dir, _schema = _resolve_project(args.project_dir)
+    output = Path(args.output)
+
+    # --sql short-circuits shape / tables.
+    if args.sql:
+        con = _prepare_v03_query_connection(project_dir / PROJECT_DB_NAME)
+        try:
+            cursor = con.execute(args.sql)
+            rows = cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+        finally:
+            con.close()
+        df = pd.DataFrame(rows, columns=cols)
+        _write_df(df, output)
+        print(f"Exported {len(df)} rows via --sql to {output}.")
+        return
+
+    shape = args.shape or "tables"
+    if shape == "joined":
+        con = _prepare_v03_query_connection(project_dir / PROJECT_DB_NAME)
+        try:
+            df = con.execute('SELECT * FROM "_"').fetchdf()
+        finally:
+            con.close()
+        _write_df(df, output)
+        print(f"Exported joined view ({len(df)} rows) to {output}.")
+        return
+
+    if shape != "tables":
+        print(f"Error: unknown --shape {shape!r}", file=sys.stderr)
+        sys.exit(1)
+
+    # --tables accepts either table names (plural) or level names (singular).
+    # Normalize to level names for the loop.
+    _plural_to_level = {f"{lv}s": lv for lv in LEVEL_ORDER}
+    _valid = set(LEVEL_ORDER) | set(_plural_to_level)
+    if args.tables:
+        wanted = [w.strip() for w in args.tables.split(",") if w.strip()]
+    else:
+        wanted = list(LEVEL_ORDER)
+    normalized = []
+    for name in wanted:
+        if name not in _valid:
+            print(
+                f"Error: --tables contains unknown name {name!r}; "
+                f"must be one of {sorted(_valid)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        normalized.append(_plural_to_level.get(name, name))
+    wanted = normalized
+
+    # If the output path has a known extension, treat it as a prefix.
+    # Otherwise treat it as a directory.
+    prefix_mode = output.suffix in {".tsv", ".csv", ".json", ".xlsx", ".parquet"}
+    if prefix_mode:
+        prefix_base = output.with_suffix("")
+        ext = output.suffix
+    else:
+        output.mkdir(parents=True, exist_ok=True)
+        prefix_base = None
+        ext = ".tsv"
+
+    conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    try:
+        written = []
+        for level in wanted:
+            table = f"{level}s"
+            df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
+            if prefix_mode:
+                out_path = Path(f"{prefix_base}.{table}{ext}")
+            else:
+                out_path = output / f"{table}{ext}"
+            _write_df(df, out_path)
+            written.append((table, out_path, len(df)))
+    finally:
+        conn.close()
+
+    for table, path, n in written:
+        print(f"  {table}: {n} rows → {path}")
+    print(f"Exported {len(written)} table(s).")
+
+
+def _write_df(df: "pd.DataFrame", output: Path) -> None:
+    """Write `df` to `output`, inferring format from the extension."""
+    ext = output.suffix.lower()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if ext == ".tsv":
+        df.to_csv(output, sep="\t", index=False)
+    elif ext == ".csv":
+        df.to_csv(output, index=False)
+    elif ext == ".json":
+        df.to_json(output, orient="records", indent=2)
+    elif ext == ".xlsx":
+        try:
+            df.to_excel(output, index=False)
+        except ImportError:
+            print("Error: openpyxl required for .xlsx; pip install 'casetrack[excel]'",
+                  file=sys.stderr)
+            sys.exit(1)
+    elif ext == ".parquet":
+        try:
+            df.to_parquet(output, index=False)
+        except ImportError:
+            print("Error: pyarrow required for .parquet; pip install 'casetrack[parquet]'",
+                  file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"Error: unsupported output extension {ext!r}", file=sys.stderr)
+        sys.exit(1)
+
+
 # ── v0.3 rerun (assays missing an analysis) ───────────────────────────────────
 
 
@@ -3986,18 +4230,23 @@ Examples:
     # ── query ──
     p_query = subparsers.add_parser(
         "query",
-        help="Run SQL over one manifest or a union of many (DuckDB-backed)",
+        help="Run SQL against a v0.3 project (--project-dir), a manifest (--manifest), "
+             "or a union of many (--root). DuckDB-backed.",
     )
     g_target = p_query.add_mutually_exclusive_group(required=True)
-    g_target.add_argument("--manifest", help="Path to a single manifest TSV")
-    g_target.add_argument("--root", help="Scan a root for manifests (cross-project query)")
-    p_query.add_argument("sql", help="SQL query; reference the manifest as `_` (or --as NAME)")
+    g_target.add_argument("--project-dir", help="[project mode] Casetrack project directory")
+    g_target.add_argument("--manifest", help="[flat mode] Path to a single manifest TSV")
+    g_target.add_argument("--root", help="[flat mode] Scan a root for manifests (cross-project query)")
+    p_query.add_argument("sql",
+                         help="SQL query. Project mode exposes views: patients, specimens, "
+                              "assays, and `_` (assays⋈specimens⋈patients inner join). "
+                              "Flat mode exposes the manifest as `_` (or --as NAME).")
     p_query.add_argument("--as", dest="as_name", default=None,
-                         help="SQL table/view alias for the manifest (default: _)")
+                         help="[flat mode] SQL table/view alias for the manifest (default: _)")
     p_query.add_argument("--pattern", default="manifest.tsv",
-                         help="With --root: manifest filename pattern (default: manifest.tsv)")
+                         help="[flat --root] Manifest filename pattern")
     p_query.add_argument("--max-depth", type=int, default=4,
-                         help="With --root: maximum directory depth (default: 4)")
+                         help="[flat --root] Maximum directory depth (default: 4)")
     p_query.add_argument("--fmt", choices=["table", "tsv", "csv", "json"], default="table",
                          help="Output format (default: table)")
     p_query.add_argument("--output", help="Write results to this file instead of stdout")
@@ -4070,9 +4319,31 @@ Examples:
     p_rerun.add_argument("--extra", help="Extra args appended to each sbatch command")
 
     # ── export ──
-    p_export = subparsers.add_parser("export", help="Export manifest to other formats")
-    p_export.add_argument("--manifest", required=True, help="Path to manifest TSV")
-    p_export.add_argument("--output", required=True, help="Output path (.xlsx, .csv, .json, .parquet)")
+    p_export = subparsers.add_parser(
+        "export",
+        help="Export a manifest (flat) or a v0.3 project to other formats",
+    )
+    g_export_target = p_export.add_mutually_exclusive_group(required=True)
+    g_export_target.add_argument("--manifest", help="[flat mode] Path to manifest TSV")
+    g_export_target.add_argument("--project-dir", help="[project mode] Casetrack project directory")
+    p_export.add_argument("--output", required=True,
+                          help="Output path — file (joined/single table) or directory (tables shape)")
+    p_export.add_argument(
+        "--shape",
+        choices=["tables", "joined"],
+        default=None,
+        help="[project mode] tables = one file per level (default); joined = single denormalized file",
+    )
+    p_export.add_argument(
+        "--tables",
+        help="[project mode] With --shape tables, restrict to a subset, "
+             "e.g. 'patients,assays'",
+    )
+    p_export.add_argument(
+        "--sql",
+        help="[project mode] Run an arbitrary SQL query (overrides --shape); "
+             "the result is written to --output",
+    )
 
     # ── register ──
     p_register = subparsers.add_parser(
