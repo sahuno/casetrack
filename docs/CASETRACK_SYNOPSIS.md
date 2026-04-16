@@ -1,254 +1,288 @@
-# Casetrack: development synopsis for coding agent
+# Casetrack — design synopsis
 
 ## What this document is
 
-This is a design synopsis for **casetrack**, a manifest-centric case management CLI tool for bioinformatics pipelines running on HPC (SLURM). It is intended to be read by a coding agent (Claude Code) that will develop the project further. The working prototype already exists — this document captures the full design intent, architecture decisions, known issues, and planned features so the agent can continue development with full context.
+The **design-intent** companion to [`README.md`](../README.md) (user-facing)
+and [`docs/MIGRATION_v0.2_to_v0.3.md`](MIGRATION_v0.2_to_v0.3.md) (upgrade
+path). This document answers *why* casetrack looks the way it does — the
+decisions behind the surface, and the tradeoffs that got us there. It
+reflects the shipped **v0.3** architecture. The v0.2 flat-TSV model is
+preserved as a deprecated compatibility layer and described in the
+migration doc; it is not the architecture going forward.
+
+For a worked end-to-end example on real data, see
+[`examples/giab_chr21/`](../examples/giab_chr21/README.md).
 
 ## Problem statement
 
-A computational biologist runs dozens of analyses per project on an HPC cluster (IRIS at MSKCC, SLURM-based). Pipelines include Nextflow workflows, ad hoc SLURM scripts, and Claude Code agent sessions. Results end up scattered across directories with no unified tracking of what has been computed for which sample. There is no single source of truth for project completion status.
+A computational biologist runs many analyses per project on HPC (IRIS at
+MSKCC, SLURM) against **cohort-scale** data — multiple patients, each with
+one or more specimens, each sequenced on one or more flowcells. Results
+end up scattered across directories; "is modkit done on every tumor
+specimen of every brca1 patient?" is a string-parsing exercise on
+filenames.
 
-The inspiration comes from the Broad Institute's Firehose/FireCloud/Terra lineage — systematic cancer analysis pipelines where every sample passes through a defined set of analyses and results are tracked centrally. Casetrack is the lightweight, local-first version of this pattern.
+Casetrack is the lightweight, local-first answer to that question. It
+doesn't try to be a Terra or a LIMS. It's one CLI that every pipeline,
+script, or agent calls to register its results into a per-project SQLite
+database. That database is the source of truth; everything else —
+dashboards, exports, cross-cohort rollups — is a read of it.
 
-## Core concept
+Inspiration: the Broad's Firehose/FireCloud/Terra lineage — but sized for
+a single lab, versioned in git, and deployable without a control plane.
 
-One TSV manifest per project. Each row is a sample. Each analysis appends new columns. The manifest only grows rightward — it is append-only for columns and fill-only for cells. Every pipeline, script, or agent calls the same CLI tool (`casetrack`) at the end to register its results.
+## The v0.3 data model
+
+Three hardcoded entities, one tier each of a hierarchy:
 
 ```
-sample_id  bam_path       modkit_mean_meth  modkit_done   tldr_l1_count  tldr_done
-SAMPLE_01  /data/s01.bam  0.72              2026-04-14    14             2026-04-14
-SAMPLE_02  /data/s02.bam  0.81              2026-04-14    3              2026-04-14
-SAMPLE_03  /data/s03.bam                                  7              2026-04-14
+patient   ← clinical/biological subject        (age, sex, BRCA status, outcome)
+  └─ specimen   ← one tissue collection        (site, timepoint, tumor purity)
+       └─ assay    ← one sequencing library    (WGS / ATAC / ONT / …)
+            └─ analysis-produced columns       (modkit_mean_meth, n_snvs, …)
 ```
 
-## Architecture
+Each entity is a SQLite table with a primary key (`patient_id`,
+`specimen_id`, `assay_id`). Children reference parents by foreign key,
+enforced by `PRAGMA foreign_keys = ON`. Analysis results live as columns
+on the appropriate level (almost always `assay`); `ALTER TABLE ADD
+COLUMN` adds them dynamically on first append.
 
-### File layout per project
+### Three file artifacts per project
 
 ```
-project/
-├── manifest.tsv                    # The single source of truth
-├── manifest.tsv.provenance.jsonl   # Audit trail (who ran what, when, SLURM job ID)
-├── manifest.tsv.schema.json        # Column-to-analysis mapping
-├── manifest.tsv.lock               # POSIX flock file (transient)
-├── samples.txt                     # Sample ID list
-├── results/
-│   ├── modkit/{sample_id}/         # Full output per sample per analysis
-│   ├── tldr/{sample_id}/
-│   └── qc/{sample_id}/
-├── scripts/
-│   ├── summarize_modkit.py         # Distills raw output → manifest columns
-│   ├── summarize_tldr.py
-│   └── summarize_qc.py
-├── logs/                           # SLURM logs
-└── containers/                     # Apptainer/Singularity .sif files
+cohort/
+├── casetrack.toml        — declared schema, human-facing, git-tracked
+├── casetrack.db          — SQLite, WAL journal, source of truth (not git-tracked)
+├── provenance.jsonl      — append-only audit log, git-trackable
+└── .gitignore            — excludes casetrack.db{,-wal,-shm}, exports/
 ```
 
-### Multi-project model
-
-Each project has its own independent manifest. No shared state between projects. The same `casetrack` CLI works on whichever `--manifest` path you point it at. Example projects that would each have their own manifest:
-
-- `alzheimers_rnaseq/` — 60 patients, analyses: star_alignment, deseq2_de, age_prediction, pathway_gsea
-- `brca_immunopeptidome/` — 35 samples, analyses: maxquant_ms, netmhcpan, hla_typing, gibbscluster
-- `l1_mouse_ont/` — 24 samples, analyses: dorado_basecalling, minimap2_alignment, modkit_methylation, tldr_insertions, xtea_somatic_l1
-
-A future `casetrack projects` command could scan for manifests under a root directory and aggregate status, but this is a convenience layer, not the core design.
+`casetrack.toml` is the **contract**. `casetrack.db` is the **runtime**.
+`provenance.jsonl` is the **replay log**. Any two of the three can
+reconstruct the missing one (the `recover` command replays the log).
 
 ### The three-phase SLURM pattern
 
-Every SLURM job follows this structure:
+Every analysis follows the same shape:
 
 ```bash
-# Phase 1: Run analysis
+# 1. Run tool
 apptainer exec container.sif tool input output
 
-# Phase 2: Summarize to per-sample TSV
-python3 scripts/summarize_tool.py --input output --sample $SAMPLE_ID --output summary.tsv
-# Contract: emit a TSV with sample_id as the first column
+# 2. Summarize to per-assay TSV
+#    Contract: first column is the level's key (assay_id / specimen_id / patient_id)
+python3 summarize_tool.py --assay-id "$ASSAY_ID" --input output --output summary.tsv
 
-# Phase 3: Append to manifest
-casetrack append --manifest manifest.tsv --results summary.tsv --key sample_id --analysis tool_name
+# 3. Register with casetrack
+casetrack append --project-dir "$PROJECT_DIR" \
+    --analysis tool_name --results summary.tsv
 ```
 
-### Concurrency model
+The pattern isolates the tool call (phase 1) from the summarization logic
+(phase 2) from the registration (phase 3). Each is independently
+testable and restartable.
 
-Multiple SLURM array tasks can finish simultaneously. `casetrack append` uses POSIX `flock` for exclusive file locking during the read-merge-write cycle. The lock is held only during I/O (typically <1 second). Each task writes to its own per-sample results directory, then contends only on the manifest append.
+## Core design decisions
 
-### Smart merge behavior
+### 1. Why SQLite, not TSV
 
-When a SLURM array job runs, the first task to finish creates the new columns in the manifest. Subsequent tasks find those columns already exist but with NaN values for their sample. The smart merge logic detects this and fills in NaN cells without requiring `--overwrite`. This is critical for the array job pattern. The `--overwrite` flag is reserved for when you genuinely want to replace existing data.
+v0.2 shipped on a flat TSV. It worked for single-level cohorts, ran into
+three walls at scale:
 
-## Current implementation
+- **Row-level updates** require rewriting the whole file. At 500
+  assays × 40 columns, file I/O starts dominating the three-phase latency.
+- **FK enforcement in TSV** is hand-rolled Python on every mutation.
+  SQLite does it at storage layer with clear errors at `INSERT` time.
+- **Multi-table atomicity** (migration, cross-level metadata edits) in
+  TSV requires a project-wide lock and a custom rollback path. SQLite
+  has `BEGIN IMMEDIATE; … ; COMMIT;` and automatic rollback.
 
-### Existing CLI commands
+Why not Postgres? Requires a server, a deployment story, and network
+access — none of which a local-first tool can assume on a shared HPC
+filesystem. SQLite is stdlib; Postgres isn't.
 
-The prototype is a single Python file (`casetrack.py`) with these subcommands:
+Why not parquet/HDF5? Both optimize for columnar analytical reads at the
+expense of row-level updates. Casetrack's workload is dominated by
+row-level writes (one per finished SLURM job).
 
-| Command | Status | Description |
-|---------|--------|-------------|
-| `init` | Working | Create manifest from samples.txt + optional metadata TSV |
-| `append` | Working | Append analysis results with file locking and smart merge |
-| `status` | Working | Show completion (table/tsv/json formats, progress bars) |
-| `validate` | Working | Check integrity: duplicate keys, null IDs, schema consistency |
-| `log` | Working | Show provenance entries (SLURM job IDs, timestamps, user) |
-| `schema` | Working | Show which analysis added which columns |
-| `export` | Working | Export to xlsx, csv, json, parquet |
+### 2. Why hardcode three levels (patient → specimen → assay)
 
-### Dependencies
+Real cancer-genomics cohorts are naturally three-tiered. A generic
+N-level tree complicates the schema, the query model (how many CTEs to
+walk up?), and the CLI (what level is this `--level` on this command?).
 
-- Python >= 3.8
-- pandas >= 1.5.0
-- Optional: openpyxl (Excel export), pyarrow (Parquet export)
-- No other dependencies. Designed for HPC environments where installing packages is constrained.
+Deferred to v0.4 if a real project genuinely needs a fourth level
+(replicate? region? timepoint as an entity rather than a column?). Three
+levels shipped with a clean FK story is better than five levels shipped
+with bugs.
 
-### Installation
+### 3. Why `casetrack.toml` as the schema source, not a Python class
 
-```bash
-pip install -e . --user
-# or
-pip install -e ".[all]" --user  # with Excel + Parquet support
-```
+Schema decisions are decisions the *domain expert* makes, not the
+engineer. TOML is readable at arm's length, reviewable in a PR, and
+validated at parse time. Python classes would bury schema choices in
+code and force a redeploy to change them.
 
-### Known issues in prototype
+`schema_v` lives in the TOML and bumps on every `schema apply` — this
+doubles as a cheap version stamp in provenance entries.
 
-1. The `append` smart merge uses iterrows() which is slow for large manifests (>1000 samples). Should use vectorized pandas merge/update instead.
-2. No `casetrack rerun` command yet — users must manually generate sbatch commands for missing samples.
-3. No `casetrack dashboard` command for HTML visualization.
-4. No `casetrack projects` command for cross-project overview.
-5. Provenance log doesn't track the git commit hash of the analysis script.
-6. No support for sample-level metadata updates after init (e.g., adding a new metadata column).
-7. The `--allow-new` flag on append could accidentally introduce typos as new samples. Should have a confirmation prompt or require exact match against a whitelist.
-8. No tests.
+### 4. Why provenance outside the DB (append-only JSONL)
 
-## Planned features (priority order)
+`provenance.jsonl` is written **after** the SQLite commit succeeds. That
+sequencing means:
 
-### 1. `casetrack rerun` command
+- A crashed commit leaves no ghost provenance entry
+- A corrupted DB can be rebuilt from the log (`casetrack recover`)
+- `tail -f provenance.jsonl` works during a long SLURM run for live audit
+- The log survives DB format changes
 
-Read status, identify incomplete samples for a given analysis, and generate (or submit) SLURM commands.
+The alternative — provenance as a SQLite table — couples the audit trail
+to the thing it audits. If the DB dies you lose both.
 
-```bash
-# Show what needs re-running
-casetrack rerun --manifest manifest.tsv --analysis tldr_insertions --script run_tldr.sh
+### 5. Why Tier-1 concurrency (WAL + busy_timeout), not a broker
 
-# Output:
-#   sbatch run_tldr.sh MC_TUMOR_003 manifest.tsv
-#   sbatch run_tldr.sh MC_TUMOR_017 manifest.tsv
-#   sbatch run_tldr.sh MC_NORMAL_009 manifest.tsv
+Realistic workloads are dozens of SLURM jobs appending a few seconds each.
+Tier 1 is:
 
-# Actually submit
-casetrack rerun --manifest manifest.tsv --analysis tldr_insertions --script run_tldr.sh --submit
-```
+- `PRAGMA journal_mode = WAL` — readers don't block writers
+- `PRAGMA busy_timeout = 30000` — writers retry up to 30 s if locked
+- `BEGIN IMMEDIATE` up front — deterministic lock ordering
+- `casetrack doctor` — stress-test the filesystem's POSIX lock semantics
+  at project kickoff
 
-### 2. `casetrack dashboard` command
+Target filesystem is **WekaFS**, which implements cross-node POSIX locks
+correctly. Tier 2 (per-task JSONL + merger) and Tier 3 (broker daemon)
+are defined in proposal 0001 §9 but only escalated to if `doctor` fails.
 
-Generate a self-contained HTML file from the manifest. No server required — just open in a browser or scp to local machine.
+### 6. Why DuckDB for queries, not SQLite's own query planner
 
-```bash
-casetrack dashboard --manifest manifest.tsv --output dashboard.html
-```
+DuckDB has:
 
-The dashboard should show: summary metrics (samples, columns, overall completion), per-analysis progress bars with completion percentages, per-sample heatmap grid (click an analysis to see which samples are done/missing), and provenance timeline.
+- Columnar query execution (faster on analytical reads)
+- A rich SQL dialect (window functions, PIVOT, list/struct types)
+- The `sqlite_scanner` extension that attaches a SQLite DB read-only
+- No server, no daemon — a Python import
 
-### 3. Tests
+`casetrack query --project-dir D "SQL"` ATTACHes `casetrack.db` READ_ONLY
+so a running query can never corrupt a live writer's WAL. Helper views
+are published:
 
-Unit tests for core logic: smart merge, file locking, provenance logging, schema tracking, validation. Integration test: init → append multiple analyses → verify manifest state. Concurrency test: simulate multiple simultaneous appends.
+- `patients`, `specimens`, `assays` — pass-throughs
+- `_` = `assays ⋈ specimens ⋈ patients` — cohort view, one row per assay
+  with all ancestor metadata inlined
 
-### 4. Performance optimization
+### 7. Why fill-only merge by default
 
-Replace iterrows() in smart merge with vectorized update. For manifests with >100 columns, consider SQLite backend with TSV export.
+Multiple SLURM array tasks commonly finish simultaneously and call
+`append` on the same table. Fill-only via `COALESCE(col, ?)` lets them
+converge deterministically — the first writer wins for every cell. Users
+who want to overwrite an earlier (perhaps bad) result pass `--overwrite`
+explicitly.
 
-### 5. `casetrack add-metadata` command
+### 8. Why strict FK enforcement with opt-in escape hatches
 
-Add new metadata columns to an existing manifest from a TSV file, without going through the analysis append path.
+"I mistyped a patient_id and now there's a phantom specimen" is the most
+common data-integrity failure mode. SQLite catches it at `INSERT` with
+`ON DELETE RESTRICT` foreign keys. The escape hatch is a deliberate
+double opt-in (`--allow-new-parent --yes`) for operators who genuinely
+want to bootstrap new parents inline. At the assay level, inline parent
+creation is refused entirely: creating a specimen stub without a
+patient_id is unresolvable.
 
-```bash
-casetrack add-metadata --manifest manifest.tsv --metadata new_clinical_data.tsv --key sample_id
-```
+### 9. Why `casetrack migrate` rather than a background converter
 
-### 6. `casetrack projects` command
+Flat-to-v0.3 migration requires routing every column into the right
+level — a decision that benefits from human review. `migrate` runs the
+heuristic (coarsest level at which a column is constant-within-group),
+emits `.migration_report.{tsv,md}`, preserves the source TSV under
+`sandbox/`, and accepts `--metadata-map` overrides. It is a one-shot
+per project, not a sync.
 
-Scan for manifests under a root directory and show cross-project overview.
+### 10. Why a three-layer usage model
 
-```bash
-casetrack projects --root ~/projects/
-# Output:
-#   alzheimers_rnaseq     60 samples   5 analyses   87% complete
-#   brca_immunopeptidome  35 samples   4 analyses   62% complete
-#   l1_mouse_ont          24 samples   7 analyses   91% complete
-```
+casetrack the **package** ≠ casetrack **projects** ≠ user **pipeline
+code**. See [`README.md`](../README.md) → "How people actually use this"
+for the full table. The short version: you install casetrack once, you
+create many projects (one per cohort), your analysis code lives in your
+own git repo and calls the CLI. You do not clone this repo per project.
 
-### 7. Git integration in provenance
+## Dependencies
 
-Log the git commit hash of the project repo (if available) alongside each append entry. This creates a link between manifest state and code version.
+Runtime:
 
-### 8. Nextflow integration
+- Python ≥ 3.10
+- `pandas ≥ 1.5.0`, `duckdb ≥ 0.9`, `tomli` (backport on 3.10; tomllib is
+  stdlib on 3.11+)
+- Optional: `openpyxl` (xlsx export), `pyarrow` (parquet export)
 
-A Nextflow process or `publishDir` hook that automatically calls `casetrack append` when a process completes. This would be a small Nextflow module or a `afterScript` directive.
+No daemon, no network, no external database. `sqlite3` is stdlib.
 
-### 9. Claude Code integration patterns
+## Integration patterns
 
-Three levels of integration, from simple to autonomous:
+**SLURM (the common case)**: ship `run_<analysis>.sh` scripts that
+follow the three-phase pattern. `examples/giab_chr21/slurm/` is the
+reference — verified against real ONT BAMs in the GIAB chr21 cohort.
 
-**Level 1: Interactive CLI** — Claude Code reads manifest status and generates commands in conversation.
+**Nextflow**: `examples/nextflow/casetrack.nf` ships
+`casetrack_append_project`, `casetrack_register_project`, and
+`casetrack_add_metadata_project` processes. `params.casetrack_project_dir`
+is the only config knob most workflows need.
 
-**Level 2: Post-analysis hook** — A shell hook that runs Claude Code after each SLURM job to review results and append QC flag columns (cc_analysis_qc_pass, cc_analysis_qc_note).
+**Claude Code**: `examples/claude/post_analysis_hook.sh` ships a hook
+that runs a QC review after every completed analysis and appends the
+review as its own analysis (`cc_<analysis>_review`) — a concrete
+application of "the manifest is the agent's scratchpad".
 
-```bash
-# At end of SLURM job, after casetrack append:
-claude --print \
-  "Read results for sample ${SAMPLE_ID}. Evaluate QC metrics.
-   Write cc_review.tsv with sample_id, cc_${ANALYSIS}_qc_pass, cc_${ANALYSIS}_qc_note."
-casetrack append --manifest ${MANIFEST} --results cc_review.tsv --key sample_id --analysis cc_${ANALYSIS}_review
-```
+## What's not in scope for v0.3
 
-**Level 3: SDK agent loop** — A Python script using the Claude Code SDK that reads manifest gaps, plans work, submits SLURM jobs, monitors completion, and appends results autonomously.
+Explicitly out:
 
-## Design principles
+- **N-level hierarchy** — patient/specimen/assay stays hardcoded.
+  Deferred to v0.4 if real projects need it (replicate? region?
+  longitudinal timepoints as entities?).
+- **Cross-project joins at the DB layer** — `casetrack query --root`
+  unions TSV exports, but there is no cohort-of-cohorts SQLite. Users
+  who need that run their own DuckDB scripts.
+- **Real-time sync between a project and a central registry** — casetrack
+  is local-first by design.
+- **GUI** — everything is CLI + static HTML. The dashboard is a
+  `casetrack dashboard` rendering of the current DB state; there is no
+  live server.
 
-1. **TSV-first**: Human-readable, git-diffable, works with awk/csvtk/pandas. No database required.
-2. **Manifest is the source of truth**: If it's not in the manifest, it didn't happen.
-3. **Append-only columns**: The manifest only grows rightward. Analyses never remove columns (except with explicit --overwrite).
-4. **Convention: _done columns**: Every analysis appends a `{analysis}_done` timestamp column alongside its data columns. This is what `casetrack status` reads.
-5. **Summarize scripts are the contract**: Each analysis has a small Python script that distills raw tool output into the few columns that belong in the manifest. Full results stay in per-sample directories.
-6. **One manifest per project**: No shared global state. Each project is fully independent.
-7. **File locking for concurrency**: POSIX flock, held only during read-merge-write. No database, no server.
-8. **Provenance by default**: Every append logs who, when, what, from which SLURM job, with file checksums.
-
-## Environment context
-
-- HPC cluster: IRIS at MSKCC, SLURM scheduler
-- Containers: Apptainer/Singularity
-- Primary user: computational biologist running ONT long-read sequencing, DNA methylation, L1 retrotransposon, and cancer genomics analyses
-- Tools in use: modkit, TLDR, xTea, minimap2, Dorado, Snakemake, Nextflow, samtools
-- Python environment: typically conda or module-loaded, limited pip install permissions (use --user or --break-system-packages)
-- Claude Code SDK available on cluster for agentic workflows
-
-## Repository structure
+## Repository layout
 
 ```
 casetrack/
-├── casetrack.py          # Main CLI (single file, all commands)
-├── setup.py              # pip-installable with entry_points
-├── README.md             # Usage documentation
+├── casetrack.py          # single-file CLI (all subcommands)
+├── setup.py              # pip-installable, entry_points=[casetrack=...]
+├── README.md             # user-facing docs
+├── CHANGELOG.md          # release history
+├── CLAUDE.md             # project instructions for Claude Code agents
+├── docs/
+│   ├── CASETRACK_SYNOPSIS.md       — you are here
+│   ├── MIGRATION_v0.2_to_v0.3.md   — upgrade guide
+│   └── proposals/
+│       └── 0001-sqlite-normalized-backend.md   — accepted design
 ├── examples/
-│   ├── run_modkit.sh     # Example SLURM script (three-phase pattern)
-│   └── scripts/
-│       ├── summarize_modkit.py   # Example: modkit pileup → manifest columns
-│       └── summarize_tldr.py     # Example: TLDR table → manifest columns
-└── tests/                # (to be created)
+│   ├── giab_chr21/       — real-data demo (ONT, Genome-in-a-Bottle)
+│   ├── nextflow/         — casetrack.nf DSL2 module
+│   └── claude/           — post-analysis hook
+├── scripts/              — one-shot tooling (legacy demo renderer)
+└── tests/                — pytest suite (410 tests as of v0.3.1)
 ```
 
-## What to build next
+## References
 
-The recommended order for a coding agent picking this up:
-
-1. Write tests for existing functionality (init, append, status, validate, smart merge, file locking)
-2. Fix the iterrows() performance issue in smart merge
-3. Implement `casetrack rerun`
-4. Implement `casetrack dashboard` (static HTML generation)
-5. Implement `casetrack add-metadata`
-6. Implement `casetrack projects`
-7. Add git commit hash to provenance logging
-8. Write a Nextflow integration module
-
-The existing `casetrack.py` is the starting point. All code is in one file for simplicity — it can be refactored into a package structure (`casetrack/cli.py`, `casetrack/manifest.py`, `casetrack/provenance.py`, etc.) when complexity warrants it, but single-file is fine for now.
+- **Proposal 0001** — the accepted v0.3 design:
+  [`docs/proposals/0001-sqlite-normalized-backend.md`](proposals/0001-sqlite-normalized-backend.md).
+  Canonical for all design-decision rationale. When in doubt about *why*
+  something works the way it does, check §0 (the seven accepted
+  decisions) and §19 (the Q&A that produced them).
+- **Migration guide** —
+  [`docs/MIGRATION_v0.2_to_v0.3.md`](MIGRATION_v0.2_to_v0.3.md) covers
+  the v0.2 → v0.3 path in detail.
+- **README** — [`README.md`](../README.md) has the user-facing quick
+  start, the command table, and the three-layer usage model.
+- **CHANGELOG** — [`CHANGELOG.md`](../CHANGELOG.md) tracks what shipped
+  when; entries are written for humans scanning for a particular change.
