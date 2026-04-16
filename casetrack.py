@@ -17,6 +17,7 @@ Usage:
     casetrack dashboard    --manifest manifest.tsv --output dashboard.html
     casetrack add-metadata --manifest manifest.tsv --metadata clinical.tsv --key sample_id
     casetrack projects     --root ~/projects/
+    casetrack query        --manifest manifest.tsv "SELECT sample_id FROM _ WHERE qc_pass"
     casetrack export       --manifest manifest.tsv --output out.xlsx
 
 Author: Samuel Ahuno (sahuno)
@@ -816,6 +817,110 @@ def cmd_add_metadata(args):
     )
 
 
+def _sql_escape(s: str) -> str:
+    """Escape single quotes for literal use inside a DuckDB SQL string."""
+    return str(s).replace("'", "''")
+
+
+def cmd_query(args):
+    """Run a SQL query against one manifest (--manifest) or a union of many
+    (--root) via DuckDB. The manifest is exposed as table `_` by default."""
+    try:
+        import duckdb  # noqa: F401
+    except ImportError:
+        print(
+            "Error: duckdb is required for 'casetrack query'.\n"
+            "Install with: pip install 'casetrack[query]'  (or: pip install duckdb)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    import duckdb as _duckdb
+
+    sql = args.sql
+    alias = args.as_name or "_"
+
+    if bool(args.manifest) == bool(args.root):
+        print(
+            "Error: exactly one of --manifest or --root is required.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    con = _duckdb.connect(":memory:")
+
+    if args.manifest:
+        if not os.path.exists(args.manifest):
+            print(f"Error: manifest not found: {args.manifest}", file=sys.stderr)
+            sys.exit(1)
+        mpath = str(Path(args.manifest).resolve())
+        con.execute(
+            f"CREATE VIEW {alias} AS "
+            f"SELECT * FROM read_csv('{_sql_escape(mpath)}', "
+            f"delim='\t', header=true, sample_size=-1)"
+        )
+    else:
+        root = Path(args.root)
+        if not root.exists() or not root.is_dir():
+            print(
+                f"Error: root not found or not a directory: {root}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        manifests = _find_project_manifests(root, args.pattern, args.max_depth)
+        if not manifests:
+            print(
+                f"No manifests found under {root} "
+                f"(pattern={args.pattern!r}, max-depth={args.max_depth}).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        parts = []
+        for m in manifests:
+            project = _sql_escape(m.parent.name)
+            mpath = _sql_escape(str(m.resolve()))
+            parts.append(
+                f"SELECT '{project}' AS project, * FROM read_csv("
+                f"'{mpath}', delim='\t', header=true, sample_size=-1)"
+            )
+        view_sql = "\nUNION ALL BY NAME\n".join(parts)
+        con.execute(f"CREATE VIEW {alias} AS {view_sql}")
+
+    try:
+        rel = con.sql(sql)
+    except _duckdb.Error as e:
+        print(f"Error: SQL failed: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    df = rel.df()
+
+    out_stream = sys.stdout
+    close_after = False
+    if args.output:
+        out_stream = open(args.output, "w", encoding="utf-8")
+        close_after = True
+
+    try:
+        if args.fmt == "json":
+            out_stream.write(df.to_json(orient="records", indent=2, date_format="iso") or "")
+            out_stream.write("\n")
+        elif args.fmt == "tsv":
+            df.to_csv(out_stream, sep="\t", index=False)
+        elif args.fmt == "csv":
+            df.to_csv(out_stream, index=False)
+        else:  # table
+            # DuckDB relations render themselves as a pretty table; grab that
+            # via the relation before it goes out of scope — but since we've
+            # already materialized df, use tabulate-style from pandas instead.
+            out_stream.write(df.to_string(index=False))
+            out_stream.write("\n")
+            out_stream.write(f"({len(df)} row{'s' if len(df) != 1 else ''})\n")
+    finally:
+        if close_after:
+            out_stream.close()
+
+
 def _render_dashboard_html(manifest, key_col: str, done_cols: list,
                            prov_entries: list, schema: dict,
                            manifest_path: str, prov_limit: int = 100) -> str:
@@ -1295,6 +1400,25 @@ Examples:
     p_schema.add_argument("--manifest", required=True, help="Path to manifest TSV")
     p_schema.add_argument("--fmt", choices=["table", "json"], default="table", help="Output format")
 
+    # ── query ──
+    p_query = subparsers.add_parser(
+        "query",
+        help="Run SQL over one manifest or a union of many (DuckDB-backed)",
+    )
+    g_target = p_query.add_mutually_exclusive_group(required=True)
+    g_target.add_argument("--manifest", help="Path to a single manifest TSV")
+    g_target.add_argument("--root", help="Scan a root for manifests (cross-project query)")
+    p_query.add_argument("sql", help="SQL query; reference the manifest as `_` (or --as NAME)")
+    p_query.add_argument("--as", dest="as_name", default=None,
+                         help="SQL table/view alias for the manifest (default: _)")
+    p_query.add_argument("--pattern", default="manifest.tsv",
+                         help="With --root: manifest filename pattern (default: manifest.tsv)")
+    p_query.add_argument("--max-depth", type=int, default=4,
+                         help="With --root: maximum directory depth (default: 4)")
+    p_query.add_argument("--fmt", choices=["table", "tsv", "csv", "json"], default="table",
+                         help="Output format (default: table)")
+    p_query.add_argument("--output", help="Write results to this file instead of stdout")
+
     # ── projects ──
     p_projects = subparsers.add_parser(
         "projects", help="Cross-project overview: scan a root for manifests"
@@ -1364,6 +1488,7 @@ Examples:
         "dashboard": cmd_dashboard,
         "add-metadata": cmd_add_metadata,
         "projects": cmd_projects,
+        "query": cmd_query,
         "export": cmd_export,
     }
 
