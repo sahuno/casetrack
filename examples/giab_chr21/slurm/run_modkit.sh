@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=modkit_pileup
+#SBATCH --account=greenbab
+#SBATCH --partition=componc_cpu
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=04:00:00
+#SBATCH --mem=64G
+#SBATCH --time=08:00:00
 #SBATCH --output=logs/modkit_%A_%a.out
 #SBATCH --error=logs/modkit_%A_%a.err
 #
