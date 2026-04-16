@@ -31,6 +31,11 @@ else
 fi
 
 MANIFEST="${3:-manifest.tsv}"
+# v0.3: set PROJECT_DIR to a casetrack project directory (containing
+# casetrack.toml + casetrack.db) to use the new SQLite backend. If set,
+# takes precedence over MANIFEST.
+PROJECT_DIR="${PROJECT_DIR:-}"
+LEVEL="${LEVEL:-assay}"
 RESULTS_DIR="results/modkit"
 REF="ref/mm10.fa"
 
@@ -66,13 +71,23 @@ python3 scripts/summarize_modkit.py \
 echo "[Phase 2] Summary TSV written."
 echo "  Columns: $(head -1 ${RESULTS_DIR}/${SAMPLE_ID}/summary.tsv)"
 
-# ── Phase 3: Append to manifest ───────────────────────
-# casetrack handles file locking, provenance logging, and column merging.
-casetrack append \
-    --manifest "${MANIFEST}" \
-    --results "${RESULTS_DIR}/${SAMPLE_ID}/summary.tsv" \
-    --key sample_id \
-    --analysis modkit_methylation
+# ── Phase 3: Append to manifest / project ───────────────────────
+# casetrack handles file locking (v0.2) or WAL + BEGIN IMMEDIATE (v0.3),
+# provenance logging, and column merging.
+if [[ -n "$PROJECT_DIR" ]]; then
+    casetrack append \
+        --project-dir "${PROJECT_DIR}" \
+        --level "${LEVEL}" \
+        --results "${RESULTS_DIR}/${SAMPLE_ID}/summary.tsv" \
+        --analysis modkit_methylation
+else
+    # v0.2 flat-manifest path (deprecated — migrate with `casetrack migrate`)
+    casetrack append \
+        --manifest "${MANIFEST}" \
+        --results "${RESULTS_DIR}/${SAMPLE_ID}/summary.tsv" \
+        --key sample_id \
+        --analysis modkit_methylation
+fi
 
 echo "[Phase 3] Manifest updated."
 echo "=========================================="

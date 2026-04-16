@@ -1,16 +1,26 @@
 # casetrack
 
-**Manifest-centric case management for bioinformatics pipelines on HPC.**
+**Lifecycle data management for computational biology pipelines on HPC.**
 
-One TSV manifest per project. One row per sample. Every analysis appends columns.
-File locking makes it safe for concurrent SLURM jobs; every mutation is logged
-with SLURM job id, git commit, and a file checksum.
+Two storage modes:
+- **v0.3 (project mode — recommended)**: a SQLite-backed project directory with
+  normalized `patient → specimen → assay` tables, enforced foreign keys, typed
+  columns, and DuckDB-powered SQL queries. Survives DB corruption — everything
+  is regenerable from `casetrack.toml` + `provenance.jsonl`.
+- **v0.2 (flat mode — deprecated)**: one TSV manifest per project, one row per
+  sample, every analysis appends columns. Still works, but prints a loud
+  deprecation warning. Scheduled for removal in **v1.0** (~6 months post-v0.3).
+
+Migrate existing flat manifests with `casetrack migrate` — see
+[`docs/MIGRATION_v0.2_to_v0.3.md`](docs/MIGRATION_v0.2_to_v0.3.md).
 
 ```
-sample_id   bam_path            modkit_mean_meth   modkit_done   tldr_l1_count   tldr_done
-SAMPLE_01   /data/s01.bam       0.72               2026-04-14    14              2026-04-14
-SAMPLE_02   /data/s02.bam       0.81               2026-04-14    3               2026-04-14
-SAMPLE_03   /data/s03.bam                                        7               2026-04-14
+cohort_v3/
+├── casetrack.toml       # declared schema — git-tracked source of truth
+├── casetrack.db         # SQLite, WAL + busy_timeout=30000 + FK enforcement
+├── provenance.jsonl     # append-only audit log (git-trackable)
+├── .gitignore           # excludes casetrack.db, casetrack.db-wal/-shm, exports/
+└── sandbox/             # preserved source TSVs (migration artifact)
 ```
 
 ## Contents
@@ -42,9 +52,38 @@ pip install -e ".[all]" --user
 casetrack --help
 ```
 
-Python ≥ 3.8. Depends only on `pandas`. Optional extras: `openpyxl` (xlsx), `pyarrow` (parquet).
+Python ≥ 3.10. Runtime deps: `pandas`, `duckdb`, `tomli` (backport on 3.10).
+Optional extras: `openpyxl` (xlsx), `pyarrow` (parquet).
 
-## Quick start
+## Quick start — v0.3 project mode (recommended)
+
+```bash
+# 1. Create a project directory with the HGSOC schema template.
+casetrack init --project-dir cohort/ --from-template hgsoc
+
+# 2. Register a few rows (or load them in bulk via `add-metadata` / `migrate`).
+casetrack register --project-dir cohort/ --level patient  --id P001 \
+    --meta 'age=55,sex=F,brca_status=brca1'
+casetrack register --project-dir cohort/ --level specimen --id S001 \
+    --parent P001 --meta 'tissue_site=tumor'
+casetrack register --project-dir cohort/ --level assay    --id A001 \
+    --parent S001 --meta 'assay_type=WGS'
+
+# 3. At the end of a SLURM job, append the per-sample summary TSV:
+casetrack append --project-dir cohort/ --level assay \
+    --results summary.tsv --analysis modkit_methylation
+
+# 4. See what's done.
+casetrack status    --project-dir cohort/ --group-by analysis
+casetrack dashboard --project-dir cohort/ --output dashboard.html
+
+# 5. Query across the three levels with SQL (assays⋈specimens⋈patients
+#    is exposed as the view `_`).
+casetrack query --project-dir cohort/ --fmt json \
+    "SELECT patient_id, assay_id, mean_meth FROM _ WHERE mean_meth > 0.6"
+```
+
+## Quick start — v0.2 flat mode (deprecated)
 
 ```bash
 # 1. Sample list
@@ -67,21 +106,34 @@ casetrack status --manifest manifest.tsv
 casetrack dashboard --manifest manifest.tsv --output dashboard.html
 ```
 
+> **Flat mode emits a deprecation warning.** Silence with
+> `CASETRACK_NO_DEPRECATION=1` while you migrate.
+
 ## Commands
 
-| Command          | Purpose                                                           |
-|------------------|-------------------------------------------------------------------|
-| `init`           | Create a manifest from a samples list + optional metadata TSV     |
-| `append`         | Append analysis results as new columns (lock-safe, smart-merge)   |
-| `add-metadata`   | Attach metadata columns post-init (clinical data, QC labels, …)   |
-| `status`         | Per-analysis completion percentages (table / tsv / json)          |
-| `validate`       | Integrity check: duplicate keys, nulls, orphan _done columns      |
-| `log`            | Show provenance entries (who/when/SLURM id/git commit)            |
-| `schema`         | Column-to-analysis mapping                                        |
-| `rerun`          | Emit or submit sbatch commands for samples missing an analysis    |
-| `dashboard`      | Self-contained offline HTML dashboard                             |
-| `projects`       | Cross-project overview: scan a root for manifests                 |
-| `export`         | Export to xlsx / csv / json / parquet                             |
+All commands accept either `--manifest PATH` (flat mode) or `--project-dir DIR`
+(v0.3 project mode, recommended). The write commands log every mutation to
+`provenance.jsonl` with user, SLURM job id, git commit, source file checksum,
+and exact SQL.
+
+| Command          | Purpose                                                                      |
+|------------------|------------------------------------------------------------------------------|
+| `init`           | Create a flat manifest OR a v0.3 project directory                           |
+| `migrate`        | **v0.3** — convert a v0.2 flat manifest into a project directory             |
+| `register`       | **v0.3** — insert a single row at patient/specimen/assay with strict FK      |
+| `append`         | Attach analysis results (flat: columns; v0.3: ALTER TABLE ADD COLUMN)        |
+| `add-metadata`   | Bulk UPDATE/INSERT metadata from a TSV (no `_done` timestamp)                |
+| `status`         | Completion summary (`--group-by {analysis,assay,specimen,patient}`)          |
+| `validate`       | Integrity check: TOML↔DB drift, FK violations, orphan `_done` columns        |
+| `log`            | Show provenance entries (`--level L` / `--transaction TX` filters in v0.3)   |
+| `schema`         | Flat: column-to-analysis map. v0.3: `{show,dump,check,apply}`                |
+| `rerun`          | Emit or submit sbatch commands for rows missing an analysis                  |
+| `dashboard`      | Self-contained offline HTML dashboard (v0.3: nested patients → specimens → assays) |
+| `projects`       | Cross-project overview — detects both v0.2 manifests and v0.3 projects       |
+| `query`          | SQL over flat manifests or v0.3 projects (DuckDB-backed; v0.3 exposes `_`)   |
+| `export`         | Export to xlsx / csv / json / parquet / tsv (`--shape tables\|joined` in v0.3) |
+| `doctor`         | **v0.3** — concurrency stress test on the project's filesystem               |
+| `recover`        | **v0.3** — rebuild `casetrack.db` by replaying `provenance.jsonl`            |
 
 `casetrack <cmd> --help` for the full option list on any subcommand.
 

@@ -3,36 +3,50 @@
 #
 # Runs Claude Code on the freshly-written results TSV, captures a QC
 # review as a second TSV, validates the header, and appends it back
-# into the manifest as its own analysis (cc_<analysis>_review).
+# as its own analysis (cc_<analysis>_review). Supports both v0.2 flat
+# mode (MANIFEST) and v0.3 project mode (PROJECT_DIR).
 #
 # Author: Samuel Ahuno <ekwame001@gmail.com>
-# Date:   2026-04-15
+# Date:   2026-04-15 (v0.2), 2026-04-16 (v0.3)
 #
 # Required env:
-#   SAMPLE_ID     — sample identifier (row key)
-#   ANALYSIS      — name of the just-completed analysis (e.g. modkit)
-#   MANIFEST      — path to manifest.tsv
-#   RESULTS_TSV   — path to the per-sample summary TSV just appended
+#   SAMPLE_ID     — row key. For v0.3 this is the assay_id (or the PK at
+#                   whichever LEVEL you target).
+#   ANALYSIS      — name of the just-completed analysis (e.g. modkit).
+#   RESULTS_TSV   — path to the per-sample summary TSV just appended.
+#
+#   Exactly ONE of:
+#     MANIFEST    — path to v0.2 manifest.tsv (deprecated).
+#     PROJECT_DIR — path to v0.3 casetrack project directory.
 #
 # Optional env:
-#   CC_BIN        — Claude Code binary (default: claude)
-#   CASETRACK_BIN — casetrack binary (default: casetrack)
+#   LEVEL         — [v0.3] target level (default: assay).
+#   CC_BIN        — Claude Code binary (default: claude).
+#   CASETRACK_BIN — casetrack binary (default: casetrack).
 #   PROMPT_FILE   — path to the prompt template
-#                   (default: qc_review_prompt.md next to this script)
+#                   (default: qc_review_prompt.md next to this script).
 #   REVIEW_DIR    — where to write the intermediate review TSV
-#                   (default: $PWD)
+#                   (default: $PWD).
 #
-# Usage (at the end of a SLURM job, after a successful casetrack append):
-#
-#   export SAMPLE_ID ANALYSIS MANIFEST RESULTS_TSV
+# Usage (v0.3):
+#   export SAMPLE_ID ANALYSIS PROJECT_DIR RESULTS_TSV
 #   bash /path/to/post_analysis_hook.sh
 
 set -euo pipefail
 
 : "${SAMPLE_ID:?post_analysis_hook: SAMPLE_ID is required}"
 : "${ANALYSIS:?post_analysis_hook: ANALYSIS is required}"
-: "${MANIFEST:?post_analysis_hook: MANIFEST is required}"
 : "${RESULTS_TSV:?post_analysis_hook: RESULTS_TSV is required}"
+
+# Accept either MANIFEST (flat) or PROJECT_DIR (v0.3). Exactly one.
+if [[ -n "${MANIFEST:-}" && -n "${PROJECT_DIR:-}" ]]; then
+    echo "post_analysis_hook: set exactly one of MANIFEST or PROJECT_DIR, not both" >&2
+    exit 1
+fi
+if [[ -z "${MANIFEST:-}" && -z "${PROJECT_DIR:-}" ]]; then
+    echo "post_analysis_hook: one of MANIFEST or PROJECT_DIR is required" >&2
+    exit 1
+fi
 
 CC_BIN="${CC_BIN:-claude}"
 CASETRACK_BIN="${CASETRACK_BIN:-casetrack}"
@@ -40,8 +54,12 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROMPT_FILE="${PROMPT_FILE:-$script_dir/qc_review_prompt.md}"
 REVIEW_DIR="${REVIEW_DIR:-$PWD}"
 
-if [[ ! -f "$MANIFEST" ]]; then
+if [[ -n "${MANIFEST:-}" && ! -f "$MANIFEST" ]]; then
     echo "post_analysis_hook: manifest not found: $MANIFEST" >&2
+    exit 1
+fi
+if [[ -n "${PROJECT_DIR:-}" && ! -d "$PROJECT_DIR" ]]; then
+    echo "post_analysis_hook: project directory not found: $PROJECT_DIR" >&2
     exit 1
 fi
 if [[ ! -f "$RESULTS_TSV" ]]; then
@@ -82,12 +100,22 @@ if (( n_rows < 1 )); then
     exit 5
 fi
 
-# ── append into the manifest as a distinct analysis so it gets its own ───────
-# ── _done timestamp, its own schema entry, and its own provenance line. ──────
-"$CASETRACK_BIN" append \
-    --manifest "$MANIFEST" \
-    --results "$review_tsv" \
-    --key sample_id \
-    --analysis "cc_${ANALYSIS}_review"
+# ── append into the project as a distinct analysis so it gets its own ───────
+# ── _done timestamp, its own provenance line, and new columns. ──────────────
+LEVEL="${LEVEL:-assay}"
+if [[ -n "${PROJECT_DIR:-}" ]]; then
+    "$CASETRACK_BIN" append \
+        --project-dir "$PROJECT_DIR" \
+        --level "$LEVEL" \
+        --results "$review_tsv" \
+        --analysis "cc_${ANALYSIS}_review"
+else
+    # Flat-mode path (emits a deprecation warning inside casetrack).
+    "$CASETRACK_BIN" append \
+        --manifest "$MANIFEST" \
+        --results "$review_tsv" \
+        --key sample_id \
+        --analysis "cc_${ANALYSIS}_review"
+fi
 
 echo "post_analysis_hook: logged QC review for ${SAMPLE_ID} (${ANALYSIS})"

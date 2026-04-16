@@ -91,3 +91,103 @@ process casetrack_add_metadata {
         ${allow_flag} ${fill_only} ${overwrite}
     """
 }
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * v0.3 project-mode processes — use these for new pipelines.
+ *
+ * Switches:
+ *   params.casetrack_project_dir  : path to the casetrack project directory
+ *                                    (contains casetrack.toml + casetrack.db).
+ *   params.casetrack_level        : target level (patient | specimen | assay).
+ *                                    Defaults to 'assay' to match the shipped
+ *                                    template's analysis_defaults.default_level.
+ *
+ * The "manifest" params above remain for v0.2 compatibility — pipelines can
+ * migrate by replacing their `casetrack_append` call with
+ * `casetrack_append_project` once they have a casetrack.toml+casetrack.db pair.
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+params.casetrack_project_dir = params.containsKey('casetrack_project_dir') ? params.casetrack_project_dir : null
+params.casetrack_level       = 'assay'
+params.casetrack_col_type    = ''
+
+process casetrack_append_project {
+    tag "${analysis}@${params.casetrack_level}"
+
+    maxForks 1
+    errorStrategy 'retry'
+    maxRetries 2
+
+    input:
+      tuple val(analysis), path(results_tsv)
+
+    output:
+      tuple val(analysis), path(results_tsv)
+
+    script:
+    def col_type_flag = params.casetrack_col_type ?
+        "--col-type '${params.casetrack_col_type}'" : ''
+    def overwrite_flag = params.containsKey('casetrack_overwrite') && params.casetrack_overwrite ?
+        '--overwrite' : ''
+    """
+    ${params.casetrack_bin} append \\
+        --project-dir '${params.casetrack_project_dir}' \\
+        --level '${params.casetrack_level}' \\
+        --results '${results_tsv}' \\
+        --analysis '${analysis}' \\
+        ${col_type_flag} ${overwrite_flag} ${params.casetrack_extra}
+    """
+}
+
+process casetrack_register_project {
+    tag "${level}:${row_id}"
+
+    maxForks 1
+    errorStrategy 'retry'
+    maxRetries 2
+
+    input:
+      tuple val(level), val(row_id), val(parent_id), val(meta_str)
+
+    output:
+      tuple val(level), val(row_id)
+
+    script:
+    def parent_flag = parent_id ? "--parent '${parent_id}'" : ''
+    def meta_flag   = meta_str  ? "--meta '${meta_str}'"  : ''
+    def allow_flag  = params.casetrack_allow_new ? '--allow-new-parent --yes' : ''
+    """
+    ${params.casetrack_bin} register \\
+        --project-dir '${params.casetrack_project_dir}' \\
+        --level '${level}' \\
+        --id '${row_id}' \\
+        ${parent_flag} ${meta_flag} ${allow_flag}
+    """
+}
+
+process casetrack_add_metadata_project {
+    tag "add-metadata@${params.casetrack_level}"
+
+    maxForks 1
+    errorStrategy 'retry'
+    maxRetries 2
+
+    input:
+      path metadata_tsv
+
+    output:
+      path metadata_tsv
+
+    script:
+    def allow_flag = params.casetrack_allow_new ? '--allow-new --yes' : ''
+    def fill_only  = params.containsKey('casetrack_fill_only') && params.casetrack_fill_only ? '--fill-only' : ''
+    def overwrite  = params.containsKey('casetrack_overwrite') && params.casetrack_overwrite ? '--overwrite' : ''
+    """
+    ${params.casetrack_bin} add-metadata \\
+        --project-dir '${params.casetrack_project_dir}' \\
+        --level '${params.casetrack_level}' \\
+        --metadata '${metadata_tsv}' \\
+        ${allow_flag} ${fill_only} ${overwrite}
+    """
+}

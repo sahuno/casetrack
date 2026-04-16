@@ -4,6 +4,92 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-04-16
+
+SQLite-backed project mode. 399 pytest tests. Flat-manifest mode remains
+supported but prints a loud deprecation warning; slated for removal in
+v1.0 (~6 months post-v0.3).
+
+### Added
+
+- **Project mode.** `casetrack init --project-dir DIR [--from-template
+  {blank,hgsoc}]` creates a directory with `casetrack.toml` (declared
+  schema), `casetrack.db` (SQLite, WAL + FK enforcement + busy_timeout),
+  `provenance.jsonl` (append-only audit log), and a `.gitignore` that
+  excludes the DB + WAL/SHM.
+- **`casetrack migrate`** — one-shot conversion of a v0.2 flat manifest
+  into a v0.3 project. Column routing is "constant-within-group, coarsest
+  level wins"; `--metadata-map` overrides. Writes
+  `.migration_report.{tsv,md}` and preserves the source TSV under
+  `sandbox/`.
+- **`casetrack register`** — single-row INSERT at any level with strict
+  foreign-key enforcement. Missing parent → exit 2; opt in to inline
+  creation with `--allow-new-parent --yes`.
+- **`casetrack append --project-dir`** — dynamic `ALTER TABLE ADD COLUMN`
+  inside a BEGIN IMMEDIATE transaction; Q7 hybrid type inference with
+  `--col-type name:TYPE,…` overrides; fill-only default via COALESCE,
+  `--overwrite` for unconditional writes.
+- **`casetrack add-metadata --project-dir`** — bulk UPDATE + opt-in bulk
+  INSERT (`--allow-new --yes`) against declared schema columns.
+- **`casetrack status --project-dir`** — `--group-by {analysis,assay,
+  specimen,patient}` with table/TSV/JSON output.
+- **`casetrack validate --project-dir`** — TOML↔DB drift detection, FK
+  integrity via `PRAGMA foreign_key_check`, orphan `_done` columns
+  cross-referenced against provenance.
+- **`casetrack log --project-dir`** — provenance viewer with `--level L`,
+  `--transaction TX`, `--last N` filters.
+- **`casetrack schema --project-dir {show,dump,check,apply}`** — lifecycle
+  for the TOML↔DB schema: show current TOML, regenerate from DB, check
+  drift, apply declared changes and bump `schema_v`.
+- **`casetrack query --project-dir`** — DuckDB ATTACH of casetrack.db
+  READ_ONLY, with `patients`/`specimens`/`assays` views plus
+  `_ = assays ⋈ specimens ⋈ patients` for the cohort view.
+- **`casetrack export --project-dir`** — `--shape {tables,joined}`,
+  `--tables p,s,a` subset, `--sql "SELECT …"` passthrough; writes TSV/
+  CSV/JSON/XLSX/Parquet (format inferred from `--output` extension).
+- **`casetrack dashboard --project-dir`** — nested HTML: one `<details>`
+  per patient → per specimen → assay table with per-analysis completion
+  cells. Fully self-contained (no external CSS/JS).
+- **`casetrack rerun --project-dir`** — lists/dispatches sbatch jobs for
+  rows missing an analysis, with `--level` to pick which table to scan.
+- **`casetrack projects --root`** — now detects v0.3 projects
+  (`casetrack.toml` + `casetrack.db`) alongside v0.2 flat manifests.
+- **`casetrack doctor --project-dir`** — Tier-1 concurrency stress test.
+  Forks N workers × M INSERTs; exits non-zero on CORRUPT / MISUSE /
+  partial commit.
+- **`casetrack recover --project-dir`** — rebuild `casetrack.db` by
+  replaying `provenance.jsonl`. Register/init entries self-contained;
+  append/add-metadata/migrate entries re-read the recorded source TSV
+  with checksum verification. `--permit-partial` allows partial rebuilds.
+
+### Changed
+
+- `casetrack.py` version bumped to 0.3.0 in `setup.py`.
+- `setup.py` pins duckdb as a required install dep (not optional); adds
+  `tomli>=2.0` for Python 3.10 (tomllib is stdlib on 3.11+).
+- `python_requires` raised to `>=3.10`.
+- Every `--manifest` invocation prints a one-shot deprecation warning to
+  stderr. Silence with `CASETRACK_NO_DEPRECATION=1`.
+- `casetrack projects` TSV output adds a `kind` column ("v0.2" / "v0.3").
+
+### Fixed (from v0.3-alpha hardening)
+
+- `cmd_append` (flat mode) no longer emits a pandas FutureWarning when
+  assigning timestamp strings into an all-NaN float64 column.
+- `casetrack projects` now fails hard on unparseable manifests instead of
+  warn-and-continue.
+
+### Documentation
+
+- `docs/MIGRATION_v0.2_to_v0.3.md` — migration guide with CLI cheatsheet.
+- `README.md` refreshed with dual-mode quick starts and updated command
+  table.
+- Nextflow module gains `casetrack_append_project`,
+  `casetrack_register_project`, and `casetrack_add_metadata_project`
+  alongside the v0.2 processes.
+- Claude post-analysis hook accepts `PROJECT_DIR` in place of `MANIFEST`.
+- `examples/run_modkit.sh` — phase-3 line now branches on `PROJECT_DIR`.
+
 ## [0.2.0] — 2026-04-15
 
 First release past the prototype. 152 pytest tests, eight signed commits,
