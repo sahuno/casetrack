@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=flagstat
+#SBATCH --account=greenbab
+#SBATCH --partition=cpu
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
 #SBATCH --time=00:30:00
@@ -17,12 +19,14 @@
 #   PROJECT_DIR   — casetrack project directory
 #
 # Optional:
-#   SAMTOOLS_BIN  — override the samtools executable (default: samtools on PATH)
-#   CASETRACK_BIN — override the casetrack executable (default: casetrack on PATH)
+#   SAMTOOLS_BIN       — samtools executable path (default: samtools on PATH)
+#   SAMTOOLS_CONTAINER — apptainer image to wrap samtools with (overrides BIN)
+#                        e.g. /data1/greenbab/software/images/onttools_v3.10.sif
+#   CASETRACK_BIN      — casetrack executable (default: casetrack on PATH)
 #
-# Assumes samtools + casetrack are on PATH. On MSKCC HPC without those in the
-# environment, set SAMTOOLS_BIN and CASETRACK_BIN explicitly, or submit from
-# an env (conda / apptainer shell) that has them.
+# If SAMTOOLS_CONTAINER is set, the script runs
+#   apptainer exec --bind /data1/greenbab <CONTAINER> samtools flagstat ...
+# otherwise it falls back to the native SAMTOOLS_BIN path.
 
 set -euo pipefail
 
@@ -31,6 +35,7 @@ set -euo pipefail
 : "${PROJECT_DIR:?run_flagstat: PROJECT_DIR is required}"
 
 SAMTOOLS_BIN="${SAMTOOLS_BIN:-samtools}"
+SAMTOOLS_CONTAINER="${SAMTOOLS_CONTAINER:-}"
 CASETRACK_BIN="${CASETRACK_BIN:-casetrack}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)"
@@ -44,11 +49,19 @@ exec > >(tee -a "$LOG") 2>&1
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] === flagstat ${ASSAY_ID} ==="
 echo "BAM_PATH=${BAM_PATH}"
 echo "PROJECT_DIR=${PROJECT_DIR}"
-echo "samtools=$(${SAMTOOLS_BIN} --version | head -1 || true)"
+
+# Build the samtools invocation — container-wrapped or native.
+if [[ -n "${SAMTOOLS_CONTAINER}" ]]; then
+    SAMTOOLS_CMD=(apptainer exec --bind /data1/greenbab "${SAMTOOLS_CONTAINER}" samtools)
+    echo "samtools: apptainer ${SAMTOOLS_CONTAINER}"
+else
+    SAMTOOLS_CMD=("${SAMTOOLS_BIN}")
+    echo "samtools: $(${SAMTOOLS_BIN} --version | head -1 || true)"
+fi
 
 # ── Phase 1: flagstat ─────────────────────────────────────────────────────────
 FLAGSTAT_OUT="${RESULTS_DIR}/flagstat.txt"
-"${SAMTOOLS_BIN}" flagstat "${BAM_PATH}" > "${FLAGSTAT_OUT}"
+"${SAMTOOLS_CMD[@]}" flagstat "${BAM_PATH}" > "${FLAGSTAT_OUT}"
 echo "[Phase 1] samtools flagstat → ${FLAGSTAT_OUT}"
 
 # ── Phase 2: summarize to TSV ─────────────────────────────────────────────────

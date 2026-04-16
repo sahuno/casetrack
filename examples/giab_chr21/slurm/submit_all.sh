@@ -50,7 +50,9 @@ while IFS=$'\t' read -r patient_id assay_id condition assay_type bam_path; do
             # chr21 restriction for the demo BAMs.
             exports+=",CHR_LIMIT=chr21"
         fi
-        cmd="sbatch --export=ALL,${exports} ${script}"
+        # --chdir so the SBATCH #output/logs/ path lands inside the project dir.
+        mkdir -p "${PROJECT_DIR}/logs"
+        cmd="sbatch --chdir=${PROJECT_DIR} --export=ALL,${exports} ${script}"
         if [[ -n "${SUBMIT}" ]]; then
             eval "${cmd}"
         else
