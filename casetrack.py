@@ -24,14 +24,30 @@ Author: Samuel Ahuno (sahuno)
 """
 
 import argparse
+import contextlib
 import datetime
 import fcntl
 import html
 import json
 import os
+import shutil
+import sqlite3
 import sys
 import hashlib
+import uuid
 from pathlib import Path
+
+try:
+    import tomllib as _tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover — 3.10 path
+    try:
+        import tomli as _tomllib
+    except ImportError:
+        print(
+            "Error: tomllib/tomli is required. On Python <3.11 install tomli: pip install tomli",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 try:
     import pandas as pd
@@ -48,6 +64,345 @@ SCHEMA_SUFFIX = ".schema.json"
 
 DONE_COLUMN_SUFFIX = "_done"
 TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S"
+
+# ── v0.3 project-mode constants ────────────────────────────────────────────────
+
+PROJECT_DB_NAME = "casetrack.db"
+PROJECT_TOML_NAME = "casetrack.toml"
+PROJECT_PROVENANCE_NAME = "provenance.jsonl"
+PROJECT_GITIGNORE_NAME = ".gitignore"
+
+# Column types allowed in casetrack.toml schema.
+VALID_COLUMN_TYPES = {"TEXT", "INTEGER", "REAL", "BOOLEAN", "DATE"}
+
+# Hardcoded hierarchy for v0.3 (Q1 from proposal 0001 §19): patient → specimen → assay.
+LEVEL_ORDER = ("patient", "specimen", "assay")
+
+# Default pragma values for every SQLite connection casetrack opens.
+SQLITE_BUSY_TIMEOUT_MS = 30000
+
+
+# ── v0.3 TOML schema ───────────────────────────────────────────────────────────
+#
+# `casetrack.toml` declares the three-level schema (patient/specimen/assay).
+# The DB is regenerable from TOML + provenance.jsonl (see §9.4 of proposal 0001),
+# so TOML is the git-tracked source of schema truth.
+
+
+class SchemaError(ValueError):
+    """Raised when a casetrack.toml schema is malformed or internally inconsistent."""
+
+
+def _blank_toml_template(project_name: str) -> str:
+    """Minimal schema with just the primary keys and enforced parent FKs."""
+    now = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    return f"""[project]
+name     = "{project_name}"
+schema_v = 1
+created  = "{now}"
+
+[levels.patient]
+key = "patient_id"
+
+[levels.patient.columns]
+patient_id = {{ type = "TEXT", required = true, unique = true }}
+
+[levels.specimen]
+key        = "specimen_id"
+parent     = "patient"
+parent_key = "patient_id"
+
+[levels.specimen.columns]
+specimen_id = {{ type = "TEXT", required = true, unique = true }}
+patient_id  = {{ type = "TEXT", required = true }}
+
+[levels.assay]
+key        = "assay_id"
+parent     = "specimen"
+parent_key = "specimen_id"
+
+[levels.assay.columns]
+assay_id    = {{ type = "TEXT", required = true, unique = true }}
+specimen_id = {{ type = "TEXT", required = true }}
+assay_type  = {{ type = "TEXT", required = true }}
+
+[analysis_defaults]
+default_level = "assay"
+
+[engine]
+wal             = true
+busy_timeout_ms = {SQLITE_BUSY_TIMEOUT_MS}
+"""
+
+
+def _hgsoc_toml_template(project_name: str) -> str:
+    """Template matching the example in proposal 0001 §6."""
+    now = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    return f"""[project]
+name     = "{project_name}"
+schema_v = 1
+created  = "{now}"
+
+[levels.patient]
+key = "patient_id"
+
+[levels.patient.columns]
+patient_id  = {{ type = "TEXT", required = true, unique = true }}
+age         = {{ type = "INTEGER" }}
+sex         = {{ type = "TEXT", enum = ["F", "M", "intersex", "unknown"] }}
+diagnosis   = {{ type = "TEXT" }}
+brca_status = {{ type = "TEXT", enum = ["brca1", "brca2", "wt", "vus"] }}
+neoadjuvant = {{ type = "BOOLEAN" }}
+pfs_months  = {{ type = "REAL" }}
+os_months   = {{ type = "REAL" }}
+
+[levels.specimen]
+key        = "specimen_id"
+parent     = "patient"
+parent_key = "patient_id"
+
+[levels.specimen.columns]
+specimen_id     = {{ type = "TEXT", required = true, unique = true }}
+patient_id      = {{ type = "TEXT", required = true }}
+tissue_site     = {{ type = "TEXT", required = true }}
+timepoint       = {{ type = "TEXT" }}
+collection_date = {{ type = "DATE" }}
+tumor_purity    = {{ type = "REAL" }}
+
+[levels.assay]
+key        = "assay_id"
+parent     = "specimen"
+parent_key = "specimen_id"
+
+[levels.assay.columns]
+assay_id    = {{ type = "TEXT", required = true, unique = true }}
+specimen_id = {{ type = "TEXT", required = true }}
+assay_type  = {{ type = "TEXT", required = true, enum = ["scRNA", "ATAC", "WGS", "WES", "ONT", "Visium"] }}
+replicate   = {{ type = "INTEGER", default = 1 }}
+qc_pass     = {{ type = "BOOLEAN" }}
+
+[analysis_defaults]
+default_level = "assay"
+
+[engine]
+wal             = true
+busy_timeout_ms = {SQLITE_BUSY_TIMEOUT_MS}
+"""
+
+
+TEMPLATES = {"blank": _blank_toml_template, "hgsoc": _hgsoc_toml_template}
+
+
+def load_schema(toml_path: str | Path) -> dict:
+    """Parse `casetrack.toml` into a validated schema dict.
+
+    Returns the parsed TOML (as a plain dict) after validating structure.
+    Raises SchemaError with a clear message on any violation.
+    """
+    toml_path = Path(toml_path)
+    if not toml_path.exists():
+        raise SchemaError(f"schema file not found: {toml_path}")
+    with open(toml_path, "rb") as f:
+        try:
+            raw = _tomllib.load(f)
+        except Exception as e:
+            raise SchemaError(f"failed to parse {toml_path}: {e}") from e
+    validate_schema(raw)
+    return raw
+
+
+def validate_schema(schema: dict) -> None:
+    """Validate a parsed casetrack schema dict. Raises SchemaError on failure."""
+    if "project" not in schema or not isinstance(schema["project"], dict):
+        raise SchemaError("missing [project] section")
+    proj = schema["project"]
+    for key in ("name", "schema_v"):
+        if key not in proj:
+            raise SchemaError(f"[project] missing required key: {key}")
+
+    if "levels" not in schema or not isinstance(schema["levels"], dict):
+        raise SchemaError("missing [levels.*] sections")
+
+    for level in LEVEL_ORDER:
+        if level not in schema["levels"]:
+            raise SchemaError(f"missing [levels.{level}] section")
+        _validate_level(level, schema["levels"][level])
+
+    # Enforce hierarchy: specimen.parent == patient, assay.parent == specimen.
+    expected_parents = {"patient": None, "specimen": "patient", "assay": "specimen"}
+    for level, expected in expected_parents.items():
+        actual = schema["levels"][level].get("parent")
+        if actual != expected:
+            raise SchemaError(
+                f"[levels.{level}] parent mismatch: expected {expected!r}, got {actual!r}"
+            )
+
+
+def _validate_level(level: str, spec: dict) -> None:
+    if not isinstance(spec, dict):
+        raise SchemaError(f"[levels.{level}] must be a table")
+    if "key" not in spec:
+        raise SchemaError(f"[levels.{level}] missing required key: key")
+    if "columns" not in spec or not isinstance(spec["columns"], dict):
+        raise SchemaError(f"[levels.{level}] missing [levels.{level}.columns] table")
+    key = spec["key"]
+    if key not in spec["columns"]:
+        raise SchemaError(
+            f"[levels.{level}] declared key {key!r} is not in [levels.{level}.columns]"
+        )
+    for colname, coldef in spec["columns"].items():
+        _validate_column(level, colname, coldef)
+
+    # Specimen and assay must also declare their parent foreign-key column.
+    parent_key = spec.get("parent_key")
+    if parent_key and parent_key not in spec["columns"]:
+        raise SchemaError(
+            f"[levels.{level}] parent_key {parent_key!r} not in [levels.{level}.columns]"
+        )
+
+
+def _validate_column(level: str, name: str, spec) -> None:
+    if not isinstance(spec, dict):
+        raise SchemaError(f"[levels.{level}.columns.{name}] must be an inline table")
+    ctype = spec.get("type")
+    if ctype not in VALID_COLUMN_TYPES:
+        raise SchemaError(
+            f"[levels.{level}.columns.{name}] invalid type {ctype!r}; "
+            f"must be one of {sorted(VALID_COLUMN_TYPES)}"
+        )
+    if "enum" in spec:
+        enum = spec["enum"]
+        if not isinstance(enum, list) or not all(isinstance(v, str) for v in enum):
+            raise SchemaError(
+                f"[levels.{level}.columns.{name}] enum must be a list of strings"
+            )
+
+
+# ── v0.3 SQLite engine ─────────────────────────────────────────────────────────
+
+
+def open_project_db(db_path: str | Path) -> sqlite3.Connection:
+    """Open (or create) a casetrack SQLite DB with WAL + busy_timeout + FKs on.
+
+    Every casetrack connection should go through this factory so concurrency
+    pragmas are consistent across commands (proposal 0001 §9.1).
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+@contextlib.contextmanager
+def begin_immediate(conn: sqlite3.Connection):
+    """BEGIN IMMEDIATE … COMMIT/ROLLBACK context (proposal 0001 §9.1).
+
+    `IMMEDIATE` acquires a reserved lock up front so two concurrent writers
+    don't both enter the transaction optimistically and collide at commit.
+    Any exception inside the block triggers ROLLBACK.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
+def schema_to_ddl(schema: dict) -> list[str]:
+    """Render a validated schema dict into CREATE TABLE statements.
+
+    Order matters — parents first so child FKs resolve during CREATE.
+    """
+    statements = []
+    for level in LEVEL_ORDER:
+        spec = schema["levels"][level]
+        statements.append(_create_table_ddl(level, spec))
+    return statements
+
+
+def _create_table_ddl(level: str, spec: dict) -> str:
+    table = f"{level}s"  # patients, specimens, assays
+    cols = []
+    for name, col in spec["columns"].items():
+        parts = [_quote_ident(name), col["type"]]
+        if col.get("required"):
+            parts.append("NOT NULL")
+        if col.get("unique") and name != spec["key"]:
+            parts.append("UNIQUE")
+        if "default" in col:
+            parts.append(f"DEFAULT {_quote_literal(col['default'])}")
+        if "enum" in col:
+            values = ", ".join(_quote_literal(v) for v in col["enum"])
+            parts.append(f"CHECK ({_quote_ident(name)} IN ({values}))")
+        cols.append(" ".join(parts))
+
+    cols.append(f"PRIMARY KEY ({_quote_ident(spec['key'])})")
+
+    parent = spec.get("parent")
+    if parent:
+        parent_table = f"{parent}s"
+        parent_key = spec["parent_key"]
+        cols.append(
+            f"FOREIGN KEY ({_quote_ident(parent_key)}) "
+            f"REFERENCES {_quote_ident(parent_table)}({_quote_ident(parent_key)}) "
+            f"ON DELETE RESTRICT"
+        )
+
+    body = ",\n    ".join(cols)
+    return f"CREATE TABLE {_quote_ident(table)} (\n    {body}\n)"
+
+
+def _quote_ident(name: str) -> str:
+    """Quote a SQL identifier (table or column). Rejects embedded double-quotes
+    to avoid breaking identifier quoting — schema identifiers come from TOML,
+    a trusted source, so a reject-on-violation policy is appropriate."""
+    if '"' in name:
+        raise SchemaError(f"identifier contains embedded double-quote: {name!r}")
+    return f'"{name}"'
+
+
+def _quote_literal(value) -> str:
+    """Quote a SQL literal (used for CHECK enums and DEFAULTs)."""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def apply_schema(conn: sqlite3.Connection, schema: dict) -> None:
+    """Run every CREATE TABLE from `schema` inside one transaction."""
+    with begin_immediate(conn):
+        for ddl in schema_to_ddl(schema):
+            conn.execute(ddl)
+
+
+# ── v0.3 project-mode provenance ───────────────────────────────────────────────
+
+
+def log_project_provenance(project_dir: str | Path, entry: dict) -> None:
+    """Append a provenance record to the project's provenance.jsonl.
+
+    Parallel to `log_provenance` (flat-mode) but targets `<project>/provenance.jsonl`.
+    Populates timestamp / user / host / SLURM ids / git state automatically.
+    """
+    log_path = Path(project_dir) / PROJECT_PROVENANCE_NAME
+    entry["timestamp"] = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    entry["user"] = os.environ.get("USER", "unknown")
+    entry["hostname"] = os.environ.get("HOSTNAME", "unknown")
+    entry["slurm_job_id"] = os.environ.get("SLURM_JOB_ID", None)
+    entry["slurm_array_task_id"] = os.environ.get("SLURM_ARRAY_TASK_ID", None)
+    entry["git"] = _git_state()
+    with open(log_path, "a") as f:
+        f.write(json.dumps(entry, default=str) + "\n")
+
+
+def _new_transaction_id() -> str:
+    return "txn_" + datetime.datetime.now().strftime("%Y%m%dT%H%M%S") + "_" + uuid.uuid4().hex[:8]
 
 
 # ── File Locking ───────────────────────────────────────────────────────────────
@@ -218,8 +573,113 @@ def fill_nan_cells(manifest: "pd.DataFrame", results: "pd.DataFrame",
 # ── Core Commands ──────────────────────────────────────────────────────────────
 
 def cmd_init(args):
-    """Initialize a new manifest from a sample list."""
+    """Dispatch `casetrack init` to flat (--manifest) or project (--project-dir) mode."""
+    if getattr(args, "project_dir", None):
+        return cmd_init_project(args)
+    return cmd_init_flat(args)
+
+
+def cmd_init_project(args):
+    """Initialize a v0.3 casetrack project directory.
+
+    Creates: <dir>/casetrack.toml, <dir>/casetrack.db (with the three-level
+    schema applied), <dir>/provenance.jsonl, <dir>/.gitignore.
+    """
+    project_dir = Path(args.project_dir)
+    template = getattr(args, "from_template", None) or "blank"
+    if template not in TEMPLATES:
+        print(
+            f"Error: unknown template {template!r}. Known: {sorted(TEMPLATES)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    db_path = project_dir / PROJECT_DB_NAME
+    toml_path = project_dir / PROJECT_TOML_NAME
+    prov_path = project_dir / PROJECT_PROVENANCE_NAME
+    gitignore_path = project_dir / PROJECT_GITIGNORE_NAME
+
+    if db_path.exists() and not args.force:
+        print(
+            f"Error: {db_path} already exists. Use --force to overwrite.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    project_name = args.project_name or project_dir.resolve().name
+    toml_text = TEMPLATES[template](project_name)
+    toml_path.write_text(toml_text)
+
+    try:
+        schema = load_schema(toml_path)
+    except SchemaError as e:
+        print(f"Error: generated schema failed validation: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if db_path.exists():
+        db_path.unlink()
+        # Clean up WAL/SHM leftovers from the old DB so they don't get reused.
+        for suffix in ("-wal", "-shm"):
+            leftover = Path(str(db_path) + suffix)
+            if leftover.exists():
+                leftover.unlink()
+
+    conn = open_project_db(db_path)
+    try:
+        apply_schema(conn, schema)
+    finally:
+        conn.close()
+
+    # Empty provenance log — touch to create.
+    if not prov_path.exists():
+        prov_path.touch()
+
+    if not gitignore_path.exists():
+        gitignore_path.write_text(_project_gitignore_contents())
+
+    log_project_provenance(project_dir, {
+        "action": "init_project",
+        "transaction_id": _new_transaction_id(),
+        "template": template,
+        "project_name": project_name,
+        "schema_v_before": 0,
+        "schema_v_after": schema["project"]["schema_v"],
+        "sql": schema_to_ddl(schema),
+    })
+
+    print(
+        f"Initialized casetrack project at {project_dir}/\n"
+        f"  - {PROJECT_TOML_NAME}  ({template} template)\n"
+        f"  - {PROJECT_DB_NAME}    (three levels: {', '.join(LEVEL_ORDER)})\n"
+        f"  - {PROJECT_PROVENANCE_NAME}\n"
+        f"  - {PROJECT_GITIGNORE_NAME}"
+    )
+
+
+def _project_gitignore_contents() -> str:
+    """Contents of `.gitignore` for a fresh project (proposal 0001 §5, §19 Q6)."""
+    return (
+        "# casetrack project .gitignore — proposal 0001 Q6\n"
+        "# DB is binary and regenerable from casetrack.toml + provenance.jsonl.\n"
+        f"{PROJECT_DB_NAME}\n"
+        f"{PROJECT_DB_NAME}-wal\n"
+        f"{PROJECT_DB_NAME}-shm\n"
+        "exports/\n"
+    )
+
+
+def cmd_init_flat(args):
+    """Initialize a new flat-manifest (v0.2 style)."""
     manifest_path = args.manifest
+
+    if not getattr(args, "samples", None):
+        print(
+            "Error: --samples is required with --manifest (flat mode).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if os.path.exists(manifest_path) and not args.force:
         print(f"Error: {manifest_path} already exists. Use --force to overwrite.", file=sys.stderr)
@@ -1365,13 +1825,35 @@ Examples:
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # ── init ──
-    p_init = subparsers.add_parser("init", help="Initialize a new manifest")
-    p_init.add_argument("--manifest", required=True, help="Path to manifest TSV")
-    p_init.add_argument("--samples", required=True, help="Text file with one sample_id per line")
+    p_init = subparsers.add_parser(
+        "init",
+        help="Initialize a new manifest (flat) or casetrack project (v0.3 SQLite)",
+    )
+    g_init_target = p_init.add_mutually_exclusive_group(required=True)
+    g_init_target.add_argument("--manifest", help="[flat mode] Path to manifest TSV")
+    g_init_target.add_argument(
+        "--project-dir",
+        help="[project mode] Directory for a new v0.3 casetrack project",
+    )
+    p_init.add_argument("--samples", help="[flat mode] Text file with one sample_id per line")
     p_init.add_argument("--key", default="sample_id", help="Key column name (default: sample_id)")
-    p_init.add_argument("--metadata", help="Optional TSV with additional sample metadata")
-    p_init.add_argument("--cols", help="Comma-separated list of empty columns to pre-create")
-    p_init.add_argument("--force", action="store_true", help="Overwrite existing manifest")
+    p_init.add_argument("--metadata", help="[flat mode] Optional TSV with additional sample metadata")
+    p_init.add_argument("--cols", help="[flat mode] Comma-separated list of empty columns to pre-create")
+    p_init.add_argument(
+        "--from-template",
+        choices=sorted(TEMPLATES.keys()),
+        default="blank",
+        help="[project mode] Schema template (default: blank)",
+    )
+    p_init.add_argument(
+        "--project-name",
+        help="[project mode] Project name written into casetrack.toml (default: directory basename)",
+    )
+    p_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing manifest (flat) or casetrack.db (project)",
+    )
 
     # ── append ──
     p_append = subparsers.add_parser("append", help="Append analysis results to manifest")
