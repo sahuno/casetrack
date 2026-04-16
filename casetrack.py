@@ -215,7 +215,69 @@ busy_timeout_ms = {SQLITE_BUSY_TIMEOUT_MS}
 """
 
 
-TEMPLATES = {"blank": _blank_toml_template, "hgsoc": _hgsoc_toml_template}
+def _giab_ont_toml_template(project_name: str) -> str:
+    """Template for Oxford Nanopore WGS cohorts — e.g. Genome-in-a-Bottle
+    reference samples. patient = biological sample (HG002, HG006, ...);
+    specimen = one DNA extraction; assay = one flowcell run.
+    """
+    now = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    return f"""[project]
+name     = "{project_name}"
+schema_v = 1
+created  = "{now}"
+
+[levels.patient]
+key = "patient_id"
+
+[levels.patient.columns]
+patient_id       = {{ type = "TEXT", required = true, unique = true }}
+sex              = {{ type = "TEXT", enum = ["F", "M", "intersex", "unknown"] }}
+reference_source = {{ type = "TEXT" }}
+trio_role        = {{ type = "TEXT", enum = ["proband", "father", "mother", "sibling", "unrelated"] }}
+cohort           = {{ type = "TEXT" }}
+
+[levels.specimen]
+key        = "specimen_id"
+parent     = "patient"
+parent_key = "patient_id"
+
+[levels.specimen.columns]
+specimen_id   = {{ type = "TEXT", required = true, unique = true }}
+patient_id    = {{ type = "TEXT", required = true }}
+specimen_type = {{ type = "TEXT", enum = ["lymphoblastoid_dna", "whole_blood", "buccal", "whole_genome_dna"] }}
+cell_line     = {{ type = "TEXT" }}
+source        = {{ type = "TEXT" }}
+
+[levels.assay]
+key        = "assay_id"
+parent     = "specimen"
+parent_key = "specimen_id"
+
+[levels.assay.columns]
+assay_id         = {{ type = "TEXT", required = true, unique = true }}
+specimen_id      = {{ type = "TEXT", required = true }}
+assay_type       = {{ type = "TEXT", required = true, enum = ["ONT_WGS", "ONT_target", "ONT_cDNA", "ONT_direct_RNA"] }}
+flowcell_id      = {{ type = "TEXT" }}
+chemistry        = {{ type = "TEXT", enum = ["R9.4.1", "R10.4.1", "R10.4.1_dorado"] }}
+basecaller_model = {{ type = "TEXT" }}
+bam_path         = {{ type = "TEXT" }}
+condition        = {{ type = "TEXT" }}
+qc_pass          = {{ type = "BOOLEAN" }}
+
+[analysis_defaults]
+default_level = "assay"
+
+[engine]
+wal             = true
+busy_timeout_ms = {SQLITE_BUSY_TIMEOUT_MS}
+"""
+
+
+TEMPLATES = {
+    "blank": _blank_toml_template,
+    "hgsoc": _hgsoc_toml_template,
+    "giab_ont": _giab_ont_toml_template,
+}
 
 
 def load_schema(toml_path: str | Path) -> dict:
