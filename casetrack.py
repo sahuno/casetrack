@@ -2214,6 +2214,287 @@ def cmd_migrate(args):
     )
 
 
+# ── v0.3 Project-mode helpers (shared across register/append/add-metadata) ─────
+
+
+def _resolve_project(project_dir: str | Path) -> tuple[Path, dict]:
+    """Validate a v0.3 project directory and load its schema.
+
+    Returns (project_dir, schema). Exits with a clear error if the directory
+    or its casetrack.toml is missing — every project-mode command funnels
+    through this so the failure message is consistent.
+    """
+    project_dir = Path(project_dir)
+    toml_path = project_dir / PROJECT_TOML_NAME
+    db_path = project_dir / PROJECT_DB_NAME
+    if not project_dir.is_dir():
+        print(f"Error: project directory not found: {project_dir}", file=sys.stderr)
+        sys.exit(1)
+    if not toml_path.exists():
+        print(f"Error: {PROJECT_TOML_NAME} not found in {project_dir}", file=sys.stderr)
+        sys.exit(1)
+    if not db_path.exists():
+        print(f"Error: {PROJECT_DB_NAME} not found in {project_dir}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        schema = load_schema(toml_path)
+    except SchemaError as e:
+        print(f"Error: invalid schema in {toml_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+    return project_dir, schema
+
+
+def _parse_meta_kv(spec: str | None) -> dict:
+    """Parse 'age=60,sex=F,brca_status=brca1' into {'age': '60', 'sex': 'F', …}.
+
+    Values remain strings; type coercion happens in _coerce_meta_to_schema
+    against the column type declared in casetrack.toml.
+    """
+    out: dict = {}
+    if not spec:
+        return out
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(f"--meta: expected 'key=value', got {chunk!r}")
+        k, v = chunk.split("=", 1)
+        k = k.strip()
+        if not k:
+            raise ValueError(f"--meta: empty key in {chunk!r}")
+        out[k] = v.strip()
+    return out
+
+
+_BOOL_TRUE = {"true", "t", "1", "yes", "y"}
+_BOOL_FALSE = {"false", "f", "0", "no", "n"}
+
+
+def _coerce_meta_to_schema(meta: dict, level_spec: dict) -> dict:
+    """Coerce string meta values to the types declared in the level's schema.
+
+    Rejects unknown columns. Lets SQLite's CHECK enforce enum constraints at
+    INSERT time rather than pre-validating — one source of truth is better.
+    """
+    cols = level_spec["columns"]
+    out: dict = {}
+    for k, v in meta.items():
+        if k not in cols:
+            raise ValueError(
+                f"--meta: column {k!r} not declared in schema; known: {sorted(cols)}"
+            )
+        ctype = cols[k]["type"]
+        out[k] = _coerce_scalar(v, ctype, k)
+    return out
+
+
+def _coerce_scalar(value: str, ctype: str, field_name: str):
+    if ctype == "TEXT" or ctype == "DATE":
+        return value
+    if ctype == "INTEGER":
+        try:
+            return int(value)
+        except ValueError as e:
+            raise ValueError(f"--meta {field_name}: expected INTEGER, got {value!r}") from e
+    if ctype == "REAL":
+        try:
+            return float(value)
+        except ValueError as e:
+            raise ValueError(f"--meta {field_name}: expected REAL, got {value!r}") from e
+    if ctype == "BOOLEAN":
+        lv = value.lower()
+        if lv in _BOOL_TRUE:
+            return 1
+        if lv in _BOOL_FALSE:
+            return 0
+        raise ValueError(
+            f"--meta {field_name}: expected BOOLEAN (true/false/1/0), got {value!r}"
+        )
+    raise ValueError(f"--meta {field_name}: unsupported type {ctype!r}")
+
+
+def _parent_exists(conn: sqlite3.Connection, parent_level: str, parent_id: str) -> bool:
+    table = f"{parent_level}s"
+    (count,) = conn.execute(
+        f"SELECT COUNT(*) FROM {_quote_ident(table)} "
+        f"WHERE {_quote_ident(f'{parent_level}_id')} = ?",
+        (parent_id,),
+    ).fetchone()
+    return count == 1
+
+
+# ── v0.3 register ──────────────────────────────────────────────────────────────
+
+
+class _ParentMissing(Exception):
+    """Internal signal that a parent row doesn't exist and --allow-new-parent
+    was not passed. Raised inside the BEGIN IMMEDIATE block so `begin_immediate`
+    rolls back any partial work; caught by cmd_register to emit exit-2."""
+
+    def __init__(self, level: str, parent_id: str):
+        super().__init__(f"{level} {parent_id!r} not found")
+        self.level = level
+        self.parent_id = parent_id
+
+
+def cmd_register(args):
+    """Insert a single row at `--level` with optional inline parent creation.
+
+    Strict FK enforcement per proposal 0001 §19 Q2: unknown parents cause
+    exit 2 unless the user opts in with --allow-new-parent --yes.
+    """
+    project_dir, schema = _resolve_project(args.project_dir)
+    level = args.level
+
+    if level not in LEVEL_ORDER:
+        print(
+            f"Error: --level must be one of {list(LEVEL_ORDER)}, got {level!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    level_spec = schema["levels"][level]
+    key_col = level_spec["key"]
+    table = f"{level}s"
+    parent_level = level_spec.get("parent")
+    parent_key_col = level_spec.get("parent_key")
+
+    # Parent argument validation.
+    if parent_level and not args.parent:
+        print(
+            f"Error: --parent is required for --level {level} "
+            f"(expected {parent_level}_id)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not parent_level and args.parent:
+        print(
+            f"Error: --level patient does not take --parent",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # --allow-new-parent at the assay level would require inventing a
+    # patient_id for the new specimen, which is unsafe. Reject explicitly.
+    if level == "assay" and args.allow_new_parent:
+        print(
+            "Error: --allow-new-parent is not supported for --level assay "
+            "(would need to invent a patient_id for the new specimen).\n"
+            "Register the specimen first:\n"
+            f"    casetrack register --project-dir {project_dir} --level specimen "
+            f"--id {args.parent} --parent <PATIENT_ID> --allow-new-parent --yes",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.allow_new_parent and not args.yes:
+        print(
+            "Error: --allow-new-parent requires --yes to commit new parent creation.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        raw_meta = _parse_meta_kv(args.meta)
+        meta = _coerce_meta_to_schema(raw_meta, level_spec)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Prevent --meta from reassigning level keys / parent FK behind our back.
+    for reserved in (key_col, parent_key_col):
+        if reserved and reserved in meta:
+            print(
+                f"Error: --meta cannot set {reserved!r}; use --id / --parent instead.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    db_path = project_dir / PROJECT_DB_NAME
+    conn = open_project_db(db_path)
+    executed_sql: list[str] = []
+    rows_affected = 0
+    parent_created = False
+
+    try:
+        with begin_immediate(conn):
+            # Parent-existence check runs *inside* the transaction so a
+            # concurrent writer can't race us between check and insert.
+            if parent_level and not _parent_exists(conn, parent_level, args.parent):
+                if not args.allow_new_parent:
+                    # Roll back so we don't emit a provenance entry or partial writes.
+                    raise _ParentMissing(parent_level, args.parent)
+                parent_created = True
+
+            if parent_created:
+                parent_table = f"{parent_level}s"
+                parent_key = f"{parent_level}_id"
+                stub_sql = (
+                    f"INSERT INTO {_quote_ident(parent_table)} "
+                    f"({_quote_ident(parent_key)}) VALUES (?)"
+                )
+                conn.execute(stub_sql, (args.parent,))
+                executed_sql.append(stub_sql)
+                rows_affected += 1
+
+            # Build the target row: key + parent FK (if any) + meta columns.
+            row: dict = {key_col: args.id}
+            if parent_key_col:
+                row[parent_key_col] = args.parent
+            row.update(meta)
+
+            cols = list(row.keys())
+            quoted_cols = ", ".join(_quote_ident(c) for c in cols)
+            placeholders = ", ".join("?" * len(cols))
+            insert_sql = (
+                f"INSERT INTO {_quote_ident(table)} ({quoted_cols}) "
+                f"VALUES ({placeholders})"
+            )
+            conn.execute(insert_sql, tuple(row[c] for c in cols))
+            executed_sql.append(insert_sql)
+            rows_affected += 1
+
+    except _ParentMissing as e:
+        conn.close()
+        print(
+            f"Error: {e.level} {e.parent_id!r} does not exist.\n"
+            f"To create it inline, re-run with --allow-new-parent --yes.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except sqlite3.IntegrityError as e:
+        conn.close()
+        print(f"Error: register aborted — {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if conn:
+            conn.close()
+
+    log_project_provenance(project_dir, {
+        "action": "register",
+        "level": level,
+        "id": args.id,
+        "parent": args.parent,
+        "parent_created": parent_created,
+        "meta": meta,
+        "transaction_id": _new_transaction_id(),
+        "sql": executed_sql,
+        "rows_affected": rows_affected,
+        "schema_v_before": schema["project"]["schema_v"],
+        "schema_v_after": schema["project"]["schema_v"],
+    })
+
+    if parent_created:
+        print(
+            f"Registered {level} {args.id!r} under new {parent_level} {args.parent!r} "
+            f"(stub; fill metadata with 'casetrack register --level {parent_level} "
+            f"--id {args.parent} …' later)."
+        )
+    else:
+        print(f"Registered {level} {args.id!r}.")
+
+
 # ── CLI Parser ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -2382,6 +2663,38 @@ Examples:
     p_export.add_argument("--manifest", required=True, help="Path to manifest TSV")
     p_export.add_argument("--output", required=True, help="Output path (.xlsx, .csv, .json, .parquet)")
 
+    # ── register ──
+    p_register = subparsers.add_parser(
+        "register",
+        help="[v0.3] Insert a single row at --level (patient/specimen/assay)",
+    )
+    p_register.add_argument("--project-dir", required=True, help="Casetrack project directory")
+    p_register.add_argument(
+        "--level",
+        required=True,
+        choices=list(LEVEL_ORDER),
+        help="Which table to register into",
+    )
+    p_register.add_argument("--id", required=True, help="Primary key for the new row")
+    p_register.add_argument(
+        "--parent",
+        help="Parent ID (required for specimen/assay, rejected for patient)",
+    )
+    p_register.add_argument(
+        "--meta",
+        help="Column values as 'key=value,key=value' (coerced per schema types)",
+    )
+    p_register.add_argument(
+        "--allow-new-parent",
+        action="store_true",
+        help="Create the immediate parent row inline if it doesn't exist (requires --yes)",
+    )
+    p_register.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm --allow-new-parent creation non-interactively",
+    )
+
     # ── migrate ──
     p_migrate = subparsers.add_parser(
         "migrate",
@@ -2426,6 +2739,7 @@ Examples:
         "query": cmd_query,
         "export": cmd_export,
         "migrate": cmd_migrate,
+        "register": cmd_register,
     }
 
     commands[args.command](args)
