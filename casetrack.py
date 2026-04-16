@@ -1715,6 +1715,13 @@ def _render_dashboard_html(manifest, key_col: str, done_cols: list,
 
 
 def cmd_dashboard(args):
+    """Dispatch `casetrack dashboard` to flat or project mode."""
+    if getattr(args, "project_dir", None):
+        return cmd_dashboard_project(args)
+    return cmd_dashboard_flat(args)
+
+
+def cmd_dashboard_flat(args):
     """Generate a self-contained HTML dashboard from the manifest."""
     _warn_flat_deprecation()
     manifest_path = args.manifest
@@ -3141,6 +3148,274 @@ def _summarize_v03_project(toml_path: Path) -> dict:
     }
 
 
+# ── v0.3 dashboard (nested HTML) ──────────────────────────────────────────────
+#
+# Nested HTML: cohort summary → one <details> per patient → nested <details>
+# per specimen → inline table of assays with completion markers per analysis.
+# Self-contained (inline CSS, no JS libs) so it scp's to a laptop and opens
+# offline.
+
+
+def cmd_dashboard_project(args):
+    project_dir, schema = _resolve_project(args.project_dir)
+    output_path = Path(args.output)
+
+    conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    try:
+        patients = conn.execute("SELECT * FROM patients ORDER BY patient_id").fetchall()
+        patient_cols = [d[0] for d in conn.execute(
+            "SELECT * FROM patients LIMIT 0"
+        ).description]
+        specimens = conn.execute("SELECT * FROM specimens ORDER BY specimen_id").fetchall()
+        specimen_cols = [d[0] for d in conn.execute(
+            "SELECT * FROM specimens LIMIT 0"
+        ).description]
+        assays = conn.execute("SELECT * FROM assays ORDER BY assay_id").fetchall()
+        assay_cols = [d[0] for d in conn.execute(
+            "SELECT * FROM assays LIMIT 0"
+        ).description]
+        done_by_level = _discover_done_columns(conn)
+    finally:
+        conn.close()
+
+    html_str = _render_v03_dashboard_html(
+        project_dir=project_dir,
+        schema=schema,
+        patients=[dict(zip(patient_cols, r)) for r in patients],
+        specimens=[dict(zip(specimen_cols, r)) for r in specimens],
+        assays=[dict(zip(assay_cols, r)) for r in assays],
+        done_by_level=done_by_level,
+    )
+    output_path.write_text(html_str)
+
+    total_assays = len(assays)
+    total_analyses = sum(len(v) for v in done_by_level.values())
+    print(
+        f"Dashboard written: {output_path} "
+        f"({len(patients)} patients, {len(specimens)} specimens, "
+        f"{total_assays} assays, {total_analyses} analyses)"
+    )
+
+
+def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
+                               patients: list, specimens: list, assays: list,
+                               done_by_level: dict) -> str:
+    esc = html.escape
+    project_name = schema["project"].get("name", project_dir.name)
+    schema_v = schema["project"].get("schema_v", 1)
+    generated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Index children by parent for quick lookup during rendering.
+    specimens_by_patient: dict = {}
+    for s in specimens:
+        specimens_by_patient.setdefault(s["patient_id"], []).append(s)
+    assays_by_specimen: dict = {}
+    for a in assays:
+        assays_by_specimen.setdefault(a["specimen_id"], []).append(a)
+
+    # Per-analysis completion at the ASSAY level (the common case).
+    assay_done_cols = done_by_level["assay"]
+    per_analysis = []
+    for dc in assay_done_cols:
+        name = dc[: -len(DONE_COLUMN_SUFFIX)]
+        done = sum(1 for a in assays if a.get(dc) is not None)
+        pct = (100.0 * done / len(assays)) if assays else 0.0
+        per_analysis.append({"name": name, "done": done, "total": len(assays), "pct": pct})
+
+    overall_pct = (
+        sum(p["pct"] for p in per_analysis) / len(per_analysis)
+        if per_analysis else 0.0
+    )
+
+    # Build the body section per patient.
+    body_sections = []
+    for p in patients:
+        pid = p["patient_id"]
+        meta_cells = _dashboard_meta_cells(p, patient_key="patient_id")
+        p_specimens = specimens_by_patient.get(pid, [])
+        # Patient-level analyses done = non-null patient-level `_done` columns.
+        p_done = sum(1 for dc in done_by_level["patient"] if p.get(dc))
+        p_total = len(done_by_level["patient"])
+        p_badge = f'<span class="badge">{p_done}/{p_total} patient-level</span>' if p_total else ""
+
+        spec_html = []
+        for sp in p_specimens:
+            sid = sp["specimen_id"]
+            s_meta = _dashboard_meta_cells(sp, patient_key="specimen_id")
+            s_assays = assays_by_specimen.get(sid, [])
+            s_done = sum(1 for dc in done_by_level["specimen"] if sp.get(dc))
+            s_total = len(done_by_level["specimen"])
+            s_badge = (f'<span class="badge">{s_done}/{s_total} specimen-level</span>'
+                       if s_total else "")
+
+            # Assay table: assay_id + per-analysis check/blank.
+            table_rows = []
+            for a in s_assays:
+                cells = []
+                for dc in assay_done_cols:
+                    if a.get(dc) is not None:
+                        cells.append(f'<td class="done" title="{esc(str(a[dc]))}">✓</td>')
+                    else:
+                        cells.append('<td class="missing"></td>')
+                table_rows.append(
+                    f'<tr><td class="id">{esc(a["assay_id"])}</td>'
+                    f'<td class="small muted">{esc(str(a.get("assay_type","")))}</td>'
+                    + "".join(cells) + "</tr>"
+                )
+            headers = "".join(
+                f'<th class="vtext">{esc(dc[: -len(DONE_COLUMN_SUFFIX)])}</th>'
+                for dc in assay_done_cols
+            )
+            n_assay_analyses = len(assay_done_cols) or 1
+            n_done_here = sum(
+                1 for a in s_assays for dc in assay_done_cols if a.get(dc) is not None
+            )
+            s_pct = (100.0 * n_done_here /
+                     (len(s_assays) * n_assay_analyses)) if s_assays else 0.0
+            assay_table = (
+                f'<table class="assays"><thead><tr>'
+                f'<th>Assay</th><th>Type</th>{headers}</tr></thead>'
+                f'<tbody>{"".join(table_rows)}</tbody></table>'
+                if s_assays else '<p class="muted">no assays</p>'
+            )
+            spec_html.append(
+                f'<details class="specimen"><summary>'
+                f'<strong>{esc(sid)}</strong>'
+                f'<span class="muted small"> ({len(s_assays)} assays, {s_pct:.0f}% done) </span>'
+                f'{s_badge}</summary>'
+                f'<div class="meta">{s_meta}</div>{assay_table}</details>'
+            )
+
+        body_sections.append(
+            f'<details class="patient" open><summary>'
+            f'<strong>{esc(pid)}</strong>'
+            f'<span class="muted small"> ({len(p_specimens)} specimens) </span>'
+            f'{p_badge}</summary>'
+            f'<div class="meta">{meta_cells}</div>'
+            + ("".join(spec_html) if spec_html else '<p class="muted">no specimens</p>')
+            + '</details>'
+        )
+
+    # Per-analysis progress bars.
+    per_analysis_html = []
+    for a in per_analysis:
+        bar_w = max(0, min(100, int(a["pct"])))
+        per_analysis_html.append(
+            f'<div class="analysis-row">'
+            f'<div class="name">{esc(a["name"])}</div>'
+            f'<div class="bar"><div style="width:{bar_w}%"></div></div>'
+            f'<div class="pct">{a["pct"]:.1f}%</div>'
+            f'<div class="count">{a["done"]}/{a["total"]}</div>'
+            f'</div>'
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>casetrack dashboard — {esc(project_name)}</title>
+<style>
+  :root {{
+    --done: #2f855a; --done-bg: #c6f6d5;
+    --missing: #a0aec0; --missing-bg: #edf2f7;
+    --fg: #1a202c; --muted: #4a5568; --border: #e2e8f0;
+    --accent: #2b6cb0; --panel: #ffffff;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{ font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+         Arial, sans-serif; color: var(--fg); margin: 0; padding: 24px;
+         background: #fafbfc; }}
+  h1 {{ margin: 0 0 4px 0; font-size: 22px; }}
+  h2 {{ margin: 28px 0 12px 0; font-size: 16px;
+        border-bottom: 1px solid var(--border); padding-bottom: 6px; }}
+  .muted {{ color: var(--muted); }}
+  .small {{ font-size: 12px; }}
+  .metrics {{ display: flex; gap: 32px; margin: 16px 0 12px 0; flex-wrap: wrap; }}
+  .metric .value {{ font-size: 24px; font-weight: 600; }}
+  .metric .label {{ color: var(--muted); font-size: 12px; text-transform: uppercase;
+                   letter-spacing: 0.05em; }}
+  .bar {{ background: var(--missing-bg); border-radius: 4px; overflow: hidden;
+          height: 14px; flex: 1; }}
+  .bar > div {{ background: var(--done); height: 100%; }}
+  .analysis-row {{ display: flex; align-items: center; gap: 12px; margin: 6px 0; }}
+  .analysis-row .name {{ width: 200px; font-family: ui-monospace, monospace; font-size: 13px; }}
+  .analysis-row .pct {{ width: 60px; text-align: right; font-variant-numeric: tabular-nums; }}
+  .analysis-row .count {{ width: 80px; text-align: right; color: var(--muted);
+                          font-variant-numeric: tabular-nums; font-size: 12px; }}
+  details.patient {{ background: var(--panel); border: 1px solid var(--border);
+                     border-radius: 4px; margin: 10px 0; padding: 10px 14px; }}
+  details.patient > summary {{ cursor: pointer; list-style: none; font-size: 15px; }}
+  details.patient > summary::-webkit-details-marker {{ display: none; }}
+  details.patient > summary::before {{ content: "▸ "; color: var(--accent);
+                                        display: inline-block; width: 1em; }}
+  details.patient[open] > summary::before {{ content: "▾ "; }}
+  details.specimen {{ margin: 6px 0 6px 18px; padding: 6px 10px;
+                      border-left: 2px solid var(--border); background: #fbfcfd; }}
+  details.specimen > summary {{ cursor: pointer; list-style: none; }}
+  details.specimen > summary::-webkit-details-marker {{ display: none; }}
+  details.specimen > summary::before {{ content: "▸ "; color: var(--accent); }}
+  details.specimen[open] > summary::before {{ content: "▾ "; }}
+  .meta {{ display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 4px 0 8px 18px;
+           color: var(--muted); font-size: 12px; }}
+  .meta span {{ white-space: nowrap; }}
+  .meta b {{ color: var(--fg); font-weight: 500; }}
+  table.assays {{ border-collapse: collapse; margin: 4px 0 4px 18px;
+                  font-size: 12px; }}
+  table.assays th {{ padding: 6px 10px; text-align: left;
+                     border-bottom: 1px solid var(--border); font-weight: 600; }}
+  table.assays th.vtext {{ writing-mode: vertical-rl; text-orientation: mixed;
+                           padding: 10px 4px; min-height: 70px; }}
+  table.assays td {{ padding: 4px 10px; border-bottom: 1px solid #f1f5f9; }}
+  table.assays td.id {{ font-family: ui-monospace, monospace; }}
+  table.assays td.done {{ background: var(--done-bg); color: var(--done);
+                          text-align: center; font-weight: 600; }}
+  table.assays td.missing {{ background: var(--missing-bg); text-align: center; }}
+  .badge {{ display: inline-block; background: var(--missing-bg); color: var(--muted);
+            padding: 1px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }}
+</style>
+</head>
+<body>
+  <h1>{esc(project_name)}</h1>
+  <div class="muted small">
+    Project dir: <code>{esc(str(project_dir))}</code>
+    · schema_v {schema_v} · generated {esc(generated_at)}
+  </div>
+
+  <div class="metrics">
+    <div class="metric"><div class="value">{len(patients)}</div>
+      <div class="label">Patients</div></div>
+    <div class="metric"><div class="value">{len(specimens)}</div>
+      <div class="label">Specimens</div></div>
+    <div class="metric"><div class="value">{len(assays)}</div>
+      <div class="label">Assays</div></div>
+    <div class="metric"><div class="value">{overall_pct:.1f}%</div>
+      <div class="label">Avg analysis completion</div></div>
+  </div>
+
+  <h2>Per-analysis completion (assay level)</h2>
+  {"".join(per_analysis_html) if per_analysis_html
+     else '<p class="muted">No assay-level analyses recorded yet.</p>'}
+
+  <h2>Patients</h2>
+  {"".join(body_sections) if body_sections
+     else '<p class="muted">No patients registered yet.</p>'}
+</body></html>
+"""
+
+
+def _dashboard_meta_cells(row: dict, *, patient_key: str) -> str:
+    """Render the non-key metadata fields of a row as inline <span> cells.
+    Skips `_done` columns (those belong to the analysis completion story)."""
+    esc = html.escape
+    cells = []
+    for k, v in row.items():
+        if k == patient_key or k.endswith(DONE_COLUMN_SUFFIX):
+            continue
+        if v is None or v == "":
+            continue
+        cells.append(f"<span><b>{esc(k)}:</b> {esc(str(v))}</span>")
+    return "".join(cells) if cells else '<span class="muted">(no metadata)</span>'
+
+
 # ── v0.3 query (DuckDB ATTACH of casetrack.db) ────────────────────────────────
 #
 # Uses duckdb's sqlite_scanner (bundled in modern duckdb) — no external install
@@ -4292,11 +4567,16 @@ Examples:
 
     # ── dashboard ──
     p_dash = subparsers.add_parser(
-        "dashboard", help="Generate a self-contained HTML dashboard"
+        "dashboard",
+        help="Generate a self-contained HTML dashboard (flat: samples table, "
+             "v0.3: nested patients → specimens → assays)",
     )
-    p_dash.add_argument("--manifest", required=True, help="Path to manifest TSV")
+    g_dash_target = p_dash.add_mutually_exclusive_group(required=True)
+    g_dash_target.add_argument("--manifest", help="[flat mode] Path to manifest TSV")
+    g_dash_target.add_argument("--project-dir", help="[project mode] Casetrack project directory")
     p_dash.add_argument("--output", required=True, help="Output HTML file path")
-    p_dash.add_argument("--key", default="sample_id", help="Key column name (default: sample_id)")
+    p_dash.add_argument("--key", default="sample_id",
+                        help="[flat mode] Key column (default: sample_id)")
 
     # ── rerun ──
     p_rerun = subparsers.add_parser(
