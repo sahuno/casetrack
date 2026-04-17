@@ -88,6 +88,15 @@ jobs:
                                "regions.laser.bed"):
                   assert (spec / required).exists(), f"missing {spec}/{required}"
 
+          # Pull expected slice count from config.yaml so this assertion
+          # grows with the cohort without hard-coding.
+          import yaml
+          cfg = yaml.safe_load(
+              Path("examples/hgsoc_sim/config.yaml").read_text()
+          )
+          expected_slice_names = {s["name"] for s in cfg["reference"]["slices"]}
+          n_slices = len(expected_slice_names)
+
           # HACk BEDs must be 6-col where non-empty; LASeR BEDs must be 5-col.
           for bed in root.rglob("*.hack.bed"):
               for line in bed.read_text().splitlines():
@@ -95,23 +104,28 @@ jobs:
                       continue
                   cols = line.split("\t")
                   assert len(cols) == 6, f"{bed}: expected 6 cols, got {len(cols)}"
+                  assert cols[0] in expected_slice_names, (
+                      f"{bed}: variant on unknown contig {cols[0]!r}"
+                  )
           for bed in root.rglob("*.laser.bed"):
-              for line in bed.read_text().splitlines():
-                  if not line.strip():
-                      continue
+              lines = [l for l in bed.read_text().splitlines() if l.strip()]
+              # One row per declared slice.
+              assert len(lines) == n_slices, (
+                  f"{bed}: expected {n_slices} rows, got {len(lines)}"
+              )
+              for line in lines:
                   cols = line.split("\t")
                   assert len(cols) == 5, f"{bed}: expected 5 cols, got {len(cols)}"
 
-          # Variant count sanity check per config.yaml. Sum across both
-          # haplotype BEDs for each specimen.
-          variants_per_spec = {
-              ("HGSOC_SIM_01", "normal"): 1,   # germline × 1
-              ("HGSOC_SIM_01", "tumor"):  3,   # germline + 2 somatic
-              ("HGSOC_SIM_02", "normal"): 1,
-              ("HGSOC_SIM_02", "tumor"):  2,
-              ("HGSOC_SIM_03", "tumor"):  3,
-          }
-          for (patient, specimen), expected_n in variants_per_spec.items():
+          # Variant count sanity check per config.yaml. For each specimen,
+          # add germline + (somatic if tumor) and assert the BED line total
+          # matches. Order-independent — keeps this robust to config edits.
+          cohort = {p["patient_id"]: p for p in cfg["cohort"]}
+          for (patient, specimen) in expected:
+              p = cohort[patient]
+              n_germ = len(p.get("germline", []))
+              n_som = len(p.get("somatic", []))
+              expected_n = n_germ + (n_som if specimen == "tumor" else 0)
               spec = root / patient / specimen
               h1 = [l for l in (spec / "haplotype1.hack.bed").read_text().splitlines()
                     if l.strip()]
