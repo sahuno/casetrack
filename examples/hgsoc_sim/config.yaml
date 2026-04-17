@@ -1,0 +1,83 @@
+# hgsoc_sim cohort definition — one YAML for the whole simulation.
+#
+# scripts/01_prepare_visor_beds.py turns this into per-patient VISOR BED
+# files. Coordinates are 0-based half-open (BED convention). Reference is
+# a 1-Mb slice of GRCh38 chr17 covering the BRCA1 locus (43,044,295–
+# 43,170,245) with flanking room for SV-style variants.
+#
+# Edit freely to extend the cohort. Each patient has:
+#   germline: variants present in both normal and tumor (inherited)
+#   somatic : variants present only in tumor (acquired)
+#   specimens: one entry per specimen with coverage + tumor purity
+#
+# Variant types supported by VISOR HACk (subset — see VISOR docs for full list):
+#   SNP           - single-nucleotide substitution (alt required)
+#   deletion      - straight deletion of the region
+#   insertion     - literal insert (alt required; sequence string)
+#   inversion     - inversion of the region
+#   duplication   - tandem dup of the region
+
+reference:
+  source_url: "https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.17.fa.gz"
+  chrom: "chr17"
+  # 1 Mb slice centered on BRCA1. Keeps runtime under a minute.
+  region_start: 42500000
+  region_end:   43500000
+  # After slicing, we renumber so the region starts at 1 on a contig called
+  # "chr17_brca1" — this is what VISOR actually sees.
+  slice_contig: "chr17_brca1"
+
+cohort:
+  - patient_id: HGSOC_SIM_01
+    # Complete pair — both specimens sim'd at healthy coverage and pass QC.
+    germline:
+      - { pos: 150000, type: SNP, alt: T, note: "het SNP upstream of BRCA1" }
+    somatic:
+      - { pos: 550000, type: SNP, alt: A, note: "BRCA1 LOF proxy" }
+      - { pos: 560000, type: deletion, length: 50, note: "50 bp intragenic del" }
+    specimens:
+      - id_suffix: normal
+        tissue_site: normal
+        assay_type: ONT
+        coverage: 25
+        purity: 100            # no tumor contamination — pure germline
+      - id_suffix: tumor
+        tissue_site: tumor
+        assay_type: ONT
+        coverage: 35
+        purity: 70             # 30% normal contamination
+
+  - patient_id: HGSOC_SIM_02
+    # Broken pair — same design as SIM_01, but the normal BAM is deliberately
+    # downsampled by 03_break_hgsoc_sim_02.sh post-simulation. The summarize
+    # script's coverage check will then emit qc_pass=False → autoflag fires.
+    germline:
+      - { pos: 120000, type: SNP, alt: C, note: "het SNP upstream of BRCA1" }
+    somatic:
+      - { pos: 540000, type: SNP, alt: G, note: "TP53-like hotspot proxy" }
+    specimens:
+      - id_suffix: normal
+        tissue_site: normal
+        assay_type: ONT
+        coverage: 25            # will be truncated to ~2x post-sim
+        purity: 100
+      - id_suffix: tumor
+        tissue_site: tumor
+        assay_type: ONT
+        coverage: 30
+        purity: 75
+
+  - patient_id: HGSOC_SIM_03
+    # Singleton — tumor only, no normal produced. Surfaces via cohort
+    # --pair-by tissue_site as "singleton".
+    germline:
+      - { pos: 180000, type: SNP, alt: G, note: "het SNP upstream of BRCA1" }
+    somatic:
+      - { pos: 570000, type: SNP, alt: T, note: "BRCA1 LOF proxy #2" }
+      - { pos: 600000, type: duplication, length: 1000, note: "1 kb tandem dup" }
+    specimens:
+      - id_suffix: tumor
+        tissue_site: tumor
+        assay_type: ONT
+        coverage: 30
+        purity: 80
