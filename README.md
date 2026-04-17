@@ -448,6 +448,17 @@ cohort_v4/
 │   ├── summarize_tldr.py           # emits qc_pass / qc_fail_reason optionally
 │   └── summarize_qc.py
 ├── docs/                           # project-specific notes (protocol, PI briefs, README)
+│   ├── research/                   # literature notes, prior-work summaries
+│   └── hypothesis/                 # pre-registered hypotheses, analysis plans
+├── manuscript/
+│   ├── figures/
+│   │   └── scripts/                # figure-making code
+│   │       ├── png/                # rendered figures — PNG
+│   │       ├── pdf/                # rendered figures — PDF
+│   │       └── svg/                # rendered figures — SVG
+│   ├── draft/                      # working manuscript drafts
+│   ├── proofs/                     # journal proofs / revisions
+│   └── references/                 # bib files / reference PDFs
 ├── logs/                           # SLURM logs
 ├── containers/                     # Apptainer .sif files
 └── sandbox/                        # preserved source TSVs (migration artifact)
