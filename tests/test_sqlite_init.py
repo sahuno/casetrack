@@ -78,7 +78,8 @@ def test_init_creates_three_tables(tmp_path: Path):
         names = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()}
-        assert names == {"patients", "specimens", "assays"}
+        # v0.4 adds qc_events on init (proposal 0002 §4.1).
+        assert {"patients", "specimens", "assays", "qc_events"} <= names
     finally:
         conn.close()
 
@@ -129,8 +130,12 @@ def test_init_logs_provenance_entry(tmp_path: Path):
     assert entry["schema_v_before"] == 0
     assert entry["schema_v_after"] == 1
     assert entry["transaction_id"].startswith("txn_")
-    assert len(entry["sql"]) == 3  # one CREATE TABLE per level
+    # Three core CREATE TABLE statements, plus the qc_events DDL and its
+    # indexes, plus qc_status / consent ALTERs (v0.4).
+    assert len(entry["sql"]) >= 3
     assert any("CREATE TABLE" in s and "patients" in s for s in entry["sql"])
+    assert any("qc_events" in s for s in entry["sql"])
+    assert entry.get("qc_schema_v") == 1
 
 
 # ── --force / collision ───────────────────────────────────────────────────────
@@ -164,7 +169,7 @@ def test_init_force_rewrites_db(tmp_path: Path):
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()}
         assert "stray" not in names
-        assert names == {"patients", "specimens", "assays"}
+        assert {"patients", "specimens", "assays", "qc_events"} <= names
     finally:
         conn.close()
 

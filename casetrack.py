@@ -713,11 +713,26 @@ def cmd_init_project(args):
             if leftover.exists():
                 leftover.unlink()
 
+    # v0.4 QC schema is bolted on after the three-level core — keeps the QC
+    # subsystem self-contained so v0.3 projects can upgrade via `migrate-qc`
+    # and new projects get it by default.
+    from casetrack_qc.schema import (
+        DEFAULT_QC_KINDS as _QC_DEFAULT_KINDS,
+        ensure_qc_schema as _ensure_qc_schema,
+        write_qc_toml_block as _write_qc_toml_block,
+    )
+
     conn = open_project_db(db_path)
+    qc_ddl: list[str] = []
     try:
         apply_schema(conn, schema)
+        with begin_immediate(conn):
+            qc_ddl = _ensure_qc_schema(conn, kinds=_QC_DEFAULT_KINDS)
     finally:
         conn.close()
+
+    # Append the [qc] TOML block so teams can extend kinds / scopes.
+    _write_qc_toml_block(toml_path)
 
     # Empty provenance log — touch to create.
     if not prov_path.exists():
@@ -733,7 +748,8 @@ def cmd_init_project(args):
         "project_name": project_name,
         "schema_v_before": 0,
         "schema_v_after": schema["project"]["schema_v"],
-        "sql": schema_to_ddl(schema),
+        "sql": schema_to_ddl(schema) + qc_ddl,
+        "qc_schema_v": 1,
     })
 
     print(
@@ -2976,6 +2992,16 @@ def cmd_schema_project(args):
         return _schema_apply(project_dir, schema, issues)
 
 
+# Columns added by the v0.4 QC subsystem. The drift checker skips these so
+# that `casetrack schema check` doesn't flag a project's own QC plumbing as
+# undeclared drift.
+_V04_QC_MANAGED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "patient": ("qc_status", "consent_status", "consent_date", "withdrawal_date"),
+    "specimen": ("qc_status",),
+    "assay": ("qc_status",),
+}
+
+
 def _schema_drift(project_dir: Path, schema: dict) -> list[dict]:
     """Return a structured list of drift entries {'kind', 'table', 'column', ...}."""
     issues: list[dict] = []
@@ -2998,6 +3024,9 @@ def _schema_drift(project_dir: Path, schema: dict) -> list[dict]:
                     continue
                 if col.endswith(DONE_COLUMN_SUFFIX):
                     # Analysis-added columns legitimately live in the DB only.
+                    continue
+                # v0.4 QC columns are managed by the QC subsystem, not the TOML.
+                if col in _V04_QC_MANAGED_COLUMNS.get(level, ()):
                     continue
                 # Check if this column was introduced by an `append` entry in
                 # provenance — that's how v0.3 tracks dynamic analysis columns.
@@ -3429,9 +3458,15 @@ def cmd_recover_project(args):
     stats = {
         "init_project": 0, "register": 0, "schema_apply": 0,
         "append": 0, "migrate": 0, "add_metadata": 0,
+        "censor": 0, "uncensor": 0, "ethics_override": 0, "migrate_qc": 0,
         "skipped": 0,
     }
     warnings: list[str] = []
+
+    # v0.4 QC replay is plugged in via casetrack_qc.recover_qc_action so the
+    # subsystem's provenance actions land byte-identical to the original DB
+    # (success criterion in proposal §13).
+    from casetrack_qc.recover import recover_qc_action as _recover_qc_action
 
     conn = None
     try:
@@ -3471,6 +3506,20 @@ def cmd_recover_project(args):
                     stats["skipped"] += 1
                 else:
                     stats["migrate"] += 1
+            elif action in ("censor", "uncensor", "ethics_override", "migrate_qc"):
+                if conn is None:
+                    raise RuntimeError(
+                        f"{action} entry seen before init_project"
+                    )
+                handled, warn = _recover_qc_action(conn, entry)
+                if not handled:
+                    warnings.append(f"unknown action {action!r}; skipping")
+                    stats["skipped"] += 1
+                elif warn:
+                    warnings.append(warn)
+                    stats["skipped"] += 1
+                else:
+                    stats[action] += 1
             else:
                 warnings.append(f"unknown action {action!r}; skipping")
                 stats["skipped"] += 1
@@ -5252,6 +5301,10 @@ Examples:
         help="Overwrite an existing casetrack.db in --out-dir",
     )
 
+    # ── v0.4 QC subcommands (censor, uncensor, qc-history, migrate-qc) ──
+    from casetrack_qc.cli import build_qc_subparsers as _build_qc_subparsers
+    _build_qc_subparsers(subparsers)
+
     args = parser.parse_args()
 
     if not args.command:
@@ -5276,6 +5329,10 @@ Examples:
         "doctor": cmd_doctor_project,
         "recover": cmd_recover_project,
     }
+
+    # v0.4 QC dispatch merges in without touching existing entries.
+    from casetrack_qc.cli import qc_command_dispatch as _qc_command_dispatch
+    commands.update(_qc_command_dispatch())
 
     commands[args.command](args)
 

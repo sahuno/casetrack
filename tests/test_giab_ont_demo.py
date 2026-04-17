@@ -63,7 +63,10 @@ def test_giab_ont_template_via_init(tmp_path: Path):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(assays)").fetchall()}
     finally:
         conn.close()
-    assert names == {"patients", "specimens", "assays"}
+    # v0.4 adds qc_events on init; giab_ont template still creates the three
+    # level tables with their declared columns.
+    assert {"patients", "specimens", "assays"} <= names
+    assert "qc_events" in names
     assert "bam_path" in cols
     assert "chemistry" in cols
 
