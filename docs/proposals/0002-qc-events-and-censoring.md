@@ -9,7 +9,7 @@
 | **Depends on** | Proposal 0001 (SQLite-backed normalized hierarchy, shipped in v0.3.0) |
 | **Target HPC** | IRIS @ MSKCC (WekaFS, SLURM, Apptainer) |
 
-## 0. Accepted decisions (from iteration 3)
+## 0. Accepted decisions (from iteration 4)
 
 | # | Question | Accepted answer |
 |---|---|---|
@@ -20,7 +20,12 @@
 | 5 | Reversal model | **Append-only**. `uncensor` writes `resolved_at` / `resolved_by` / `resolved_reason` on the existing row — never deletes. Reversal is the minority path (most flags are hard-fail-at-intake). |
 | 6 | Patient consent attributes | **Both**: `patients.consent_status`, `patients.consent_date`, `patients.withdrawal_date` as typed columns for fast queries; `qc_events` keeps the immutable audit trail. |
 | 7 | Legacy `qc_pass BOOLEAN` | **Deprecated**. Replaced by `qc_status`. A compatibility view or read-only computed column may be offered in v0.4.x. |
-| 8 | Whole-cohort readiness | **Option A + Option C** (see §8): `casetrack status --usable` for pipeline driving + new `casetrack cohort` command for the grant-report view, including `--pair-by` to surface matched-pair completeness (e.g. tumor/normal pairs for a given assay type). |
+| 8 | Whole-cohort readiness | **Option A + Option C** (see §8): `casetrack status --usable` for pipeline driving + new `casetrack cohort` command for the grant-report view, including `--pair-by` to surface matched-pair completeness. |
+| 9 | `append` on a censored assay | **Strict refuse**. Exit 2 + stderr with suggested fix. `--force-append-on-censored --yes` (paired, matching the `--allow-new --yes` idiom) overrides. Saves cluster hours and prevents confusion about whether data landed. |
+| 10 | Pair-by arity | **N partitions** (not just 2). Covers tumor/normal, longitudinal (multiple timepoints), and multi-region designs off the same code path. Partition dimension is any column on `specimens`. |
+| 11 | Consent enum | `["consented", "consented_limited_use", "pending", "revoked", "withdrawn", "consent_expired", "deceased_pre_consent"]`. |
+| 12 | Default QC `kind` values | Base set + ONT-heavy HGSOC workflow additions: `qc_fail`, `qc_warn`, `consent_revoked`, `protocol_deviation`, `superseded`, `library_prep_failed`, `basecall_accuracy_low`, `contamination`, `batch_effect_flagged`, `sequencing_run_failed`, `other`. Teams extend via `casetrack.toml [qc] kinds`. |
+| 13 | Pair dimension column | `specimens.tissue_site` is the canonical column name for tumor/normal pairing. Other dimensions (timepoint, region) follow the same convention — exact column name set by each project's TOML. |
 
 ## 1. Summary
 
@@ -137,11 +142,26 @@ These columns are a cache. `casetrack recover` rebuilds them by replaying `qc_ev
 ```toml
 [levels.patient.columns]
 consent_status   = { type = "TEXT",
-                     enum = ["consented","pending","revoked","withdrawn","deceased_pre_consent"],
+                     enum = ["consented",
+                             "consented_limited_use",
+                             "pending",
+                             "revoked",
+                             "withdrawn",
+                             "consent_expired",
+                             "deceased_pre_consent"],
                      default = "consented" }
 consent_date     = { type = "DATE" }
 withdrawal_date  = { type = "DATE" }
 ```
+
+Enum value guidance:
+- `consented` — standard case; full use.
+- `consented_limited_use` — biobank-style tiered consent; some analyses/secondary-use may be restricted. Treated as "usable by default" — restrictions enforced at analysis time via external documentation, not by casetrack.
+- `pending` — sample collected pre-consent or consent under review; excluded until resolved.
+- `revoked` — patient has actively withdrawn consent. MUST have corresponding `qc_events` row `kind='consent_revoked'`.
+- `withdrawn` — patient left the study but did not revoke already-collected data use. Treated as `revoked` by default read paths but distinguishable in audits.
+- `consent_expired` — time-bounded consent has lapsed (see §12 Q5). Treated as `revoked`.
+- `deceased_pre_consent` — patient died before consent could be obtained. Excluded by default.
 
 **Invariant** (enforced at CLI, not DDL, since DDL can't express cross-column constraints cleanly):
 - If `consent_status = 'revoked'`, there MUST be a corresponding `qc_events` row with `kind = 'consent_revoked'`.
@@ -233,7 +253,28 @@ casetrack qc-history --project-dir D --level patient --id HGSOC002 --include-cas
 # Cohort readiness
 casetrack cohort --project-dir D
 casetrack cohort --project-dir D --assay-type ONT-RNA-Seq --pair-by tissue_site
+casetrack cohort --project-dir D --assay-type ONT-DNA-Seq --pair-by timepoint \
+    --partition-order baseline,post-tx,progression --require 2
 casetrack cohort --project-dir D --fmt json
+```
+
+### 5.1.1 Append on a censored assay — default refuses
+
+```bash
+# Default: SLURM re-runs on a known-bad assay exit 2 with guidance.
+$ casetrack append --project-dir D --results modkit.tsv --analysis modkit
+Error: assay HGSOC002-normal-ONT-RNA is qc_failed
+       (reason: "library prep failed, cDNA yield 8 ng, need >100")
+Suggestions:
+  - If the issue is resolved (e.g. re-sequenced): casetrack uncensor --event-id 42
+  - If you need to land data anyway (rare): --force-append-on-censored --yes
+Exit 2.
+
+# Force path — deliberate override, logs a distinct 'force_append' provenance event.
+$ casetrack append --project-dir D --results modkit.tsv --analysis modkit \
+      --force-append-on-censored --yes
+⚠ Forcing append on 1 censored assay: HGSOC002-normal-ONT-RNA
+  Data written. Entity remains excluded from read paths.
 ```
 
 ### 5.2 Changed commands
@@ -261,13 +302,30 @@ kinds = [
   "consent_revoked",
   "protocol_deviation",
   "superseded",
+  # ONT-heavy HGSOC workflow additions (see decision #12):
+  "library_prep_failed",
+  "basecall_accuracy_low",
+  "contamination",
+  "batch_effect_flagged",
+  "sequencing_run_failed",
   "other",
 ]
 default_source   = "manual"
 default_exclude  = ["fail", "censored", "consent_revoked"]  # in read paths
+
+# Optional: restrict specific kinds to specific levels (CLI-enforced).
+# Omitted kinds are allowed at any level.
+[qc.kind_scopes]
+consent_revoked        = ["patient"]
+library_prep_failed    = ["assay"]
+basecall_accuracy_low  = ["assay"]
+sequencing_run_failed  = ["assay"]
+protocol_deviation     = ["specimen", "assay"]
+contamination          = ["specimen", "assay"]
+# batch_effect_flagged is allowed at any level — batches cross the hierarchy.
 ```
 
-Teams can extend `kinds` to add domain-specific kinds (e.g. `batch_contaminated`). The SQLite `CHECK` on `qc_events.kind` is regenerated by `schema apply`.
+Teams extend `kinds` for their own workflows. The SQLite `CHECK` on `qc_events.kind` is regenerated by `schema apply`. `kind_scopes` is CLI-enforced so `casetrack censor --level patient --kind library_prep_failed` fails fast with a clear error rather than producing nonsensical data.
 
 ## 6. SLURM auto-flag convention
 
@@ -290,6 +348,8 @@ then `casetrack append` atomically writes:
 - `qc_events` row with `source='slurm'`, `created_by='slurm:$SLURM_JOB_ID'`
 
 All inside one `BEGIN IMMEDIATE`. If the append fails for any reason, neither data nor QC events land.
+
+**Re-run on a censored assay** (decision #9): if the target assay is already `qc_status='fail'` or `'censored'`, `casetrack append` refuses with exit 2 and a message suggesting either `uncensor` (if the issue is resolved) or `--force-append-on-censored --yes` (for cases where you *do* want to land data on a known-bad sample — e.g. comparative "why did this fail?" analyses). The `--yes` pairing matches the `--allow-new --yes` idiom elsewhere in casetrack.
 
 Note that the convention uses **bare** `qc_pass` / `qc_fail_reason` / `qc_warn` — not `{analysis}_qc_pass`. The flag is the summarize script's judgement: "this assay is bad, regardless of which analysis asked me." If the script decides the assay is usable (even if *this* analysis's numbers are unimpressive), it omits the columns or leaves `qc_pass=True`, and the assay stays unflagged.
 
@@ -369,31 +429,70 @@ Cohort: msk_hgsoc_2026
 
 Formats: `--fmt {table, tsv, json, md}`.
 
-### 8.3 `casetrack cohort --pair-by` (paired-design readiness)
+### 8.3 `casetrack cohort --pair-by` (paired- and multi-partition design readiness)
 
-The HGSOC002 case from §4.5 — one half of a tumor/normal pair failed — is surfaced explicitly:
+`--pair-by` partitions each patient's specimens by any `specimens` column and reports completeness + QC status per partition. The N-partition arity (decision #10) handles tumor/normal (2), longitudinal (3+), and multi-region designs off the same code path.
+
+#### Two-partition example — tumor/normal (the HGSOC002 case from §4.5)
 
 ```
 $ casetrack cohort --project-dir D --assay-type ONT-RNA-Seq --pair-by tissue_site
-Assay type: ONT-RNA-Seq   (pair dimension: tissue_site = {tumor, normal})
+Assay type: ONT-RNA-Seq   (partition: tissue_site = {tumor, normal})
 
-  PATIENT     TUMOR    NORMAL   PAIR STATUS
+  PATIENT     TUMOR    NORMAL   GROUP STATUS
   HGSOC002    pass     FAIL     broken  (drop for paired analysis)
   HGSOC006    pass     pass     complete
   ...
 
 Summary:
-  Complete matched pairs:  48
-  Broken pairs:             1
-  Singletons:               1  (only one tissue_site present)
+  Complete groups:  48
+  Broken groups:     1   (all partitions present, ≥1 failed QC)
+  Incomplete:        0   (not all partitions present)
+  Singletons:        1   (only one partition present)
 ```
 
-`--pair-by` works off any column on `specimens` that partitions the specimens of a patient into distinct groups (here `tissue_site`). Extensible to other designs (`timepoint` for longitudinal, `region` for multi-region). A failed half surfaces as a broken pair without automatically censoring the passing half — the user decides whether to drop the patient from a paired analysis.
+#### Three-partition example — longitudinal
 
-Additional flags:
-- `--complete-only` → patients list whose pairs are complete (good for piping to analysis tooling)
-- `--broken-only` → just the broken ones (to review)
+```
+$ casetrack cohort --project-dir D --assay-type ONT-DNA-Seq \
+      --pair-by timepoint \
+      --partition-order baseline,post-tx,progression
+
+Assay type: ONT-DNA-Seq   (partition: timepoint = {baseline, post-tx, progression})
+
+  PATIENT     BASELINE   POST-TX   PROGRESSION   GROUP STATUS
+  HGSOC010    pass       pass      pass          complete
+  HGSOC011    pass       pass      (none)        incomplete (missing: progression)
+  HGSOC012    pass       FAIL      pass          broken
+  HGSOC013    pass       (none)    (none)        singleton
+
+Summary:
+  Complete groups: 1   Broken: 1   Incomplete: 1   Singletons: 1
+
+  Partial completeness (with --require N):
+    --require 2 of 3:  2 patients satisfy (HGSOC010, HGSOC011)
+    --require 3 of 3:  1 patient satisfies  (HGSOC010)
+```
+
+#### Flags
+
+- `--pair-by COL` — partition column name (any column on `specimens`; commonly `tissue_site`, `timepoint`, `region`)
+- `--partition-order v1,v2,...` — canonical display order for partition values; if omitted, partitions display in alphabetical order
+- `--require N` — report patients satisfying "≥N-of-M partitions present and passing" (for partial-completeness workflows)
+- `--assay-type T` — scope the readiness to a single assay type (the common case for paired analyses)
+- `--complete-only` / `--broken-only` / `--incomplete-only` — output just patients in that category (good for piping to analysis drivers)
 - `--fmt {table, tsv, json}`
+
+#### Status terminology
+
+| Term | Meaning |
+|---|---|
+| `complete` | all partitions present, all pass QC |
+| `broken` | all partitions present, ≥1 fails QC |
+| `incomplete` | not all partitions present |
+| `singleton` | only one partition present |
+
+A broken group never auto-cascades — the user decides (informed by the table) whether to drop the passing halves too.
 
 ### 8.4 `query` views (power users)
 
@@ -481,16 +580,19 @@ A floating legend explains the visual encoding. Self-contained HTML, zero JS as 
 
 ## 12. Open questions
 
+Resolved in iteration 4 and promoted to §0 decisions: the strict-append behaviour (was Q2/Q3), multi-partition pair-by (was Q6), consent enum values, default QC kinds, and pair dimension column name. The following remain:
+
 | # | Question | Lean |
 |---|---|---|
 | Q1 | Should `warn` status propagate to downstream views or be purely informational? | Informational for now. Revisit if a team asks. |
-| Q2 | How does `casetrack append` behave if the summary TSV has `qc_pass=False` for an assay already censored? | No-op with a stderr note. If the existing event was `resolved`, a new one is appended. |
-| Q3 | Should `append` refuse to write data columns when `qc_pass=False`? | No. Still write the data (NaN or raw values), still set `{analysis}_done`, but also flag the assay. The data may be useful to understand the failure. |
 | Q4 | Should `superseded` events be auto-emitted when a replicate is added? | No, too magic. Explicit `casetrack censor --kind superseded --reason "rep2 is canonical"` only. |
-| Q5 | Time-based consent (e.g. "consent valid through 2028-12-31")? | Out of scope. Model as a `consent_expiry` column if a team needs it. Re-open if common. |
-| Q6 | `cohort --pair-by` across >2 partition values (e.g. 3 timepoints)? | Full matrix: report patients with a complete set across all partitions. `--require 2 of 3` to allow partial sets. Defer until a real use case. |
+| Q5 | Time-based consent beyond `consent_expired` status (e.g. parsing `consent_date + 5_years`)? | Out of scope. `consent_expired` is a manual status transition, not computed. Add automation later if a team needs it. |
 | Q7 | Audit output: should `casetrack censor --from file.tsv` write one provenance entry or one per event? | One per event, same `transaction_id` for the batch. Keeps replay simple. |
 | Q8 | Field `created_by`: format for humans vs. SLURM vs. imports? | Humans: `$USER`. SLURM: `slurm:$SLURM_JOB_ID`. Import: `import:$(basename FROM_FILE)`. Captured automatically by the CLI. |
+| Q9 | Batch tracking for `batch_effect_flagged` — do we model `assays.batch_id` as a first-class column? | Not in v0.4. `batch_effect_flagged` is a free-text-reason kind for now. A future proposal adds `batch_id` on `assays` + `batches` table if a team needs cohort-level batch analytics. |
+| Q10 | Should `casetrack register --level patient --meta consent_status=revoked` auto-create a matching `qc_events` row? | Yes — invariant from §4.3 ("if `consent_status='revoked'` there MUST be a matching event"). `register` writes both inside one transaction. |
+| Q11 | Can `uncensor` operate by `(level, entity_id)` instead of `--event-id`? | `--event-id` is canonical. `--level`/`--id` is accepted as sugar when there's exactly one active event on that entity; ambiguous cases require `--event-id`. |
+| Q12 | Dashboard backward compatibility — will v0.3.x dashboards render on v0.4 DBs? | Yes. v0.4 dashboards add new sections but fall back gracefully when `qc_events` is empty. A v0.3 project (no QC data) should look identical to today. |
 
 ## 13. Implementation plan (phased)
 
