@@ -435,6 +435,10 @@ cohort_v4/
 ├── casetrack.db                    # SQLite; WAL + FK enforcement (gitignored)
 ├── provenance.jsonl                # append-only audit log (git-trackable)
 ├── .gitignore                      # excludes casetrack.db + -wal/-shm + exports/
+├── data/
+│   ├── raw/                        # immutable inputs — never modified in place
+│   ├── ref/                        # reference genome + annotations + indexes
+│   └── validation/                 # truth sets / ground-truth BEDs / benchmark VCFs
 ├── results/
 │   ├── modkit/{assay_id}/
 │   ├── tldr/{assay_id}/
@@ -443,6 +447,7 @@ cohort_v4/
 │   ├── summarize_modkit.py         # distils raw output → assay TSV
 │   ├── summarize_tldr.py           # emits qc_pass / qc_fail_reason optionally
 │   └── summarize_qc.py
+├── docs/                           # project-specific notes (protocol, PI briefs, README)
 ├── logs/                           # SLURM logs
 ├── containers/                     # Apptainer .sif files
 └── sandbox/                        # preserved source TSVs (migration artifact)
