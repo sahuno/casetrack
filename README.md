@@ -2,17 +2,26 @@
 
 **Lifecycle data management for computational biology pipelines on HPC.**
 
-Two storage modes:
-- **v0.3 (project mode — recommended)**: a SQLite-backed project directory with
-  normalized `patient → specimen → assay` tables, enforced foreign keys, typed
-  columns, and DuckDB-powered SQL queries. Survives DB corruption — everything
-  is regenerable from `casetrack.toml` + `provenance.jsonl`.
-- **v0.2 (flat mode — deprecated)**: one TSV manifest per project, one row per
-  sample, every analysis appends columns. Still works, but prints a loud
-  deprecation warning. Scheduled for removal in **v1.0** (~6 months post-v0.3).
+Answers two questions about a multi-patient, multi-specimen, multi-assay
+cohort: "*is this analysis complete?*" and "*is this sample usable?*"
 
-Migrate existing flat manifests with `casetrack migrate` — see
-[`docs/MIGRATION_v0.2_to_v0.3.md`](docs/MIGRATION_v0.2_to_v0.3.md).
+Three storage layers, one CLI:
+- **v0.4 (current)**: the v0.3 project backend + a QC / censoring / consent
+  subsystem. Every read path (`status`, `rerun`, `export`, `query`,
+  `dashboard`) filters out QC-failed and consent-revoked entities by
+  default. SLURM summary TSVs can auto-flag via `qc_pass` /
+  `qc_fail_reason` / `qc_warn` columns. Paired-design readiness via
+  `casetrack cohort --pair-by`.
+- **v0.3 (project mode)**: a SQLite-backed project directory with
+  normalized `patient → specimen → assay` tables, enforced foreign keys,
+  typed columns, and DuckDB-powered SQL queries. Survives DB corruption —
+  everything is regenerable from `casetrack.toml` + `provenance.jsonl`.
+- **v0.2 (flat mode — deprecated)**: one TSV manifest per project, one
+  row per sample. Still works, loud deprecation warning, removed in **v1.0**.
+
+Upgrade paths:
+`v0.2 → v0.3` via `casetrack migrate` ([guide](docs/MIGRATION_v0.2_to_v0.3.md)).
+`v0.3 → v0.4` via `casetrack migrate-qc` ([guide](docs/MIGRATION_v0.3_to_v0.4.md)).
 
 ```
 cohort_v3/
@@ -51,7 +60,8 @@ Three recommended patterns by user shape:
 ## Contents
 
 - [Install](#install)
-- [Quick start](#quick-start)
+- [Quick start — v0.3 project mode (recommended)](#quick-start--v03-project-mode-recommended)
+- [Quick start — v0.2 flat mode (deprecated)](#quick-start--v02-flat-mode-deprecated)
 - [Commands](#commands)
 - [The three-phase SLURM pattern](#the-three-phase-slurm-pattern)
 - [Concurrency & safety rails](#concurrency--safety-rails)
@@ -87,25 +97,36 @@ Optional extras: `openpyxl` (xlsx), `pyarrow` (parquet).
 casetrack init --project-dir cohort/ --from-template hgsoc
 
 # 2. Register a few rows (or load them in bulk via `add-metadata` / `migrate`).
-casetrack register --project-dir cohort/ --level patient  --id P001 \
+casetrack register --project-dir cohort/ --level patient  --id HGSOC002 \
     --meta 'age=55,sex=F,brca_status=brca1'
-casetrack register --project-dir cohort/ --level specimen --id S001 \
-    --parent P001 --meta 'tissue_site=tumor'
-casetrack register --project-dir cohort/ --level assay    --id A001 \
-    --parent S001 --meta 'assay_type=WGS'
+casetrack register --project-dir cohort/ --level specimen --id HGSOC002-normal \
+    --parent HGSOC002 --meta 'tissue_site=normal'
+casetrack register --project-dir cohort/ --level assay    --id HGSOC002-normal-ONT-RNA \
+    --parent HGSOC002-normal --meta 'assay_type=ONT'
 
-# 3. At the end of a SLURM job, append the per-sample summary TSV:
+# 3. At the end of a SLURM job, append the per-sample summary TSV.
+#    If the TSV has qc_pass=False, casetrack auto-emits a qc_events row
+#    in the same transaction — no extra CLI call needed (see §SLURM pattern).
 casetrack append --project-dir cohort/ --level assay \
     --results summary.tsv --analysis modkit_methylation
 
-# 4. See what's done.
-casetrack status    --project-dir cohort/ --group-by analysis
+# 4. Flag a bad assay manually (library prep failed, contamination, etc.).
+casetrack censor --project-dir cohort/ \
+    --level assay --id HGSOC002-normal-ONT-RNA \
+    --kind library_prep_failed --reason "cDNA yield 8 ng, need >100"
+
+# 5. See what's complete AND usable. `--usable` adds the exclusion breakdown.
+casetrack status    --project-dir cohort/ --usable
 casetrack dashboard --project-dir cohort/ --output dashboard.html
 
-# 5. Query across the three levels with SQL (assays⋈specimens⋈patients
-#    is exposed as the view `_`).
+# 6. Cohort readiness — paired designs surface broken pairs.
+casetrack cohort --project-dir cohort/ \
+    --assay-type ONT-RNA-Seq --pair-by tissue_site
+
+# 7. Query across the three levels with SQL. `_` is the raw join;
+#    `_active` applies the §4.4 cascade (QC + consent) automatically.
 casetrack query --project-dir cohort/ --fmt json \
-    "SELECT patient_id, assay_id, mean_meth FROM _ WHERE mean_meth > 0.6"
+    "SELECT patient_id, assay_id, mean_meth FROM _active WHERE mean_meth > 0.6"
 ```
 
 ## Quick start — v0.2 flat mode (deprecated)
@@ -166,59 +187,6 @@ and exact SQL.
 | `cohort`         | **v0.4** — cohort readiness summary + paired-design view (`--pair-by`)       |
 
 `casetrack <cmd> --help` for the full option list on any subcommand.
-
-### v0.4 QC workflow (HGSOC002 worked example)
-
-Concrete scenario from proposal 0002 §4.5: patient HGSOC002's normal
-ONT-RNA-Seq failed library prep; the matching tumor ONT-RNA passed; both
-halves of HGSOC006's pair are fine. Whole-cohort readiness should surface
-the broken pair so you can decide whether to drop the intact tumor half.
-
-```bash
-# 1. Flag the failed assay.
-casetrack censor --project-dir hgsoc_2026 \
-    --level assay --id HGSOC002-normal-ONT-RNA \
-    --kind library_prep_failed \
-    --reason "cDNA yield 8 ng, need >100"
-
-# 2. A subsequent `append` on that assay now exits 2 — protects cluster hours:
-casetrack append --project-dir hgsoc_2026 \
-    --results modkit.tsv --analysis modkit
-# Error: 1 assay(s) in modkit.tsv are censored: ['HGSOC002-normal-ONT-RNA']
-#        ...
-#        - If you need to land data anyway (rare): --force-append-on-censored --yes
-
-# 3. See what's usable vs excluded.
-casetrack status --project-dir hgsoc_2026 --usable
-#   Usable assays: 11 / 12
-#   Excluded:      1
-#     QC-failed:   1   (HGSOC002-normal-ONT-RNA)
-
-# 4. Paired-design readiness: HGSOC002 is "broken", HGSOC006 is "complete".
-casetrack cohort --project-dir hgsoc_2026 \
-    --assay-type ONT-RNA-Seq --pair-by tissue_site
-#   PATIENT     TUMOR    NORMAL   GROUP STATUS
-#   HGSOC002    pass     FAIL     broken
-#   HGSOC006    pass     pass     complete
-
-# 5. After re-sequencing, reverse the flag — uncensor is an append-only
-#    write (resolved_at + resolved_by + resolved_reason on the same row).
-casetrack uncensor --project-dir hgsoc_2026 \
-    --level assay --id HGSOC002-normal-ONT-RNA \
-    --reason "re-sequenced on 2026-04-10 batch, passes"
-```
-
-**SLURM auto-flag.** If a summary TSV contains `qc_pass` / `qc_fail_reason`
-/ `qc_warn` columns, `casetrack append` consumes them and emits
-`qc_events` rows inside the same transaction — no extra CLI call needed.
-
-**Consent revocation.** `casetrack censor --level patient --kind
-consent_revoked` flips the patient's `consent_status`, sets
-`withdrawal_date`, and cascades exclusion at read. `casetrack uncensor`
-refuses to resolve a `consent_revoked` event unless `--ethics-override
---yes` is passed AND the `--reason` mentions IRB / re-consent / an ISO
-date. See `docs/MIGRATION_v0.3_to_v0.4.md` for the upgrade path and
-proposal 0002 for the full design.
 
 ### Representative examples
 
@@ -312,74 +280,111 @@ Every analysis job follows the same three phases:
 # ... resource directives ...
 
 SAMPLE_ID="$1"
-MANIFEST="$2"
+PROJECT_DIR="$2"
 
 # Phase 1: run the tool
 apptainer exec container.sif modkit pileup input.bam output.bed
 
-# Phase 2: distill to per-sample TSV (sample_id must be the first column)
+# Phase 2: distill to per-sample TSV.
+#   Required:   assay_id (first column)
+#   Optional:   qc_pass / qc_fail_reason / qc_warn — v0.4 autoflag. If the
+#               summarizer decides the whole assay is unusable, emit qc_pass=False
+#               (+ optional qc_fail_reason). casetrack append turns that into a
+#               qc_events row inside the same transaction as the data update.
 python3 scripts/summarize_modkit.py \
     --input output.bed \
-    --sample "$SAMPLE_ID" \
+    --assay "$SAMPLE_ID" \
     --output summary.tsv
 
-# Phase 3: append to manifest
+# Phase 3: append to project. If the target assay is already censored,
+# this exits 2 unless you pass --force-append-on-censored --yes.
 casetrack append \
-    --manifest "$MANIFEST" \
+    --project-dir "$PROJECT_DIR" \
     --results summary.tsv \
-    --key sample_id \
     --analysis modkit_methylation
 ```
+
+Example summary TSV with autoflag columns:
+
+```
+assay_id                    modkit_mean_meth   qc_pass   qc_fail_reason
+HGSOC002-tumor-ONT-RNA      0.72               True
+HGSOC002-normal-ONT-RNA                        False     library prep failed (cDNA yield 8 ng)
+```
+
+The `qc_pass` / `qc_fail_reason` / `qc_warn` columns are **consumed** by
+`casetrack append` — they never become analysis columns on `assays`.
 
 See `examples/run_modkit.sh` for a complete worked example and
 `examples/scripts/summarize_*.py` for the summarize-script contract.
 
 ## Concurrency & safety rails
 
-- **POSIX `flock`** guards the read-merge-write cycle in `append` and `add-metadata`.
-  The lock is held ~1s per invocation; parallel SLURM array tasks queue cleanly.
-- **Smart-merge** fills only NaN cells when an analysis' columns already exist, so
-  sibling array tasks don't fight each other.
-- **`--yes` gate** on `--allow-new` — prevents typo'd sample IDs from silently
-  expanding the manifest. Without `--yes`, casetrack previews the would-be adds
-  and refuses to commit (exit 2).
-- **Provenance-first**: every mutation logs to `manifest.tsv.provenance.jsonl`
-  with user, hostname, SLURM job id + array task id, git commit / branch / dirty
-  flag, and a checksum of the results file. No exceptions.
-- **Validate on demand**: `casetrack validate` catches duplicate keys, null IDs,
-  empty columns, orphaned `_done` timestamps without paired data columns, and
-  schema/manifest drift.
+- **SQLite WAL + `busy_timeout=30000`** in project mode (`BEGIN IMMEDIATE`
+  envelopes every mutation). **POSIX `flock`** in flat mode. Parallel
+  SLURM array tasks queue cleanly on both.
+- **Smart-merge** fills only NaN cells by default, so sibling array tasks
+  don't fight each other.
+- **Three `--yes` double opt-ins** — every one protects against a different
+  kind of silent data loss or bad-data admit:
+  - `--allow-new --yes` on `append` / `add-metadata` — admit row IDs that
+    aren't already in the project.
+  - `--force-append-on-censored --yes` on `append` (v0.4) — land data on
+    an entity whose `qc_status` is `fail` / `censored` / `consent_revoked`.
+  - `--ethics-override --yes` on `uncensor` (v0.4) — reverse a
+    `consent_revoked` event. The `--reason` must additionally mention an
+    IRB ref / re-consent phrasing / an ISO date, so a later auditor can
+    grep `provenance.jsonl` for every ethics transaction.
+- **Provenance-first**: every mutation logs to `provenance.jsonl` with
+  user, hostname, SLURM job id + array task id, git commit / branch /
+  dirty flag, and a checksum of the results file. v0.4 adds `censor`,
+  `uncensor`, `ethics_override`, `migrate_qc` actions to the schema.
+- **`casetrack validate`** catches TOML↔DB drift, FK orphans, orphan
+  `_done` timestamps, consent invariant violations, and `qc_status` ↔
+  active-events mismatch.
+- **`casetrack recover`** rebuilds `casetrack.db` byte-equivalent from
+  provenance alone — the DB is never the source of truth.
 
 ## Provenance
 
-`manifest.tsv.provenance.jsonl` is an append-only JSONL audit trail. Example entry:
+Project mode writes to `<project>/provenance.jsonl`; flat mode to
+`<manifest>.provenance.jsonl`. Both are append-only JSONL audit trails.
+Example v0.4 entry — a SLURM job that appended modkit results and auto-
+flagged a failed assay in the same transaction:
 
 ```json
 {
-  "action": "append",
-  "analysis": "modkit_methylation",
-  "results_file": "summary.tsv",
-  "results_checksum": "f4e1b7c9…",
-  "columns_added": ["modkit_mean_meth", "modkit_done"],
-  "samples_updated": 1,
-  "samples_new": 0,
-  "timestamp": "2026-04-15T17:03:50",
+  "action": "censor",
+  "level": "assay",
+  "entity_id": "HGSOC002-normal-ONT-RNA",
+  "kind": "qc_fail",
+  "reason": "library prep failed (cDNA yield 8 ng)",
+  "source": "slurm",
+  "created_by": "slurm:12345",
+  "transaction_id": "txn_20260417T090312_a1b2c3",
+  "qc_event_id": 42,
+  "new_qc_status": "fail",
+  "from_analysis": "modkit_methylation",
+  "timestamp": "2026-04-17T09:03:12",
   "user": "sahuno",
   "hostname": "is01",
   "slurm_job_id": "12345",
-  "slurm_array_task_id": "7",
   "git": {
     "commit": "67bba917afc…",
     "branch": "main",
     "dirty": false,
-    "toplevel": "/data1/greenbab/projects/alzheimers_rnaseq"
+    "toplevel": "/data1/greenbab/projects/hgsoc_2026"
   }
 }
 ```
 
-The `git` block captures the analysis pipeline's repo state at append time —
-so a reviewer can ask "which commit produced this column?" six months later.
-Opt out with `CASETRACK_NO_GIT=1` if a node lacks git.
+The `git` block captures the analysis pipeline's repo state at write time —
+so a reviewer can ask "which commit produced this column / this QC flag?"
+six months later. Ethics-sensitive actions (`consent_revoked` censors and
+`ethics_override` uncensors) additionally carry `"ethics": true`, so a
+single `grep` surfaces every consent transaction for audit. Opt out of
+the `git` block with `CASETRACK_NO_GIT=1` if a node lacks git. Every
+action — including QC — is replayable via `casetrack recover`.
 
 ## Nextflow integration
 
@@ -400,6 +405,11 @@ See `examples/nextflow/README.md` for:
 - profiles for `standard` / `slurm` / `apptainer` / `test`
 - three integration patterns (standalone, `afterScript`, collect-and-batch)
 
+The `casetrack_append_project` process inherits v0.4's strict-refuse +
+autoflag automatically — nothing to configure. If a summarize step emits a
+TSV with `qc_pass=False`, the append step in the pipeline turns it into a
+`qc_events` row in the same transaction.
+
 ## Claude Code integration
 
 Level 2 hook in `examples/claude/`: after a SLURM analysis finishes and calls
@@ -417,40 +427,57 @@ Full contract, exit codes, and prompt customization in `examples/claude/README.m
 
 ## Project layout
 
+A v0.4 project directory:
+
 ```
-project/
-├── manifest.tsv                    # single source of truth
-├── manifest.tsv.provenance.jsonl   # audit trail
-├── manifest.tsv.schema.json        # column-to-analysis mapping
-├── manifest.tsv.lock               # transient POSIX lock
-├── samples.txt
+cohort_v4/
+├── casetrack.toml                  # declared schema (git-tracked)
+├── casetrack.db                    # SQLite; WAL + FK enforcement (gitignored)
+├── provenance.jsonl                # append-only audit log (git-trackable)
+├── .gitignore                      # excludes casetrack.db + -wal/-shm + exports/
 ├── results/
-│   ├── modkit/{sample_id}/
-│   ├── tldr/{sample_id}/
-│   └── qc/{sample_id}/
+│   ├── modkit/{assay_id}/
+│   ├── tldr/{assay_id}/
+│   └── qc/{assay_id}/
 ├── scripts/
-│   ├── summarize_modkit.py         # distils raw output → manifest columns
-│   ├── summarize_tldr.py
+│   ├── summarize_modkit.py         # distils raw output → assay TSV
+│   ├── summarize_tldr.py           # emits qc_pass / qc_fail_reason optionally
 │   └── summarize_qc.py
 ├── logs/                           # SLURM logs
-└── containers/                     # Apptainer .sif files
+├── containers/                     # Apptainer .sif files
+└── sandbox/                        # preserved source TSVs (migration artifact)
 ```
 
 Repo layout:
 
 ```
 casetrack/
-├── casetrack.py          # all CLI commands (single-file)
-├── setup.py              # pip entry_points = [casetrack]
-├── README.md             # you are here
-├── docs/                 # design synopsis + architecture SVG
+├── casetrack.py                 # v0.3 commands (single file)
+├── casetrack_qc/                # v0.4 QC subsystem (subpackage)
+│   ├── schema.py                # qc_events DDL + qc_status + TOML
+│   ├── events.py                # insert / query / resolve; derive_status
+│   ├── censor.py                # cmd_censor, cmd_uncensor, cmd_qc_history
+│   ├── consent.py               # consent updates + ethics regex + invariant
+│   ├── autoflag.py              # SLURM summary-TSV convention
+│   ├── reader.py                # _active cascade + DuckDB view
+│   ├── cohort.py                # cmd_cohort + pair-by N-partition
+│   ├── migrate.py               # cmd_migrate_qc
+│   ├── recover.py               # replay helpers for QC actions
+│   └── cli.py                   # argparse wiring helpers
+├── setup.py                     # pip entry_points + packages=[casetrack_qc]
+├── README.md                    # you are here
+├── docs/
+│   ├── MIGRATION_v0.2_to_v0.3.md
+│   ├── MIGRATION_v0.3_to_v0.4.md
+│   └── proposals/0001-…, 0002-qc-events-and-censoring.md
 ├── examples/
 │   ├── run_modkit.sh
-│   ├── scripts/          # summarize_modkit.py, summarize_tldr.py
-│   ├── nextflow/         # DSL2 module + demo pipeline + config
-│   └── claude/           # post-analysis QC hook + prompt template
-├── tests/                # 152 pytest tests
-└── sandbox/              # non-tracked build leftovers (gitignored)
+│   ├── scripts/                 # summarize_*.py
+│   ├── nextflow/                # DSL2 module + demo pipeline
+│   ├── claude/                  # post-analysis QC hook
+│   └── giab_chr21/              # real-data demo (HG002+HG006 chr21)
+├── tests/                       # 522 pytest tests across 27 files
+└── sandbox/                     # non-tracked build leftovers (gitignored)
 ```
 
 ## Testing
@@ -460,22 +487,46 @@ pip install --user pytest openpyxl pyarrow
 python3 -m pytest tests/ -q
 ```
 
-Suite covers: helpers (locking, provenance, checksums, schema), every subcommand
-(`init` / `append` / `add-metadata` / `status` / `validate` / `log` / `schema` /
-`rerun` / `dashboard` / `projects` / `export`), smart-merge correctness and
-5000-sample perf regression, concurrent append via `multiprocessing`, git
-provenance with a real tmp repo, the Nextflow module's shell contract
-(extract-and-execute), and the Claude Code hook (with a stubbed `claude` on PATH).
+522 tests across 27 files (~2 min full run).
+
+Suite covers: helpers (locking, provenance, checksums, schema), every
+subcommand (flat + project mode), smart-merge correctness and 5000-sample
+perf regression, concurrent append via `multiprocessing`, WAL concurrency
+under real contention, git provenance with a real tmp repo, the Nextflow
+module's shell contract (extract-and-execute), the Claude Code hook (with
+a stubbed `claude` on PATH), and every v0.4 QC path: schema + events CRUD,
+censor / uncensor / qc-history CLI, SLURM autoflag, strict-refuse on
+censored append, rerun / status / export QC defaults, validate
+invariants, ethics-override gate, `migrate-qc` + `recover` round-trip,
+and `cohort` base + `--pair-by` N-partition.
 
 ## Design principles
 
-1. **TSV-first.** Human-readable, git-diffable, works with awk / csvtk / pandas. No database.
-2. **The manifest is the source of truth.** If it's not in the manifest, it didn't happen.
-3. **Append-only columns, fill-only cells by default.** Mutations require an explicit flag (`--overwrite`).
-4. **Convention over configuration.** Every analysis gets a `{analysis}_done` timestamp column — that's what `status` reads.
-5. **Summarize scripts are the contract.** Each analysis has a small Python script that produces the per-sample TSV; full raw output stays in per-sample dirs.
-6. **One manifest per project.** No shared global state. `casetrack projects` aggregates across projects without coupling them.
-7. **Safety rails are explicit.** `flock` for concurrency, `--yes` for row growth, provenance for every mutation.
+1. **The DB is a cache. Provenance is the truth.** `casetrack.db` is
+   gitignored and regenerable from `casetrack.toml` + `provenance.jsonl`
+   via `casetrack recover`. Every mutation — including QC — produces a
+   provenance entry before it produces a DB change.
+2. **Append-only by default.** Columns only get added; cells only get
+   filled. Destructive operations require explicit flags. Censoring is
+   append-only too: `uncensor` writes `resolved_at` on the same row,
+   never deletes.
+3. **Convention over configuration.** Every analysis gets a
+   `{analysis}_done` timestamp column — that's what `status` and `rerun`
+   read. Every summary TSV can opt into QC with three reserved column
+   names. Every mutation logs provenance. No per-project config.
+4. **Strict FK, strict QC, strict consent.** Unknown parent → exit 2.
+   Append on censored → exit 2. Consent reversal without ethics gate →
+   exit 2. Every strict check has a paired `--yes` opt-in so deliberate
+   overrides are loud.
+5. **Whole-entity QC, not per-analysis.** An assay is usable or it isn't.
+   Per-analysis censoring (fine for modkit, bad for xtea on the same
+   assay) is deferred until a concrete motivating case appears.
+6. **Read-time cascade, not write-time denormalization.** A consent-
+   revoked patient excludes its specimens and assays at query time — the
+   child rows don't carry a copy of the consent flag.
+7. **Safety rails are explicit.** Three `--yes` opt-ins (§Concurrency),
+   provenance on every write, `validate` + `recover` + `doctor` for
+   post-hoc checks.
 
 ## License
 
