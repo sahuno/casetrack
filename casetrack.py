@@ -2761,6 +2761,17 @@ class _MissingKeys(Exception):
         self.missing = missing
 
 
+class _AppendOnCensored(Exception):
+    """Raised when `casetrack append` targets entities whose qc_status is
+    fail/censored/consent_revoked without the --force-append-on-censored --yes
+    opt-in. Proposal 0002 §5.1.1 / §9."""
+
+    def __init__(self, level: str, entity_ids: list[str]):
+        super().__init__(f"{len(entity_ids)} censored {level}(s)")
+        self.level = level
+        self.entity_ids = entity_ids
+
+
 def cmd_append_project(args):
     """Attach analysis results to rows at --level, extending the schema as needed."""
     project_dir, schema = _resolve_project(args.project_dir)
@@ -2797,8 +2808,16 @@ def cmd_append_project(args):
         )
         sys.exit(1)
 
-    analysis_cols = [c for c in results.columns if c != key_col]
-    if not analysis_cols:
+    # v0.4: carve out the autoflag columns (qc_pass / qc_fail_reason / qc_warn)
+    # before column-type inference so they never become analysis columns.
+    from casetrack_qc.autoflag import AUTOFLAG_COLUMNS as _QC_AUTOFLAG_COLS
+    autoflag_cols_present = [c for c in _QC_AUTOFLAG_COLS if c in results.columns]
+
+    analysis_cols = [
+        c for c in results.columns
+        if c != key_col and c not in _QC_AUTOFLAG_COLS
+    ]
+    if not analysis_cols and not autoflag_cols_present:
         print(
             f"Error: {results_path} has no columns besides {key_col!r}.",
             file=sys.stderr,
@@ -2835,6 +2854,8 @@ def cmd_append_project(args):
     executed_sql: list[str] = []
     columns_added: list[str] = []
     rows_updated = 0
+    autoflag_emitted: list[dict] = []
+    txn_id = _new_transaction_id()
 
     try:
         with begin_immediate(conn):
@@ -2850,6 +2871,38 @@ def cmd_append_project(args):
             missing = tsv_keys - {str(k) for k in existing_keys}
             if missing:
                 raise _MissingKeys(missing)
+
+            # v0.4: strict-refuse append on entities that are already censored
+            # (qc_status in {fail, censored, consent_revoked}). Pipeline
+            # re-runs on known-bad assays waste cluster hours, so default is
+            # exit 2 unless the user deliberately opts in with
+            # --force-append-on-censored --yes (proposal §5.1.1 / §9).
+            from casetrack_qc.schema import qc_schema_exists as _qc_schema_exists
+            if _qc_schema_exists(conn):
+                qc_rows = dict(
+                    conn.execute(
+                        f"SELECT {_quote_ident(key_col)}, qc_status "
+                        f"FROM {_quote_ident(table)}"
+                    ).fetchall()
+                )
+                censored = {
+                    k for k in tsv_keys
+                    if qc_rows.get(k) in ("fail", "censored", "consent_revoked")
+                }
+                force = (
+                    getattr(args, "force_append_on_censored", False)
+                    and getattr(args, "yes", False)
+                )
+                if censored and not force:
+                    raise _AppendOnCensored(level, sorted(censored))
+                if censored and force:
+                    ids = ", ".join(sorted(censored))
+                    print(
+                        f"\u26A0 Forcing append on {len(censored)} censored "
+                        f"{level}: {ids}\n"
+                        "  Data written. Entity remains excluded from read paths.",
+                        file=sys.stderr,
+                    )
 
             # Add any new columns up-front so subsequent UPDATE can reference them.
             existing_cols = set(_get_table_columns(conn, table))
@@ -2885,6 +2938,19 @@ def cmd_append_project(args):
                 rows_updated += 1
 
             executed_sql.append(update_sql)
+
+            # v0.4 SLURM auto-flag (§6): if the summary TSV had qc_pass /
+            # qc_fail_reason / qc_warn columns, turn them into qc_events rows
+            # + bump qc_status. Same transaction — if any DB write fails,
+            # both data and QC roll back together.
+            if autoflag_cols_present and _qc_schema_exists(conn):
+                from casetrack_qc.autoflag import apply_autoflag as _apply_autoflag
+                autoflag_emitted = _apply_autoflag(
+                    conn, results, key_col,
+                    level=level,
+                    transaction_id=txn_id,
+                    source="slurm",
+                )
     except _MissingKeys as e:
         conn.close()
         preview = sorted(e.missing)[:5]
@@ -2893,6 +2959,22 @@ def cmd_append_project(args):
             f"table {table!r}: {preview}{'…' if len(e.missing) > 5 else ''}\n"
             f"Register them first with 'casetrack register --level {level} --id ... "
             f"--parent ...' before appending.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except _AppendOnCensored as e:
+        conn.close()
+        preview = e.entity_ids[:3]
+        more = f" (+{len(e.entity_ids) - 3} more)" if len(e.entity_ids) > 3 else ""
+        print(
+            f"Error: {len(e.entity_ids)} {e.level}(s) in {results_path} are "
+            f"censored: {preview}{more}\n"
+            f"Suggestions:\n"
+            f"  - If the issue is resolved: "
+            f"casetrack uncensor --level {e.level} --id <ID> "
+            f"--reason '<fix>'\n"
+            f"  - If you need to land data anyway (rare): "
+            f"--force-append-on-censored --yes",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -2913,15 +2995,37 @@ def cmd_append_project(args):
         "results_file": str(results_path),
         "results_checksum": _checksum(str(results_path)),
         "col_type_overrides": col_type_overrides,
-        "transaction_id": _new_transaction_id(),
+        "transaction_id": txn_id,
         "sql": executed_sql,
         "schema_v_before": schema["project"]["schema_v"],
         "schema_v_after": schema["project"]["schema_v"],
+        "autoflag_events": [e["qc_event_id"] for e in autoflag_emitted],
     })
 
+    # One `censor` provenance entry per autoflag event, all sharing the
+    # append's transaction_id (proposal §12 Q7 lean: one entry per event).
+    for em in autoflag_emitted:
+        log_project_provenance(project_dir, {
+            "action": "censor",
+            "level": level,
+            "entity_id": em["entity_id"],
+            "kind": em["kind"],
+            "reason": em["reason"],
+            "source": "slurm",
+            "created_by": f"slurm:{os.environ.get('SLURM_JOB_ID', 'unknown')}",
+            "transaction_id": txn_id,
+            "qc_event_id": em["qc_event_id"],
+            "new_qc_status": em["new_qc_status"],
+            "from_analysis": analysis,
+        })
+
     added_note = f" (+{len(columns_added)} new column{'s' if len(columns_added) != 1 else ''})" if columns_added else ""
+    autoflag_note = (
+        f" (+{len(autoflag_emitted)} qc event{'s' if len(autoflag_emitted) != 1 else ''})"
+        if autoflag_emitted else ""
+    )
     print(
-        f"Appended {analysis!r} to {rows_updated} {level} row(s){added_note}."
+        f"Appended {analysis!r} to {rows_updated} {level} row(s){added_note}{autoflag_note}."
     )
 
 
@@ -4044,6 +4148,10 @@ def _prepare_v03_query_connection(db_path: Path):
         JOIN specimens USING (specimen_id)
         JOIN patients USING (patient_id)
     """)
+    # v0.4: expose `_active` — same join with the §4.4 cascade applied. Silent
+    # no-op on v0.3-only DBs that don't have qc_status/consent_status columns.
+    from casetrack_qc.reader import install_active_views as _install_active_views
+    _install_active_views(con)
     return con
 
 
@@ -4141,11 +4249,74 @@ def cmd_export_project(args):
         print(f"Exported {len(df)} rows via --sql to {output}.")
         return
 
+    # v0.4: figure out QC filtering up-front so the audit line matches the
+    # subset that actually got written (proposal §5.2).
+    include_censored = getattr(args, "include_censored", False)
+    include_consent_revoked = getattr(args, "include_consent_revoked", False)
+    active_ids: dict[str, set[str] | None] = {"patient": None, "specimen": None, "assay": None}
+    excluded_count = 0
+    _qc_conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    try:
+        from casetrack_qc.schema import qc_schema_exists as _qc_schema_exists
+        from casetrack_qc.reader import (
+            active_assay_ids as _active_assay_ids,
+            active_patient_ids as _active_patient_ids,
+            active_specimen_ids as _active_specimen_ids,
+            exclusion_breakdown as _exclusion_breakdown,
+        )
+        if _qc_schema_exists(_qc_conn) and not (
+            include_censored and include_consent_revoked
+        ):
+            active_ids = {
+                "patient": _active_patient_ids(
+                    _qc_conn,
+                    include_censored=include_censored,
+                    include_consent_revoked=include_consent_revoked,
+                ),
+                "specimen": _active_specimen_ids(
+                    _qc_conn,
+                    include_censored=include_censored,
+                    include_consent_revoked=include_consent_revoked,
+                ),
+                "assay": _active_assay_ids(
+                    _qc_conn,
+                    include_censored=include_censored,
+                    include_consent_revoked=include_consent_revoked,
+                ),
+            }
+            breakdown = _exclusion_breakdown(_qc_conn)
+            filt_msg = []
+            if not include_censored:
+                nq = len(breakdown["qc_failed_assays"]) + len(breakdown["censored_assays"])
+                if nq:
+                    filt_msg.append(f"{nq} QC-failed/censored assay(s)")
+            if not include_consent_revoked:
+                nc = len(breakdown["consent_revoked_assays"])
+                if nc:
+                    filt_msg.append(f"{nc} consent-revoked assay(s)")
+            if filt_msg:
+                print(
+                    f"\u26A0 export filter: excluded " + ", ".join(filt_msg)
+                    + "  (--include-censored / --include-consent-revoked to opt in)",
+                    file=sys.stderr,
+                )
+    finally:
+        _qc_conn.close()
+
     shape = args.shape or "tables"
     if shape == "joined":
         con = _prepare_v03_query_connection(project_dir / PROJECT_DB_NAME)
         try:
-            df = con.execute('SELECT * FROM "_"').fetchdf()
+            # Use the _active view when filtering, the raw _ view otherwise.
+            if any(a is not None for a in active_ids.values()):
+                from casetrack_qc.reader import install_active_views as _install_views
+                _install_views(con)
+                try:
+                    df = con.execute('SELECT * FROM "_active"').fetchdf()
+                except Exception:
+                    df = con.execute('SELECT * FROM "_"').fetchdf()
+            else:
+                df = con.execute('SELECT * FROM "_"').fetchdf()
         finally:
             con.close()
         _write_df(df, output)
@@ -4192,7 +4363,23 @@ def cmd_export_project(args):
         written = []
         for level in wanted:
             table = f"{level}s"
-            df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
+            key_col = f"{level}_id"
+            # v0.4 filter: if `active_ids[level]` is set, restrict the export
+            # to those keys.
+            active = active_ids.get(level)
+            if active is None:
+                df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
+            elif not active:
+                df = pd.read_sql_query(
+                    f"SELECT * FROM {table} WHERE 1=0", conn
+                )
+            else:
+                placeholders = ", ".join("?" * len(active))
+                df = pd.read_sql_query(
+                    f"SELECT * FROM {table} WHERE {key_col} IN ({placeholders})",
+                    conn,
+                    params=list(active),
+                )
             if prefix_mode:
                 out_path = Path(f"{prefix_base}.{table}{ext}")
             else:
@@ -4274,6 +4461,29 @@ def cmd_rerun_project(args):
                     f"ORDER BY {_quote_ident(key_col)}"
                 ).fetchall()
             ]
+
+        # v0.4: filter out censored / consent-revoked by default. --force-censored
+        # opts back in and prints a loud stderr warning (proposal §5.2).
+        from casetrack_qc.schema import qc_schema_exists as _qc_schema_exists
+        force_censored = getattr(args, "force_censored", False)
+        if not force_censored and _qc_schema_exists(conn) and level == "assay":
+            from casetrack_qc.reader import active_assay_ids as _active_assay_ids
+            active = _active_assay_ids(conn)
+            before = len(missing_keys)
+            missing_keys = [k for k in missing_keys if k in active]
+            skipped = before - len(missing_keys)
+            if skipped:
+                print(
+                    f"\u26A0 Skipped {skipped} censored/consent-revoked "
+                    f"{level}(s). Re-run with --force-censored to include.",
+                    file=sys.stderr,
+                )
+        elif force_censored and _qc_schema_exists(conn):
+            print(
+                "\u26A0 --force-censored: including censored/consent-revoked "
+                f"{level}s.",
+                file=sys.stderr,
+            )
     finally:
         conn.close()
 
@@ -4560,17 +4770,41 @@ def cmd_status_project(args):
     project_dir, schema = _resolve_project(args.project_dir)
     conn = open_project_db(project_dir / PROJECT_DB_NAME)
     try:
+        # v0.4 QC filter: --usable mode short-circuits to the usable/excluded
+        # breakdown (§8.1). Otherwise default counts exclude fail/censored +
+        # consent-revoked unless opted back in.
+        from casetrack_qc.schema import qc_schema_exists as _qc_schema_exists
+        qc_on = _qc_schema_exists(conn)
+        if qc_on and getattr(args, "usable", False):
+            _emit_status_usable(
+                conn,
+                project_dir,
+                analysis=getattr(args, "analysis", None),
+            )
+            return
+
         group_by = args.group_by or "analysis"
         done_by_level = _discover_done_columns(conn)
-        counts_by_level = {
-            level: conn.execute(
-                f"SELECT COUNT(*) FROM {_quote_ident(f'{level}s')}"
-            ).fetchone()[0]
-            for level in LEVEL_ORDER
-        }
+
+        # Apply QC filter to the "total" counts when qc_on AND not including
+        # censored. Kept in a dict so we can pass to _status_by_analysis for
+        # per-level totals.
+        include_censored = getattr(args, "include_censored", False)
+        include_consent_revoked = getattr(args, "include_consent_revoked", False)
+        counts_by_level = _status_counts_by_level(
+            conn,
+            qc_on=qc_on,
+            include_censored=include_censored,
+            include_consent_revoked=include_consent_revoked,
+        )
 
         if group_by == "analysis":
-            report = _status_by_analysis(conn, done_by_level, counts_by_level)
+            report = _status_by_analysis(
+                conn, done_by_level, counts_by_level,
+                qc_on=qc_on,
+                include_censored=include_censored,
+                include_consent_revoked=include_consent_revoked,
+            )
         elif group_by == "assay":
             report = _status_by_row(conn, "assay", done_by_level["assay"])
         elif group_by == "specimen":
@@ -4587,16 +4821,171 @@ def cmd_status_project(args):
                  counts=counts_by_level)
 
 
-def _status_by_analysis(conn, done_by_level, counts_by_level) -> list[dict]:
+def _status_counts_by_level(
+    conn: sqlite3.Connection,
+    *,
+    qc_on: bool,
+    include_censored: bool,
+    include_consent_revoked: bool,
+) -> dict:
+    if not qc_on or (include_censored and include_consent_revoked):
+        return {
+            level: conn.execute(
+                f"SELECT COUNT(*) FROM {_quote_ident(f'{level}s')}"
+            ).fetchone()[0]
+            for level in LEVEL_ORDER
+        }
+    from casetrack_qc.reader import (
+        active_assay_ids as _active_assay_ids,
+        active_patient_ids as _active_patient_ids,
+        active_specimen_ids as _active_specimen_ids,
+    )
+    return {
+        "patient": len(_active_patient_ids(
+            conn,
+            include_censored=include_censored,
+            include_consent_revoked=include_consent_revoked,
+        )),
+        "specimen": len(_active_specimen_ids(
+            conn,
+            include_censored=include_censored,
+            include_consent_revoked=include_consent_revoked,
+        )),
+        "assay": len(_active_assay_ids(
+            conn,
+            include_censored=include_censored,
+            include_consent_revoked=include_consent_revoked,
+        )),
+    }
+
+
+def _emit_status_usable(
+    conn: sqlite3.Connection,
+    project_dir: Path,
+    *,
+    analysis: str | None = None,
+) -> None:
+    """Render the §8.1 usable-vs-excluded breakdown."""
+    from casetrack_qc.reader import (
+        active_assay_ids as _active_assay_ids,
+        exclusion_breakdown as _exclusion_breakdown,
+    )
+    usable = _active_assay_ids(conn)
+    (total,) = conn.execute("SELECT COUNT(*) FROM assays").fetchone()
+    excluded = _exclusion_breakdown(conn)
+
+    done = 0
+    pending = 0
+    if analysis and usable:
+        done_col = f"{analysis}{DONE_COLUMN_SUFFIX}"
+        actual_cols = set(_get_table_columns(conn, "assays"))
+        if done_col in actual_cols:
+            placeholders = ", ".join("?" * len(usable))
+            rows = conn.execute(
+                f"SELECT {_quote_ident(done_col)} FROM assays "
+                f"WHERE assay_id IN ({placeholders})",
+                list(usable),
+            ).fetchall()
+            done = sum(1 for (v,) in rows if v is not None)
+            pending = len(rows) - done
+    else:
+        # Summarize completeness across all known _done columns.
+        done_cols = [
+            c for c in _get_table_columns(conn, "assays")
+            if c.endswith(DONE_COLUMN_SUFFIX)
+        ]
+        # One assay counts as "complete" iff every declared analysis is done.
+        if usable and done_cols:
+            placeholders = ", ".join("?" * len(usable))
+            sql = (
+                "SELECT "
+                + ", ".join(
+                    f"(SUM(CASE WHEN {_quote_ident(c)} IS NULL THEN 1 ELSE 0 END))"
+                    for c in done_cols
+                )
+                + f" FROM assays WHERE assay_id IN ({placeholders})"
+            )
+            null_counts = conn.execute(sql, list(usable)).fetchone()
+            # If any column has zero NULLs, every usable assay ran that analysis.
+            done = len(usable)
+            pending = 0
+            # Per-analysis breakdown.
+
+    print(f"Project: {project_dir}")
+    print(f"  Usable assays: {len(usable)} / {total}")
+    if analysis:
+        print(f"    Complete:    {done}")
+        print(f"    Pending:     {pending}")
+    n_qc = len(excluded['qc_failed_assays'])
+    n_censored = len(excluded['censored_assays'])
+    n_consent = len(excluded['consent_revoked_assays'])
+    n_excluded = total - len(usable)
+    print(f"  Excluded:      {n_excluded}")
+    if n_qc:
+        ids = ", ".join(excluded['qc_failed_assays'][:5])
+        more = f" (+{n_qc - 5} more)" if n_qc > 5 else ""
+        print(f"    QC-failed:   {n_qc}   ({ids}{more})")
+    if n_censored:
+        print(f"    Censored:    {n_censored}")
+    if n_consent:
+        pids = excluded['consent_revoked_patients']
+        ids = ", ".join(pids[:5])
+        more = f" (+{len(pids) - 5} more)" if len(pids) > 5 else ""
+        print(f"    Consent-rev: {n_consent}   (patients: {ids}{more})")
+
+
+def _status_by_analysis(
+    conn, done_by_level, counts_by_level,
+    *,
+    qc_on: bool = False,
+    include_censored: bool = False,
+    include_consent_revoked: bool = False,
+) -> list[dict]:
     rows = []
+    # When QC is on and we're filtering, scope `done` counts to the active
+    # set so percentages match the filtered totals.
+    active_by_level: dict[str, set[str] | None] = {
+        level: None for level in LEVEL_ORDER
+    }
+    if qc_on and not (include_censored and include_consent_revoked):
+        from casetrack_qc.reader import (
+            active_assay_ids as _active_assay_ids,
+            active_patient_ids as _active_patient_ids,
+            active_specimen_ids as _active_specimen_ids,
+        )
+        active_by_level = {
+            "patient": _active_patient_ids(
+                conn, include_censored=include_censored,
+                include_consent_revoked=include_consent_revoked),
+            "specimen": _active_specimen_ids(
+                conn, include_censored=include_censored,
+                include_consent_revoked=include_consent_revoked),
+            "assay": _active_assay_ids(
+                conn, include_censored=include_censored,
+                include_consent_revoked=include_consent_revoked),
+        }
+
     for level in LEVEL_ORDER:
         table = f"{level}s"
         total = counts_by_level[level]
+        key_col = f"{level}_id"
+        active = active_by_level[level]
         for done_col in done_by_level[level]:
-            (done,) = conn.execute(
-                f"SELECT COUNT(*) FROM {_quote_ident(table)} "
-                f"WHERE {_quote_ident(done_col)} IS NOT NULL"
-            ).fetchone()
+            if active is None:
+                (done,) = conn.execute(
+                    f"SELECT COUNT(*) FROM {_quote_ident(table)} "
+                    f"WHERE {_quote_ident(done_col)} IS NOT NULL"
+                ).fetchone()
+            elif not active:
+                done = 0
+            else:
+                placeholders = ", ".join("?" * len(active))
+                (done,) = conn.execute(
+                    f"SELECT COUNT(*) FROM {_quote_ident(table)} "
+                    f"WHERE {_quote_ident(done_col)} IS NOT NULL "
+                    f"AND {_quote_ident(key_col)} IN ({placeholders})",
+                    list(active),
+                ).fetchone()
             pct = round(100.0 * done / total, 1) if total else 0.0
             rows.append({
                 "analysis": done_col[: -len(DONE_COLUMN_SUFFIX)],
@@ -4846,6 +5235,57 @@ def cmd_validate_project(args):
                         f"{table}.{dc} has {has_data} completion(s) but no "
                         f"data column from analysis {analysis!r} in provenance"
                     )
+
+        # 4. v0.4 QC invariants.
+        from casetrack_qc.schema import qc_schema_exists as _qc_schema_exists
+        if _qc_schema_exists(conn):
+            from casetrack_qc.consent import (
+                consent_event_invariant_violations as _consent_violations,
+            )
+            for v in _consent_violations(conn):
+                issues.append(f"consent invariant: {v['message']}")
+
+            # 4b. Orphan active events: target entity missing.
+            for level in LEVEL_ORDER:
+                table = f"{level}s"
+                key = f"{level}_id"
+                orphans = conn.execute(
+                    "SELECT id, entity_id FROM qc_events "
+                    "WHERE level=? AND resolved_at IS NULL "
+                    f"AND entity_id NOT IN (SELECT {_quote_ident(key)} FROM {_quote_ident(table)})",
+                    (level,),
+                ).fetchall()
+                for eid, entity_id in orphans:
+                    issues.append(
+                        f"qc_events id={eid}: active event references "
+                        f"missing {level} {entity_id!r}"
+                    )
+
+            # 4c. qc_status ↔ active-events consistency. For every row,
+            # recompute the expected status from active events and compare
+            # against the materialized column.
+            from casetrack_qc.events import derive_status as _derive_status
+            for level in LEVEL_ORDER:
+                table = f"{level}s"
+                key = f"{level}_id"
+                rows = conn.execute(
+                    f"SELECT {_quote_ident(key)}, qc_status FROM {_quote_ident(table)}"
+                ).fetchall()
+                for entity_id, materialized in rows:
+                    active_kinds = [
+                        r[0] for r in conn.execute(
+                            "SELECT kind FROM qc_events "
+                            "WHERE level=? AND entity_id=? AND resolved_at IS NULL",
+                            (level, entity_id),
+                        ).fetchall()
+                    ]
+                    expected = _derive_status(active_kinds, level)
+                    if expected != materialized:
+                        issues.append(
+                            f"{table}.qc_status mismatch for {entity_id!r}: "
+                            f"materialized={materialized!r} vs "
+                            f"expected-from-events={expected!r}"
+                        )
     finally:
         conn.close()
 
@@ -5029,7 +5469,12 @@ Examples:
     p_append.add_argument("--allow-new", action="store_true",
                           help="[flat mode] Allow new sample IDs not in manifest (requires --yes)")
     p_append.add_argument("--yes", action="store_true",
-                          help="[flat mode] Confirm --allow-new additions non-interactively")
+                          help="Confirm --allow-new (flat) or --force-append-on-censored (v0.4)")
+    p_append.add_argument(
+        "--force-append-on-censored",
+        action="store_true",
+        help="[v0.4] Allow append on censored entities (requires --yes)",
+    )
 
     # ── status ──
     p_status = subparsers.add_parser(
@@ -5047,6 +5492,18 @@ Examples:
     )
     p_status.add_argument("--fmt", choices=["table", "tsv", "json"], default="table",
                           help="Output format")
+    p_status.add_argument(
+        "--usable", action="store_true",
+        help="[v0.4] Show usable vs excluded breakdown (proposal §8.1)",
+    )
+    p_status.add_argument(
+        "--include-censored", action="store_true",
+        help="[v0.4] Include QC-failed/censored in counts",
+    )
+    p_status.add_argument(
+        "--include-consent-revoked", action="store_true",
+        help="[v0.4] Include consent-revoked patients and their assays",
+    )
 
     # ── validate ──
     p_validate = subparsers.add_parser(
@@ -5188,6 +5645,10 @@ Examples:
     p_rerun.add_argument("--submit", action="store_true", help="Actually invoke sbatch (default: dry-run)")
     p_rerun.add_argument("--list-only", action="store_true", help="Print bare IDs, not sbatch commands")
     p_rerun.add_argument("--extra", help="Extra args appended to each sbatch command")
+    p_rerun.add_argument(
+        "--force-censored", action="store_true",
+        help="[v0.4] Include censored/consent-revoked entities (default: skip)",
+    )
 
     # ── export ──
     p_export = subparsers.add_parser(
@@ -5214,6 +5675,14 @@ Examples:
         "--sql",
         help="[project mode] Run an arbitrary SQL query (overrides --shape); "
              "the result is written to --output",
+    )
+    p_export.add_argument(
+        "--include-censored", action="store_true",
+        help="[v0.4] Include QC-failed/censored entities in export",
+    )
+    p_export.add_argument(
+        "--include-consent-revoked", action="store_true",
+        help="[v0.4] Include consent-revoked patients and their assays",
     )
 
     # ── register ──
