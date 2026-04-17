@@ -33,7 +33,7 @@ echo "==> [01/5] Preparing VISOR BEDs…"
 python3 "$SCRIPTS/01_prepare_visor_beds.py"
 
 echo
-echo "==> [02/5] Running VISOR HACk + LASeR for every specimen…"
+echo "==> [02/5] Running VISOR HACk + Badread + minimap2 for every specimen…"
 bash "$SCRIPTS/02_run_visor.sh"
 
 echo

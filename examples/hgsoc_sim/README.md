@@ -16,8 +16,9 @@ under `sandbox/hgsoc_sim/` (gitignored).
 
 ## Prerequisites
 
-- **Apptainer** (or Docker) — to run VISOR and Badread containers.
-- **curl, samtools, minimap2** — available as biocontainers if not native.
+- **Apptainer** (or Docker) — to run the four biocontainers (VISOR,
+  Badread, minimap2, samtools).
+- **curl** — for downloading chr17.
 - **Python 3.10+** with `pandas`, `pyyaml` for the config + summary scripts.
 - **casetrack** — `pip install -e . --user` from the repo root.
 
@@ -38,9 +39,9 @@ runnable on its own for debugging.
 
 | Step | Script                                      | Produces |
 |------|---------------------------------------------|----------|
-| 0    | `scripts/00_fetch_reference.sh`             | `sandbox/hgsoc_sim/ref/chr17_brca1.fa` — 1 Mb slice of GRCh38 chr17 covering BRCA1 |
+| 0    | `scripts/00_fetch_reference.sh`             | `sandbox/hgsoc_sim/ref/ref.fa` — multi-contig slice of GRCh38 (`chr17_brca1` + `chr17_tp53`) |
 | 1    | `scripts/01_prepare_visor_beds.py`          | per-patient HACk + LASeR BEDs under `sandbox/hgsoc_sim/cohort/<PATIENT>/{normal,tumor}/` |
-| 2    | `scripts/02_run_visor.sh`                   | per-specimen `sim.srt.bam` under `sandbox/hgsoc_sim/cohort/<PATIENT>/<SPECIMEN>/laser/` |
+| 2    | `scripts/02_run_visor.sh`                   | HACk → haplotype FASTAs → Badread R10.4.1 reads → minimap2 → `sim.srt.bam` |
 | 3    | `scripts/03_break_hgsoc_sim_02.sh`          | downsamples the `HGSOC_SIM_02` normal BAM to ~2× (triggers autoflag later) |
 | 4    | `scripts/04_summarize_mock.py`              | per-assay summary TSVs with `qc_pass` / `qc_fail_reason` columns |
 | 5    | `scripts/05_bootstrap_casetrack.py`         | `sandbox/hgsoc_sim/project/` — a v0.4 casetrack project with the cohort registered and summaries appended |
@@ -84,16 +85,18 @@ See `config.yaml` for the full spec.
 
 ## Tradeoffs / caveats
 
-- **Reads are R9.4.1 via pbsim2**, which is what VISOR LASeR ships with. For
-  modern R10.4.1 modeling you'd use Badread directly on the HACk haplotype
-  FASTAs — noted as a follow-up in `containers/README.md`.
+- **Reads are R10.4.1 via Badread** (`nanopore2023` error + qscore models).
+  VISOR HACk still drives haplotype construction; its bundled pbsim2
+  simulator (R9.4.1) is bypassed. See `containers/README.md` for the
+  read-mix math and purity weighting.
 - **WGS, not RNA.** The motivating HGSOC002 case in proposal 0002 is an
   ONT-RNA failure, but VISOR simulates DNA reads only. The QC path being
   exercised (append → autoflag → status --usable → cohort --pair-by) is
   identical.
-- **1 Mb chr17 slice** keeps everything under a minute of runtime.
-  Variants are placed inside BRCA1 and in the flanking non-coding region.
-  Extend `config.yaml` to add TP53 (chr17:7.6M) or CCNE1 (chr19:29.8M).
+- **Two slices, ~1.1 Mb total** (`chr17_brca1` 1 Mb + `chr17_tp53` 100 kb)
+  keep runtime under a minute. Extend `config.yaml` to add CCNE1
+  (chr19:29.8M) or any other region — the scripts loop over `reference.slices`
+  automatically.
 - **Don't treat the truth VCFs as production ground truth.** VISOR reports
   what it inserted; that's enough for a reproducibility check on the
   pipeline but not for variant-caller benchmarking.

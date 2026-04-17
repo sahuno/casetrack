@@ -12,26 +12,26 @@ Total disk: ~300 MB.
 CONTAINER_DIR="${CONTAINER_DIR:-$HOME/apps/containers}"
 mkdir -p "$CONTAINER_DIR"
 
-# VISOR — haplotype construction + long-read simulation.
+# VISOR — haplotype construction (HACk). LASeR's built-in long-read
+# simulation is NOT used; we drive reads via Badread for R10.4.1 fidelity.
 apptainer pull --dir "$CONTAINER_DIR" \
     visor_1.1.2.1.sif \
     docker://quay.io/biocontainers/visor:1.1.2.1--pyh7cba7a3_0
 
-# samtools — BAM indexing / downsampling for the "broken pair" step.
+# Badread — R10.4.1 ONT read simulation (nanopore2023 error + qscore models).
 apptainer pull --dir "$CONTAINER_DIR" \
-    samtools_1.21.sif \
-    docker://quay.io/biocontainers/samtools:1.21--h50ea8bc_0
+    badread_0.4.1.sif \
+    docker://quay.io/biocontainers/badread:0.4.1--pyhdfd78af_0
 
-# minimap2 — not used in the default VISOR-LASeR path (LASeR aligns
-# internally), but recommended if you swap in Badread for R10.4.1 reads.
+# minimap2 — aligner for the Badread FASTQs.
 apptainer pull --dir "$CONTAINER_DIR" \
     minimap2_2.28.sif \
     docker://quay.io/biocontainers/minimap2:2.28--he4a0461_0
 
-# Badread — optional, for R10.4.1 modelling (see "Follow-up" below).
+# samtools — sort / index / downsample.
 apptainer pull --dir "$CONTAINER_DIR" \
-    badread_0.4.1.sif \
-    docker://quay.io/biocontainers/badread:0.4.1--pyhdfd78af_0
+    samtools_1.21.sif \
+    docker://quay.io/biocontainers/samtools:1.21--h50ea8bc_0
 ```
 
 The demo scripts resolve images via `$CONTAINER_DIR` — export it in your
@@ -44,27 +44,38 @@ If you're on a dev laptop instead of IRIS, the same images work via Docker:
 
 ```bash
 docker pull quay.io/biocontainers/visor:1.1.2.1--pyh7cba7a3_0
-docker pull quay.io/biocontainers/samtools:1.21--h50ea8bc_0
-docker pull quay.io/biocontainers/minimap2:2.28--he4a0461_0
 docker pull quay.io/biocontainers/badread:0.4.1--pyhdfd78af_0
+docker pull quay.io/biocontainers/minimap2:2.28--he4a0461_0
+docker pull quay.io/biocontainers/samtools:1.21--h50ea8bc_0
 ```
 
 Set `RUNNER=docker` in your shell and the scripts will route through
 `docker run --rm -v $PWD:$PWD -w $PWD` instead of `apptainer exec`.
 
-## Follow-up — R10.4.1 reads via Badread
+## Pipeline overview — what each tool does
 
-VISOR LASeR ships with **pbsim2**, which models R9.4.1 ONT reads. For
-realistic R10.4.1 (matching the HGSOC cohort's chemistry), replace
-`02_run_visor.sh` with:
+| Tool      | Step  | Role |
+|-----------|-------|------|
+| VISOR HACk | 2.1 | turns the per-haplotype variant BEDs into two haplotype FASTAs |
+| Badread    | 2.2 | R10.4.1 read simulation per haplotype (`nanopore2023` models) |
+| Badread    | 2.3 | R10.4.1 normal-contamination reads from the raw reference (when purity < 100) |
+| minimap2   | 2.4 | aligns the merged FASTQs to the reference (`map-ont` preset) |
+| samtools   | 2.5 | sorts + indexes the resulting BAM |
 
-1. `VISOR HACk` to build the tumor/normal haplotype FASTAs (unchanged).
-2. `badread simulate --reference hackout/h1.fa --quantity 30x
-      --error_model nanopore2023 --qscore_model nanopore2023`
-      → per-haplotype FASTQ.
-3. Concat + shuffle haplotype FASTQs (weighted for tumor purity).
-4. `minimap2 -ax map-ont ref.fa reads.fq | samtools sort -o sim.srt.bam`.
+The read mix is weighted so total coverage = `coverage_x`:
+- each tumor haplotype contributes `coverage_x × purity / 200`
+- the reference contributes `coverage_x × (1 − purity/100)`
 
-Not wired up by default because pbsim2-R9.4.1 is sufficient for exercising
-the casetrack v0.4 QC paths; the realism upgrade matters for caller
-benchmarking, not for demoing the CLI.
+At `purity = 100`, no contamination reads are emitted.
+
+## Why not VISOR LASeR's built-in simulator?
+
+VISOR LASeR bundles pbsim2, which models R9.4.1 (ONT 2018-era) reads. The
+real HGSOC cohort this demo is patterned on uses R10.4.1 — ~2× better
+per-base accuracy and a different systematic error profile. Badread's
+`nanopore2023` models match that chemistry directly, so downstream tools
+(modkit, sniffles, etc.) behave closer to production.
+
+If you need a faster, container-free fallback, `VISOR LASeR` is still
+invokable from the same container and will produce usable R9.4.1 BAMs —
+swap the Step-2 section of `02_run_visor.sh` accordingly.
