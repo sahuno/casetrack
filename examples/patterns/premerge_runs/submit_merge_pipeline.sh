@@ -91,6 +91,29 @@ phase1_premerge_flagstat() {
     printf '%s\n' "${dep_jobs[@]}" | paste -sd: -
 }
 
+# ── Phase 2a (optional): subset_chr — restrict each merged BAM to one chr ────
+# Usage: CHR=chr17 bash ... subset_chr --submit
+phase2a_subset_chr() {
+    local upstream_dep="${1:-}"
+    : "${CHR:?subset_chr phase requires CHR (e.g. chr17)}"
+    local dep_jobs=()
+    while IFS=$'\t' read -r specimen_id; do
+        [[ -z "${specimen_id}" || "${specimen_id}" == "specimen_id" ]] && continue
+        local exports="SPECIMEN_ID=${specimen_id},PROJECT_DIR=${PROJECT_DIR},CHR=${CHR},DEMO_SCRIPTS_DIR=${DEMO_SCRIPTS_DIR},CASETRACK_BIN=${CASETRACK_BIN}"
+        [[ -n "${SAMTOOLS_CONTAINER:-}" ]] && exports+=",SAMTOOLS_CONTAINER=${SAMTOOLS_CONTAINER}"
+
+        local jid
+        jid=$(_dispatch_or_preview "subset_${CHR} ${specimen_id}" "${upstream_dep}" \
+            --chdir="${PROJECT_DIR}" --export=ALL,"${exports}" \
+            "${HERE}/run_subset_chr.sh")
+        [[ -n "${jid}" ]] && dep_jobs+=("${jid}")
+    done < <(
+        "${CASETRACK_BIN}" query --project-dir "${PROJECT_DIR}" --fmt tsv \
+            "SELECT DISTINCT specimen_id FROM specimens ORDER BY specimen_id"
+    )
+    printf '%s\n' "${dep_jobs[@]}" | paste -sd: -
+}
+
 # ── Phase 2: merge — one sbatch per specimen ─────────────────────────────────
 phase2_merge() {
     local upstream_dep="${1:-}"
@@ -122,6 +145,8 @@ phase3_modkit_merged() {
         local exports="SPECIMEN_ID=${specimen_id},PROJECT_DIR=${PROJECT_DIR},REF_FASTA=${REF_FASTA},DEMO_SCRIPTS_DIR=${DEMO_SCRIPTS_DIR},CASETRACK_BIN=${CASETRACK_BIN}"
         [[ -n "${MODKIT_CONTAINER:-}" ]] && exports+=",MODKIT_CONTAINER=${MODKIT_CONTAINER}"
         [[ -n "${CHR_LIMIT:-}" ]] && exports+=",CHR_LIMIT=${CHR_LIMIT}"
+        [[ -n "${BAM_COL:-}" ]] && exports+=",BAM_COL=${BAM_COL}"
+        [[ -n "${ANALYSIS_NAME:-}" ]] && exports+=",ANALYSIS_NAME=${ANALYSIS_NAME}"
 
         _dispatch_or_preview "modkit_merged ${specimen_id}" "${upstream_dep}" \
             --chdir="${PROJECT_DIR}" --export=ALL,"${exports}" \
@@ -137,6 +162,8 @@ case "${PHASE}" in
         phase1_premerge_flagstat ;;
     merge)
         phase2_merge ;;
+    subset_chr)
+        phase2a_subset_chr ;;
     modkit_merged)
         phase3_modkit_merged ;;
     all)

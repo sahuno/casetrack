@@ -25,7 +25,14 @@
 #   MODKIT_CONTAINER  — apptainer image with modkit
 #   CASETRACK_BIN     — default: casetrack on PATH
 #   MOD_BASES         — default: "5mC 5hmC"
-#   CHR_LIMIT         — e.g. "chr21" for demo runs; empty for whole-genome
+#   CHR_LIMIT         — e.g. "chr21" — passes --region to modkit; empty = WG
+#   BAM_COL           — specimens column holding the BAM path to run modkit on
+#                       (default: merged_bam_path). Set to chr17_bam_path to
+#                       run against the output of run_subset_chr.sh CHR=chr17.
+#   OUT_SUBDIR        — override the results subdirectory name
+#                       (default: modkit_merged, or modkit_{BAM_COL stem}).
+#   ANALYSIS_NAME     — casetrack analysis name (default: modkit_merged, or
+#                       modkit_{BAM_COL stem}).
 
 set -euo pipefail
 
@@ -38,25 +45,39 @@ CASETRACK_BIN="${CASETRACK_BIN:-casetrack}"
 MODKIT_CONTAINER="${MODKIT_CONTAINER:-}"
 MOD_BASES="${MOD_BASES:-5mC 5hmC}"
 CHR_LIMIT="${CHR_LIMIT:-}"
+BAM_COL="${BAM_COL:-merged_bam_path}"
+
+# Derive the default subdir + analysis name from BAM_COL so chr-subset runs
+# don't collide with the full-merged run on disk or in the casetrack schema.
+# Examples: BAM_COL=merged_bam_path → modkit_merged
+#           BAM_COL=chr17_bam_path   → modkit_chr17
+_col_stem="${BAM_COL%_bam_path}"
+if [[ "${_col_stem}" == "merged" ]]; then
+    _default_analysis="modkit_merged"
+else
+    _default_analysis="modkit_${_col_stem}"
+fi
+ANALYSIS_NAME="${ANALYSIS_NAME:-${_default_analysis}}"
+OUT_SUBDIR="${OUT_SUBDIR:-${ANALYSIS_NAME}}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-RESULTS_DIR="${PROJECT_DIR}/results/modkit_merged/${SPECIMEN_ID}"
+RESULTS_DIR="${PROJECT_DIR}/results/${OUT_SUBDIR}/${SPECIMEN_ID}"
 LOG_DIR="${PROJECT_DIR}/logs"
 mkdir -p "${RESULTS_DIR}" "${LOG_DIR}"
-LOG="${LOG_DIR}/modkit_merged_${SPECIMEN_ID}_${STAMP}.log"
+LOG="${LOG_DIR}/${ANALYSIS_NAME}_${SPECIMEN_ID}_${STAMP}.log"
 exec > >(tee -a "$LOG") 2>&1
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] === modkit_merged ${SPECIMEN_ID} ==="
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] === ${ANALYSIS_NAME} ${SPECIMEN_ID} ==="
 
-# ── Look up the merged BAM from the specimen row ──────────────────────────────
+# ── Look up the BAM path from the specimen row ────────────────────────────────
 BAM_PATH="$("${CASETRACK_BIN}" query --project-dir "${PROJECT_DIR}" --fmt tsv \
-    "SELECT merged_bam_path FROM specimens WHERE specimen_id = '${SPECIMEN_ID}'" \
+    "SELECT ${BAM_COL} FROM specimens WHERE specimen_id = '${SPECIMEN_ID}'" \
     | tail -n +2 | head -1 || true)"
 if [[ -z "${BAM_PATH}" || "${BAM_PATH}" == "None" ]]; then
-    echo "Error: specimens.${SPECIMEN_ID}.merged_bam_path is not set — run run_merge.sh first" >&2
+    echo "Error: specimens.${SPECIMEN_ID}.${BAM_COL} is not set — run the upstream analysis first" >&2
     exit 1
 fi
-echo "BAM_PATH (from specimens.merged_bam_path): ${BAM_PATH}"
+echo "BAM_PATH (from specimens.${BAM_COL}): ${BAM_PATH}"
 echo "REF_FASTA=${REF_FASTA}"
 
 if [[ -n "${MODKIT_CONTAINER}" ]]; then
@@ -120,7 +141,7 @@ cat "${SUMMARY_TSV}"
 "${CASETRACK_BIN}" append \
     --project-dir "${PROJECT_DIR}" \
     --level specimen \
-    --analysis modkit_merged \
+    --analysis "${ANALYSIS_NAME}" \
     --results "${SUMMARY_TSV}"
 echo "[Phase 3] Appended at specimen level."
 
