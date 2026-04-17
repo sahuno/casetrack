@@ -20,6 +20,7 @@ Author: Samuel Ahuno (ekwame001@gmail.com)
 from __future__ import annotations
 
 from casetrack_qc.censor import cmd_censor, cmd_qc_history, cmd_uncensor
+from casetrack_qc.cohort import cmd_cohort
 from casetrack_qc.migrate import cmd_migrate_qc
 from casetrack_qc.recover import recover_qc_action
 from casetrack_qc.schema import (
@@ -36,6 +37,7 @@ from casetrack_qc.cli import build_qc_subparsers, qc_command_dispatch
 
 __all__ = [
     "cmd_censor",
+    "cmd_cohort",
     "cmd_migrate_qc",
     "cmd_qc_history",
     "cmd_uncensor",
