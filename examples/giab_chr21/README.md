@@ -24,6 +24,25 @@ giab_chr21/
 The sample sheet has 4 rows — two GIAB samples (HG002, HG006) × two ONT
 flowcells each. All BAMs are restricted to chr21.
 
+## Quick start — path 3 (v0.4 QC / censoring / consent walk-through)
+
+Exercises every v0.4 feature — SLURM autoflag, manual censor, uncensor,
+qc-history, `status --usable`, `cohort --pair-by`, consent revocation
+with ethics-override gate, `_active` view, QC dashboard, validate, and
+recover round-trip — against a project populated by path 1. No cluster.
+
+```bash
+bash examples/giab_chr21/run_qc_demo.sh /tmp/giab_qc_demo/
+```
+
+The script invokes `run_mock_demo.sh` first if the project doesn't exist,
+then applies each v0.4 state transition in order and asserts the DB
+state along the way. It's a fresh-project walk-through (not idempotent
+on repeat runs) — delete `PROJECT_DIR` between runs. Full test coverage
+lives in `tests/test_giab_qc_demo.py` (13 assertions).
+
+Tracks [GH #14](https://github.com/sahuno/casetrack/issues/14).
+
 ## Quick start — path 1 (mock demo, no cluster)
 
 Populates a project end-to-end in under a minute. No actual analysis tooling
