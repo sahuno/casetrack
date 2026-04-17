@@ -33,6 +33,10 @@
 #                       (default: modkit_merged, or modkit_{BAM_COL stem}).
 #   ANALYSIS_NAME     — casetrack analysis name (default: modkit_merged, or
 #                       modkit_{BAM_COL stem}).
+#   BGZF              — if "true" (default), modkit writes bgzf-compressed
+#                       bedMethyl (<out>.bedMethyl.gz). Tabix-indexable and
+#                       ~4-5x smaller than plain text. Set to "false" to
+#                       keep the old plain-text behavior.
 
 set -euo pipefail
 
@@ -46,6 +50,7 @@ MODKIT_CONTAINER="${MODKIT_CONTAINER:-}"
 MOD_BASES="${MOD_BASES:-5mC 5hmC}"
 CHR_LIMIT="${CHR_LIMIT:-}"
 BAM_COL="${BAM_COL:-merged_bam_path}"
+BGZF="${BGZF:-true}"
 
 # Derive the default subdir + analysis name from BAM_COL so chr-subset runs
 # don't collide with the full-merged run on disk or in the casetrack schema.
@@ -87,7 +92,13 @@ else
 fi
 
 # ── Phase 1: modkit pileup ────────────────────────────────────────────────────
-BEDMETHYL="${RESULTS_DIR}/${SPECIMEN_ID}.bedMethyl"
+if [[ "${BGZF}" == "true" ]]; then
+    BEDMETHYL="${RESULTS_DIR}/${SPECIMEN_ID}.bedMethyl.gz"
+    BGZF_ARG="--bgzf"
+else
+    BEDMETHYL="${RESULTS_DIR}/${SPECIMEN_ID}.bedMethyl"
+    BGZF_ARG=""
+fi
 REGION_ARGS=""
 [[ -n "${CHR_LIMIT}" ]] && REGION_ARGS="--region ${CHR_LIMIT}"
 
@@ -98,6 +109,7 @@ ${MODKIT} pileup \
     --modified-bases ${MOD_BASES} \
     --cpg \
     ${REGION_ARGS} \
+    ${BGZF_ARG} \
     --threads "${SLURM_CPUS_PER_TASK:-8}"
 echo "[Phase 1] modkit pileup → ${BEDMETHYL}"
 
@@ -106,26 +118,28 @@ echo "[Phase 1] modkit pileup → ${BEDMETHYL}"
 # rename the column via --key-col in the TSV header).
 SUMMARY_TSV="${RESULTS_DIR}/summary.tsv"
 python3 - "${BEDMETHYL}" "${SPECIMEN_ID}" "${SUMMARY_TSV}" <<'PY'
-import statistics, sys
-from pathlib import Path
+import gzip, statistics, sys
 bed, spec, out = sys.argv[1], sys.argv[2], sys.argv[3]
+opener = gzip.open if bed.endswith(".gz") else open
 fracs, n_high = [], 0
-for line in Path(bed).read_text().splitlines():
-    if not line or line.startswith("#"):
-        continue
-    parts = line.split("\t")
-    if len(parts) < 11:
-        continue
-    mod, cov, frac = parts[3], parts[9], parts[10]
-    if mod != "m":
-        continue
-    try:
-        f = float(frac); c = int(cov)
-    except ValueError:
-        continue
-    fracs.append(f)
-    if c >= 5:
-        n_high += 1
+with opener(bed, "rt") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 11:
+            continue
+        mod, cov, frac = parts[3], parts[9], parts[10]
+        if mod != "m":
+            continue
+        try:
+            f = float(frac); c = int(cov)
+        except ValueError:
+            continue
+        fracs.append(f)
+        if c >= 5:
+            n_high += 1
 n = len(fracs)
 mean = round(sum(fracs) / (n * 100), 4) if n else 0.0
 med = round(statistics.median(fracs) / 100, 4) if n else 0.0
