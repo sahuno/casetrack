@@ -1,0 +1,127 @@
+name: hgsoc_sim-smoke
+
+# Lightweight smoke test for the examples/hgsoc_sim/ scaffold. Runs the
+# container-free steps (YAML → VISOR BED expansion) on every PR that
+# touches the demo. Does NOT run VISOR / Badread / minimap2 — those need
+# containers or a much larger runner image.
+#
+# Catches: config.yaml regressions, 01_prepare_visor_beds.py logic bugs,
+# unintended directory-layout changes. Runs in ~10s.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "examples/hgsoc_sim/**"
+      - ".github/workflows/hgsoc_sim.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "examples/hgsoc_sim/**"
+      - ".github/workflows/hgsoc_sim.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: hgsoc-sim-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: bed-expansion-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps (pyyaml only)
+        run: python -m pip install pyyaml
+
+      - name: Shell-lint the scripts
+        run: |
+          for s in examples/hgsoc_sim/scripts/*.sh examples/hgsoc_sim/run_demo.sh; do
+            bash -n "$s" && echo "OK: $s"
+          done
+
+      - name: Python-compile the scripts
+        run: |
+          python -m py_compile examples/hgsoc_sim/scripts/01_prepare_visor_beds.py
+          python -m py_compile examples/hgsoc_sim/scripts/04_summarize_mock.py
+          python -m py_compile examples/hgsoc_sim/scripts/05_bootstrap_casetrack.py
+
+      - name: Run 01_prepare_visor_beds.py into a tmpdir
+        run: |
+          python examples/hgsoc_sim/scripts/01_prepare_visor_beds.py \
+            --sandbox "${RUNNER_TEMP}/hgsoc_sim_smoke"
+
+      - name: Assert expected cohort shape
+        run: |
+          python <<'PY'
+          import sys, os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "hgsoc_sim_smoke" / "cohort"
+          # 3 patients, 5 specimens total (HGSOC_SIM_03 is tumor-only).
+          expected = {
+              ("HGSOC_SIM_01", "normal"), ("HGSOC_SIM_01", "tumor"),
+              ("HGSOC_SIM_02", "normal"), ("HGSOC_SIM_02", "tumor"),
+              ("HGSOC_SIM_03", "tumor"),
+          }
+          got = set()
+          for p in root.iterdir():
+              if not p.is_dir():
+                  continue
+              for s in p.iterdir():
+                  if s.is_dir():
+                      got.add((p.name, s.name))
+          assert got == expected, f"cohort shape drift: {got} != {expected}"
+
+          # Every specimen must have both haplotype HACk BEDs + LASeR BED.
+          for patient, specimen in expected:
+              spec = root / patient / specimen
+              for required in ("haplotype1.hack.bed",
+                               "haplotype2.hack.bed",
+                               "regions.laser.bed"):
+                  assert (spec / required).exists(), f"missing {spec}/{required}"
+
+          # HACk BEDs must be 6-col where non-empty; LASeR BEDs must be 5-col.
+          for bed in root.rglob("*.hack.bed"):
+              for line in bed.read_text().splitlines():
+                  if not line.strip():
+                      continue
+                  cols = line.split("\t")
+                  assert len(cols) == 6, f"{bed}: expected 6 cols, got {len(cols)}"
+          for bed in root.rglob("*.laser.bed"):
+              for line in bed.read_text().splitlines():
+                  if not line.strip():
+                      continue
+                  cols = line.split("\t")
+                  assert len(cols) == 5, f"{bed}: expected 5 cols, got {len(cols)}"
+
+          # Variant count sanity check per config.yaml. Sum across both
+          # haplotype BEDs for each specimen.
+          variants_per_spec = {
+              ("HGSOC_SIM_01", "normal"): 1,   # germline × 1
+              ("HGSOC_SIM_01", "tumor"):  3,   # germline + 2 somatic
+              ("HGSOC_SIM_02", "normal"): 1,
+              ("HGSOC_SIM_02", "tumor"):  2,
+              ("HGSOC_SIM_03", "tumor"):  3,
+          }
+          for (patient, specimen), expected_n in variants_per_spec.items():
+              spec = root / patient / specimen
+              h1 = [l for l in (spec / "haplotype1.hack.bed").read_text().splitlines()
+                    if l.strip()]
+              h2 = [l for l in (spec / "haplotype2.hack.bed").read_text().splitlines()
+                    if l.strip()]
+              got_n = len(h1) + len(h2)
+              assert got_n == expected_n, (
+                  f"{patient}/{specimen}: expected {expected_n} variants, got {got_n}"
+              )
+
+          print("OK: cohort shape, BED formats, and variant counts all verified.")
+          PY
