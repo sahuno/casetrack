@@ -4,6 +4,83 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-04-17
+
+QC / censoring / consent subsystem. Implements
+[proposal 0002](docs/proposals/0002-qc-events-and-censoring.md). New
+commands + QC-aware defaults on every existing read path. 522 pytest tests
+(112 new). Flat-manifest mode unchanged (still slated for removal in v1.0).
+
+### Added
+
+- **New subpackage `casetrack_qc/`** — hybrid layout next to the existing
+  single-file `casetrack.py`. Existing v0.3 commands live in the monolith
+  untouched; the new subsystem lives in its own package.
+- **`qc_events` table** — append-only audit log of every censor / uncensor /
+  migrate_qc action. Indexed by `(level, entity_id)` and by the active
+  subset. Every row links to a `provenance.jsonl` entry via `transaction_id`.
+- **Materialized `qc_status` columns** on `patients` / `specimens` / `assays`
+  for fast filters. Rebuildable from events via `casetrack recover`.
+- **Consent columns on `patients`** — `consent_status` (enum:
+  `consented`, `consented_limited_use`, `pending`, `revoked`, `withdrawn`,
+  `consent_expired`, `deceased_pre_consent`), `consent_date`,
+  `withdrawal_date`. Enforces the `consent_status='revoked'` ↔ active
+  `qc_events` invariant.
+- **`casetrack censor`** — manual or bulk censoring. Kinds default to the
+  ONT-HGSOC-leaning set in §0 #12. `--from FILE` does bulk import with
+  one provenance entry per event, all sharing one `transaction_id`.
+- **`casetrack uncensor`** — resolve an active event. Consent reversal
+  requires `--ethics-override --yes` AND a reason that mentions IRB ref /
+  re-consent / ISO date. Logs `action='ethics_override'` with `ethics: true`.
+- **`casetrack qc-history`** — per-entity or project-wide event list.
+- **`casetrack migrate-qc`** — one-shot v0.3 → v0.4 upgrade. Migrates a
+  legacy `qc_pass BOOLEAN` on assays into `qc_status` + `qc_events`, drops
+  the legacy column, appends the default `[qc]` block to `casetrack.toml`.
+  `--dry-run` previews the plan without touching the DB.
+- **`casetrack cohort`** — readiness summary (§8.2) and paired-design view
+  (§8.3). `--pair-by COL` partitions any `specimens` column into N buckets
+  (tumor/normal via `tissue_site`, longitudinal via `timepoint`, multi-
+  region, …). Status terminology: `complete`, `broken`, `incomplete`,
+  `singleton`. `--require N` for N-of-M partial completeness.
+- **SLURM auto-flag** — if a summary TSV contains `qc_pass` /
+  `qc_fail_reason` / `qc_warn`, `casetrack append` consumes them in the
+  same transaction, emitting `qc_events` with `source='slurm'` and
+  `created_by='slurm:$SLURM_JOB_ID'`.
+- **`_active` DuckDB view** on the `query` connection — same shape as `_`
+  but with the §4.4 cascade applied.
+- **`docs/MIGRATION_v0.3_to_v0.4.md`** — step-by-step upgrade guide.
+
+### Changed
+
+- **`casetrack init`** — adds the QC schema (table + columns) and the
+  `[qc]` TOML block as part of project creation.
+- **`casetrack append`** — strict-refuse on censored entities (exit 2);
+  `--force-append-on-censored --yes` override. Autoflag columns are
+  consumed, never promoted to analysis columns.
+- **`casetrack rerun`** — default skips censored / consent-revoked;
+  `--force-censored` includes them with a loud stderr warning.
+- **`casetrack status`** — new `--usable` breakdown (§8.1); default counts
+  exclude fail + consent-revoked; `--include-censored` /
+  `--include-consent-revoked` opt back in.
+- **`casetrack export`** — default excludes fail + consent-revoked and
+  prints a stderr audit line summarizing filters.
+- **`casetrack validate`** — now also checks the consent invariant, orphan
+  active events, and `qc_status` ↔ active-events consistency.
+- **`casetrack dashboard`** — QC chips next to the cohort metrics and a
+  dedicated "Excluded (active QC events)" section; no chips on v0.3-era
+  projects that haven't been migrated (backward-compatible).
+- **`casetrack recover`** — replays `censor`, `uncensor`, `ethics_override`,
+  `migrate_qc` provenance actions into byte-equivalent state.
+- **`setup.py`** — bumps version to 0.4.0 and installs the
+  `casetrack_qc` subpackage alongside the `casetrack` module.
+
+### Deferred (future proposals)
+
+- Per-analysis censoring (the "fine for modkit, bad for xtea on the same
+  assay" case) — whole-entity only in v0.4.
+- `assays.batch_id` first-class column + `batches` table —
+  `batch_effect_flagged` ships as a free-text-reason kind for now.
+
 ## [0.3.1] — 2026-04-16
 
 Docs, demo, and SLURM-wrapper polish. No library behavior changes; the

@@ -3730,7 +3730,13 @@ def _recover_append(conn: sqlite3.Connection, project_dir: Path,
     analysis = entry.get("analysis", "unknown")
 
     results = pd.read_csv(path, sep="\t")
-    analysis_cols = [c for c in results.columns if c != key_col]
+    # v0.4: strip autoflag columns so replay matches what the original append
+    # wrote to the DB (those columns never became analysis columns).
+    from casetrack_qc.autoflag import AUTOFLAG_COLUMNS as _QC_AUTOFLAG_COLS
+    analysis_cols = [
+        c for c in results.columns
+        if c != key_col and c not in _QC_AUTOFLAG_COLS
+    ]
     done_col = f"{analysis}{DONE_COLUMN_SUFFIX}"
     # Re-add columns that appear in entry.columns_added (fresh DB has base only).
     with begin_immediate(conn):
@@ -3856,6 +3862,7 @@ def cmd_dashboard_project(args):
     output_path = Path(args.output)
 
     conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    qc_info: dict = {}
     try:
         patients = conn.execute("SELECT * FROM patients ORDER BY patient_id").fetchall()
         patient_cols = [d[0] for d in conn.execute(
@@ -3870,6 +3877,17 @@ def cmd_dashboard_project(args):
             "SELECT * FROM assays LIMIT 0"
         ).description]
         done_by_level = _discover_done_columns(conn)
+
+        # v0.4 QC-aware dashboard section (proposal §11). Silently degrades on
+        # pre-migrate projects — the info dict just stays empty.
+        from casetrack_qc.schema import qc_schema_exists as _qc_schema_exists
+        if _qc_schema_exists(conn):
+            from casetrack_qc.reader import exclusion_breakdown as _exclusion_breakdown
+            qc_info = _exclusion_breakdown(conn)
+            qc_info["active_events"] = conn.execute(
+                "SELECT level, entity_id, kind, reason, source, created_at "
+                "FROM qc_events WHERE resolved_at IS NULL ORDER BY id"
+            ).fetchall()
     finally:
         conn.close()
 
@@ -3880,6 +3898,7 @@ def cmd_dashboard_project(args):
         specimens=[dict(zip(specimen_cols, r)) for r in specimens],
         assays=[dict(zip(assay_cols, r)) for r in assays],
         done_by_level=done_by_level,
+        qc_info=qc_info,
     )
     output_path.write_text(html_str)
 
@@ -3894,7 +3913,8 @@ def cmd_dashboard_project(args):
 
 def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
                                patients: list, specimens: list, assays: list,
-                               done_by_level: dict) -> str:
+                               done_by_level: dict,
+                               qc_info: dict | None = None) -> str:
     esc = html.escape
     project_name = schema["project"].get("name", project_dir.name)
     schema_v = schema["project"].get("schema_v", 1)
@@ -4053,6 +4073,17 @@ def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
            color: var(--muted); font-size: 12px; }}
   .meta span {{ white-space: nowrap; }}
   .meta b {{ color: var(--fg); font-weight: 500; }}
+  .qc-chips {{ margin: 4px 0 12px 0; display: flex; gap: 8px; flex-wrap: wrap; }}
+  .qc-chip {{ padding: 2px 10px; border-radius: 10px; font-size: 12px;
+              font-weight: 600; }}
+  .qc-chip-red {{ background: #fed7d7; color: #742a2a; }}
+  .qc-chip-amber {{ background: #feebc8; color: #7b341e; }}
+  .qc-chip-grey {{ background: var(--missing-bg); color: var(--muted); }}
+  table.qc-events {{ border-collapse: collapse; width: 100%; font-size: 12px;
+                     margin: 8px 0 20px 0; }}
+  table.qc-events th, table.qc-events td {{ padding: 4px 8px; text-align: left;
+                                             border-bottom: 1px solid var(--border); }}
+  table.qc-events th {{ background: #f7fafc; font-weight: 600; }}
   table.assays {{ border-collapse: collapse; margin: 4px 0 4px 18px;
                   font-size: 12px; }}
   table.assays th {{ padding: 6px 10px; text-align: left;
@@ -4086,15 +4117,64 @@ def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
       <div class="label">Avg analysis completion</div></div>
   </div>
 
+  {_qc_chips_html(qc_info)}
+
   <h2>Per-analysis completion (assay level)</h2>
   {"".join(per_analysis_html) if per_analysis_html
      else '<p class="muted">No assay-level analyses recorded yet.</p>'}
+
+  {_qc_excluded_html(qc_info)}
 
   <h2>Patients</h2>
   {"".join(body_sections) if body_sections
      else '<p class="muted">No patients registered yet.</p>'}
 </body></html>
 """
+
+
+def _qc_chips_html(qc_info: dict | None) -> str:
+    if not qc_info:
+        return ""
+    esc = html.escape
+    parts = []
+    nq = len(qc_info.get("qc_failed_assays", []))
+    nc = len(qc_info.get("censored_assays", []))
+    nr = len(qc_info.get("consent_revoked_patients", []))
+    if nr:
+        parts.append(f'<span class="qc-chip qc-chip-red">{nr} consent-revoked</span>')
+    if nq:
+        parts.append(f'<span class="qc-chip qc-chip-amber">{nq} QC-failed</span>')
+    if nc:
+        parts.append(f'<span class="qc-chip qc-chip-grey">{nc} censored</span>')
+    if not parts:
+        return ""
+    return f'<div class="qc-chips">{"".join(parts)}</div>'
+
+
+def _qc_excluded_html(qc_info: dict | None) -> str:
+    if not qc_info:
+        return ""
+    esc = html.escape
+    events = qc_info.get("active_events") or []
+    if not events:
+        return ""
+    rows = []
+    for level, entity_id, kind, reason, source, created_at in events:
+        rows.append(
+            "<tr>"
+            f"<td>{esc(level)}</td><td class='id'>{esc(entity_id)}</td>"
+            f"<td>{esc(kind)}</td><td class='muted small'>{esc(source)}</td>"
+            f"<td class='small'>{esc(str(created_at))}</td>"
+            f"<td class='muted small'>{esc(reason)}</td>"
+            "</tr>"
+        )
+    return (
+        '<h2>Excluded (active QC events)</h2>'
+        '<table class="qc-events">'
+        '<thead><tr><th>Level</th><th>Entity</th><th>Kind</th>'
+        '<th>Source</th><th>Created</th><th>Reason</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table>'
+    )
 
 
 def _dashboard_meta_cells(row: dict, *, patient_key: str) -> str:

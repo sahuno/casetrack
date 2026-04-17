@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 
 from casetrack_qc.censor import cmd_censor, cmd_qc_history, cmd_uncensor
+from casetrack_qc.cohort import cmd_cohort
 from casetrack_qc.migrate import cmd_migrate_qc
 
 
@@ -90,6 +91,27 @@ def build_qc_subparsers(subparsers) -> None:
         help="Print the plan, make no changes",
     )
 
+    # ── cohort ──
+    p_cohort = subparsers.add_parser(
+        "cohort",
+        help="[v0.4] Cohort readiness summary + paired-design view",
+    )
+    p_cohort.add_argument("--project-dir", required=True)
+    p_cohort.add_argument("--pair-by",
+                          help="Column on specimens to partition by (e.g. tissue_site)")
+    p_cohort.add_argument("--assay-type",
+                          help="Scope pair-by readiness to one assay_type")
+    p_cohort.add_argument("--partition-order",
+                          help="Comma-separated canonical order (e.g. 'tumor,normal')")
+    p_cohort.add_argument("--require", type=int,
+                          help="Report patients satisfying >=N passing partitions")
+    p_cohort.add_argument("--complete-only", action="store_true")
+    p_cohort.add_argument("--broken-only", action="store_true")
+    p_cohort.add_argument("--incomplete-only", action="store_true")
+    p_cohort.add_argument("--singleton-only", action="store_true")
+    p_cohort.add_argument("--fmt", choices=["table", "tsv", "json", "md"],
+                          default="table")
+
 
 def qc_command_dispatch() -> dict:
     """Command-name → function map that ``casetrack.main()`` merges into its own."""
@@ -98,4 +120,5 @@ def qc_command_dispatch() -> dict:
         "uncensor": cmd_uncensor,
         "qc-history": cmd_qc_history,
         "migrate-qc": cmd_migrate_qc,
+        "cohort": cmd_cohort,
     }

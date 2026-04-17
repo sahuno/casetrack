@@ -159,8 +159,66 @@ and exact SQL.
 | `export`         | Export to xlsx / csv / json / parquet / tsv (`--shape tables\|joined` in v0.3) |
 | `doctor`         | **v0.3** — concurrency stress test on the project's filesystem               |
 | `recover`        | **v0.3** — rebuild `casetrack.db` by replaying `provenance.jsonl`            |
+| `censor`         | **v0.4** — record a QC failure / consent revocation on an entity             |
+| `uncensor`       | **v0.4** — resolve an active qc_events row (consent reversal gated)          |
+| `qc-history`     | **v0.4** — full QC event history for one entity (or all active)              |
+| `migrate-qc`     | **v0.4** — one-shot: add QC schema + port a legacy `qc_pass` column          |
+| `cohort`         | **v0.4** — cohort readiness summary + paired-design view (`--pair-by`)       |
 
 `casetrack <cmd> --help` for the full option list on any subcommand.
+
+### v0.4 QC workflow (HGSOC002 worked example)
+
+Concrete scenario from proposal 0002 §4.5: patient HGSOC002's normal
+ONT-RNA-Seq failed library prep; the matching tumor ONT-RNA passed; both
+halves of HGSOC006's pair are fine. Whole-cohort readiness should surface
+the broken pair so you can decide whether to drop the intact tumor half.
+
+```bash
+# 1. Flag the failed assay.
+casetrack censor --project-dir hgsoc_2026 \
+    --level assay --id HGSOC002-normal-ONT-RNA \
+    --kind library_prep_failed \
+    --reason "cDNA yield 8 ng, need >100"
+
+# 2. A subsequent `append` on that assay now exits 2 — protects cluster hours:
+casetrack append --project-dir hgsoc_2026 \
+    --results modkit.tsv --analysis modkit
+# Error: 1 assay(s) in modkit.tsv are censored: ['HGSOC002-normal-ONT-RNA']
+#        ...
+#        - If you need to land data anyway (rare): --force-append-on-censored --yes
+
+# 3. See what's usable vs excluded.
+casetrack status --project-dir hgsoc_2026 --usable
+#   Usable assays: 11 / 12
+#   Excluded:      1
+#     QC-failed:   1   (HGSOC002-normal-ONT-RNA)
+
+# 4. Paired-design readiness: HGSOC002 is "broken", HGSOC006 is "complete".
+casetrack cohort --project-dir hgsoc_2026 \
+    --assay-type ONT-RNA-Seq --pair-by tissue_site
+#   PATIENT     TUMOR    NORMAL   GROUP STATUS
+#   HGSOC002    pass     FAIL     broken
+#   HGSOC006    pass     pass     complete
+
+# 5. After re-sequencing, reverse the flag — uncensor is an append-only
+#    write (resolved_at + resolved_by + resolved_reason on the same row).
+casetrack uncensor --project-dir hgsoc_2026 \
+    --level assay --id HGSOC002-normal-ONT-RNA \
+    --reason "re-sequenced on 2026-04-10 batch, passes"
+```
+
+**SLURM auto-flag.** If a summary TSV contains `qc_pass` / `qc_fail_reason`
+/ `qc_warn` columns, `casetrack append` consumes them and emits
+`qc_events` rows inside the same transaction — no extra CLI call needed.
+
+**Consent revocation.** `casetrack censor --level patient --kind
+consent_revoked` flips the patient's `consent_status`, sets
+`withdrawal_date`, and cascades exclusion at read. `casetrack uncensor`
+refuses to resolve a `consent_revoked` event unless `--ethics-override
+--yes` is passed AND the `--reason` mentions IRB / re-consent / an ISO
+date. See `docs/MIGRATION_v0.3_to_v0.4.md` for the upgrade path and
+proposal 0002 for the full design.
 
 ### Representative examples
 
