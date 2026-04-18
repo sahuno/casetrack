@@ -44,15 +44,16 @@ jobs:
 
       - name: Shell-lint the scripts
         run: |
+          # Catches all numbered steps (00, 00b, 00c, 01, 02, …) + the driver.
           for s in examples/hgsoc_sim/scripts/*.sh examples/hgsoc_sim/run_demo.sh; do
             bash -n "$s" && echo "OK: $s"
           done
 
       - name: Python-compile the scripts
         run: |
-          python -m py_compile examples/hgsoc_sim/scripts/01_prepare_visor_beds.py
-          python -m py_compile examples/hgsoc_sim/scripts/04_summarize_mock.py
-          python -m py_compile examples/hgsoc_sim/scripts/05_bootstrap_casetrack.py
+          for py in examples/hgsoc_sim/scripts/*.py; do
+            python -m py_compile "$py"
+          done
 
       - name: Run 01_prepare_visor_beds.py into a tmpdir
         run: |
