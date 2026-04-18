@@ -65,11 +65,27 @@ set -euo pipefail
 #     falls back to `VISOR` on PATH if present.
 
 BIND="/data1/greenbab"
+
+# VISOR HACk shells out to bedtools which isn't in the visor SIF. We bind-
+# mount a host conda env that ships bedtools and prepend its bin/ to PATH
+# inside the container. Override BEDTOOLS_ENV if bedtools lives elsewhere.
+: "${BEDTOOLS_ENV:=/home/ahunos/miniforge3/envs/snakemake}"
+
 _probe() {  # $1=tool, $2=sif_env_path (optional)
     if command -v "$1" >/dev/null 2>&1; then
         echo "$1"
     elif [[ -n "${2:-}" && -s "$2" ]]; then
         echo "apptainer exec --bind $BIND $2 $1"
+    else
+        echo "__MISSING__"
+    fi
+}
+
+_probe_visor() {  # VISOR needs bedtools on PATH inside the container
+    if command -v VISOR >/dev/null 2>&1; then
+        echo "VISOR"
+    elif [[ -n "${VISOR_SIF:-}" && -s "$VISOR_SIF" && -x "$BEDTOOLS_ENV/bin/bedtools" ]]; then
+        echo "apptainer exec --bind $BIND --bind ${BEDTOOLS_ENV}:/opt/bt_env --env PATH=/opt/bt_env/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin $VISOR_SIF VISOR"
     else
         echo "__MISSING__"
     fi
@@ -82,7 +98,7 @@ BADREAD_SIF="$CONTAINER_DIR/$(python3 -c "import yaml; print(yaml.safe_load(open
 MINIMAP_SIF="$CONTAINER_DIR/$(python3 -c "import yaml; print(yaml.safe_load(open('$HPC_CONFIG'))['containers']['minimap2'])")"
 SAMTOOLS_SIF=$(python3 -c "import yaml; print(yaml.safe_load(open('$HPC_CONFIG'))['containers']['ont_shared'])")
 
-VISOR_CMD=$(_probe VISOR "$VISOR_SIF")
+VISOR_CMD=$(_probe_visor)
 BADREAD_CMD=$(_probe badread "$BADREAD_SIF")
 MINIMAP_CMD=$(_probe minimap2 "$MINIMAP_SIF")
 SAMTOOLS_CMD=$(_probe samtools "$SAMTOOLS_SIF")
