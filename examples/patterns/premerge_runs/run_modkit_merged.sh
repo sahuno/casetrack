@@ -37,6 +37,13 @@
 #                       bedMethyl (<out>.bedMethyl.gz). Tabix-indexable and
 #                       ~4-5x smaller than plain text. Set to "false" to
 #                       keep the old plain-text behavior.
+#   HEADER            — if "true" (default), modkit emits a `#`-prefixed
+#                       column header as the first line (modkit --header).
+#                       Matches the project convention that BED-like files
+#                       start with a header; downstream parsers (pandas
+#                       read_csv(comment='#'), bedtools, etc.) ignore it.
+#                       Set to "false" to suppress for tools that don't
+#                       cope with it.
 
 set -euo pipefail
 
@@ -51,6 +58,7 @@ MOD_BASES="${MOD_BASES:-5mC 5hmC}"
 CHR_LIMIT="${CHR_LIMIT:-}"
 BAM_COL="${BAM_COL:-merged_bam_path}"
 BGZF="${BGZF:-true}"
+HEADER="${HEADER:-true}"
 
 # Derive the default subdir + analysis name from BAM_COL so chr-subset runs
 # don't collide with the full-merged run on disk or in the casetrack schema.
@@ -101,6 +109,8 @@ else
 fi
 REGION_ARGS=""
 [[ -n "${CHR_LIMIT}" ]] && REGION_ARGS="--region ${CHR_LIMIT}"
+HEADER_ARG=""
+[[ "${HEADER}" == "true" ]] && HEADER_ARG="--header"
 
 ${MODKIT} pileup \
     "${BAM_PATH}" \
@@ -110,6 +120,7 @@ ${MODKIT} pileup \
     --cpg \
     ${REGION_ARGS} \
     ${BGZF_ARG} \
+    ${HEADER_ARG} \
     --threads "${SLURM_CPUS_PER_TASK:-8}"
 echo "[Phase 1] modkit pileup → ${BEDMETHYL}"
 
