@@ -18,7 +18,6 @@ set -euo pipefail
 : "${CASETRACK_BIN:?run_attach_bams: CASETRACK_BIN required}"
 
 TSV=$(mktemp)
-trap 'rm -f "$TSV"' EXIT
 
 printf "assay_id\tbam_path\n" > "$TSV"
 
@@ -40,4 +39,6 @@ cat "$TSV"
     --analysis attach_bams \
     --results "$TSV"
 
+rm -f "$TSV"
 echo "[attach_bams] done."
+exit 0

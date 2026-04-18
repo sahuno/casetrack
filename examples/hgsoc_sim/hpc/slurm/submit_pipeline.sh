@@ -288,9 +288,19 @@ case "$PHASE" in
         [[ -n "$dep_scrna" ]] && summary_dep="${dep_modkit}:${dep_scrna}"
         phase_summary "$summary_dep"
         ;;
+    resume)
+        # Resume after synth + attach_bams already landed their data.
+        # Starts at flagstat (no upstream dep), chains merge → modkit →
+        # summary. Assumes bam_path is populated on each assay row and
+        # scRNA metrics are already appended (or intentionally skipped).
+        dep_flag=$(phase_flagstat "")
+        dep_merge=$(phase_merge "$dep_flag")
+        dep_modkit=$(phase_modkit "$dep_merge")
+        phase_summary "$dep_modkit"
+        ;;
     *)
         echo "Unknown phase: $PHASE" >&2
-        echo "Usage: PROJECT_DIR=... SANDBOX=... bash $0 {plan|synth|qc|merge|modkit|scrna|summary|all} [--submit]" >&2
+        echo "Usage: PROJECT_DIR=... SANDBOX=... bash $0 {plan|synth|qc|merge|modkit|scrna|summary|all|resume} [--submit]" >&2
         exit 1
         ;;
 esac
