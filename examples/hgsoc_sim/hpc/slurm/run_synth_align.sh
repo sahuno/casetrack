@@ -168,11 +168,11 @@ for i in 1 2; do
     [[ -s "$hap_fa" ]] || continue
     "${BADREAD[@]}" simulate \
         --reference "$hap_fa" \
-        --quantity "${hap_bp}bp" \
+        --quantity "${hap_cov}x" \
         --seed $((SEED + i - 1)) \
         --error_model nanopore2023 \
         --qscore_model nanopore2023 \
-        --identity 95,3,99 \
+        --identity 95,99,3 \
         --length 15000,13000 \
         >> "$FASTQ"
 done
@@ -181,11 +181,11 @@ done
 if [[ "${NO_PURITY_MIX:-}" != "true" && "$norm_bp" -gt 0 ]]; then
     "${BADREAD[@]}" simulate \
         --reference "$REF_FA" \
-        --quantity "${norm_bp}bp" \
+        --quantity "${norm_cov}x" \
         --seed $((SEED + 100)) \
         --error_model nanopore2023 \
         --qscore_model nanopore2023 \
-        --identity 95,3,99 \
+        --identity 95,99,3 \
         --length 15000,13000 \
         >> "$FASTQ"
 fi

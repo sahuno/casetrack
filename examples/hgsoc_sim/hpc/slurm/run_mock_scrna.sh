@@ -4,7 +4,7 @@
 #SBATCH --partition=componc_cpu
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=2G
-#SBATCH --time=00:10:00
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/mock_scrna_%A_%a.out
 #SBATCH --error=logs/mock_scrna_%A_%a.err
 #
