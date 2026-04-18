@@ -1,0 +1,96 @@
+# hgsoc_sim/hpc — HPC-facing overlay on the parent cohort.
+#
+# Reuses the parent directory's `config.yaml` verbatim for cohort / variants /
+# reference slices. This file adds only the HPC-specific knobs: per-specimen
+# flowcell-run count, per-assay SLURM resources, container paths, and the
+# multi-assay mix (ONT_WGS + scRNA).
+
+# ── Pointer to the cohort definition ─────────────────────────────────────────
+# Kept in the parent so the 3-patient sim logic (BRCA1 + TP53, complete pair /
+# broken pair / singleton) stays in one place.
+parent_config: "../config.yaml"
+
+# ── Flowcell-run count per specimen ──────────────────────────────────────────
+# Two runs per specimen so the pre-merge → merge → modkit pattern
+# (examples/patterns/premerge_runs/) exercises end-to-end. Each run is a
+# distinct Badread seed, same coverage as the specimen's total divided by
+# the run count.
+flowcell_runs_per_specimen: 2
+
+# ── Multi-assay mix ──────────────────────────────────────────────────────────
+# Each specimen gets one assay of each type. ONT_WGS goes through real
+# VISOR + Badread + minimap2; scRNA is deterministic mocks (VISOR doesn't
+# simulate RNA). Both are registered in casetrack as assays under their
+# specimen.
+assays:
+  - type: ONT                 # matches hgsoc template assay_type enum
+    subtype: WGS              # free-text (on the assay row via metadata)
+    kind: real                # drives real synthesis
+    flowcell_runs: 2          # pre-merge + merge pattern
+  - type: scRNA
+    subtype: RNA              # 10x Chromium-style
+    kind: mock                # no synthesis; hash-deterministic summary
+    flowcell_runs: 1
+
+# ── Container images ─────────────────────────────────────────────────────────
+# Pulled per examples/hgsoc_sim/containers/README.md — these paths are the
+# IRIS defaults. Override with CONTAINER_DIR env var.
+containers:
+  # Fallbacks only — run_synth_align.sh prefers native binaries when
+  # they're on PATH. On IRIS the snakemake env at
+  # /home/ahunos/miniforge3/envs/snakemake/bin/ ships badread, minimap2,
+  # and samtools natively; containers kick in when PATH resolution fails.
+  dir: /data1/greenbab/users/ahunos/apps/containers
+  # VISOR isn't in the snakemake env, so we need the container. The
+  # group-shared image works and sidesteps the quay.io rate limits.
+  visor_sif: /data1/greenbab/software/images/visor_latest.sif
+  badread: badread_0.4.1.sif
+  minimap2: minimap2_2.28.sif
+  # samtools + modkit come from the shared onttools image (newer than the
+  # biocontainers samtools release and always on-cluster).
+  ont_shared: /data1/greenbab/software/images/onttools_v3.10.sif
+
+# ── SLURM resource profile ───────────────────────────────────────────────────
+# Sized for the 1.1 Mb chr17 slice at 25–35× coverage. Real BAMs come out
+# around 100–200 MB per flowcell run, so merge/modkit land fast.
+slurm:
+  account: greenbab
+  partition: componc_cpu
+  jobs:
+    synth_align:          # VISOR HACk → Badread → minimap2 → sort+index
+      cpus: 16
+      mem: 32G
+      time: "02:00:00"
+    premerge_flagstat:    # per-assay pre-merge QC (reuses patterns/premerge_runs)
+      cpus: 2
+      mem: 4G
+      time: "00:30:00"
+    merge_ont:            # samtools merge on 2 flowcell-runs per specimen
+      cpus: 4
+      mem: 8G
+      time: "00:30:00"
+    modkit_merged:        # modkit pileup on the merged BAM
+      cpus: 16
+      mem: 32G
+      time: "02:00:00"
+    mock_scrna:           # deterministic mock summary
+      cpus: 1
+      mem: 2G
+      time: "00:10:00"
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+# Sandbox lives under /data1/greenbab/users/<you>/ by default. Override via
+# SANDBOX env.
+paths:
+  sandbox_default: /data1/greenbab/users/ahunos/casetrack_projects/hgsoc_sim_hpc
+  project_subdir: project        # casetrack project lives at $SANDBOX/project
+  synth_subdir: synth            # intermediates under $SANDBOX/synth/<patient>/<specimen>/<run>/
+  cohort_subdir: cohort          # VISOR BEDs under $SANDBOX/cohort/<patient>/<specimen>/
+  ref_subdir: ref                # reference FASTA
+
+# ── Autoflag thresholds ──────────────────────────────────────────────────────
+# Conservative for the 1.1 Mb simulated region. Low enough that only the
+# deliberately-broken HGSOC_SIM_02 normal (downsampled to ~2×) flags.
+qc_thresholds:
+  min_total_reads: 500          # ~5× coverage on 1.1 Mb at 2 kb N50
+  min_mapped_pct: 95.0
