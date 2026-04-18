@@ -32,6 +32,20 @@ CASETRACK_BIN="${CASETRACK_BIN:-casetrack}"
 OUT_DIR="${OUT_DIR:-$PROJECT_DIR/results/mock_scrna/$ASSAY_ID}"
 mkdir -p "$OUT_DIR" "$PROJECT_DIR/logs"
 
+# Idempotency: if this assay is already censored (e.g. from a prior autoflag
+# run that landed qc_pass=false), casetrack's strict-refuse will reject a
+# fresh append. That's the correct safety in production — the operator must
+# `casetrack uncensor` before re-landing data — but it deadlocks a simple
+# re-run. Treat "already fail" as a clean skip so the afterok DAG stays
+# unblocked; the existing row + qc_event remain authoritative.
+qc_status=$("$CASETRACK_BIN" query --project-dir "$PROJECT_DIR" --fmt tsv \
+    "SELECT qc_status FROM proj.assays WHERE assay_id='$ASSAY_ID'" \
+    2>/dev/null | tail -n +2 | head -1)
+if [[ "$qc_status" == "fail" || "$qc_status" == "censored" ]]; then
+    echo "[$(date '+%F %T')] $ASSAY_ID qc_status=$qc_status — skipping re-append; prior data + qc_event preserved."
+    exit 0
+fi
+
 SUMMARY_TSV="$OUT_DIR/summary.tsv"
 python3 "$SCRIPTS_DIR/mock_scrna_summary.py" \
     --assay-id "$ASSAY_ID" \
