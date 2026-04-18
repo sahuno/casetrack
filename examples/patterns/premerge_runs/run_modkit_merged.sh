@@ -114,12 +114,14 @@ ${MODKIT} pileup \
 echo "[Phase 1] modkit pileup → ${BEDMETHYL}"
 
 # ── Phase 2: summarize ────────────────────────────────────────────────────────
-# Reuse the giab_chr21 summarizer — it reads specimen_id from --assay-id (we
-# rename the column via --key-col in the TSV header).
+# Output columns are prefixed by `${_col_stem}` (derived from BAM_COL) per the
+# option-2 analysis-scoped convention: modkit_merged writes merged_n_cpg_sites,
+# modkit_chr17 writes chr17_n_cpg_sites, etc. Keeps two modkit analyses on
+# the same specimens table from clobbering each other via fill-only COALESCE.
 SUMMARY_TSV="${RESULTS_DIR}/summary.tsv"
-python3 - "${BEDMETHYL}" "${SPECIMEN_ID}" "${SUMMARY_TSV}" <<'PY'
+python3 - "${BEDMETHYL}" "${SPECIMEN_ID}" "${_col_stem}" "${SUMMARY_TSV}" <<'PY'
 import gzip, statistics, sys
-bed, spec, out = sys.argv[1], sys.argv[2], sys.argv[3]
+bed, spec, prefix, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 opener = gzip.open if bed.endswith(".gz") else open
 fracs, n_high = [], 0
 with opener(bed, "rt") as fh:
@@ -144,10 +146,13 @@ n = len(fracs)
 mean = round(sum(fracs) / (n * 100), 4) if n else 0.0
 med = round(statistics.median(fracs) / 100, 4) if n else 0.0
 pct_high = round(100.0 * n_high / n, 2) if n else 0.0
+cols = ["specimen_id",
+        f"{prefix}_n_cpg_sites", f"{prefix}_mean_meth",
+        f"{prefix}_median_meth", f"{prefix}_pct_high_conf"]
 with open(out, "w") as f:
-    f.write("specimen_id\tn_cpg_sites\tmean_meth\tmedian_meth\tpct_high_conf\n")
+    f.write("\t".join(cols) + "\n")
     f.write(f"{spec}\t{n}\t{mean}\t{med}\t{pct_high}\n")
-print(f"Wrote {out} (n_cpg={n}, mean_meth={mean})")
+print(f"Wrote {out} (n_cpg={n}, mean_meth={mean}, prefix={prefix})")
 PY
 cat "${SUMMARY_TSV}"
 

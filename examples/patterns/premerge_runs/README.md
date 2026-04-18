@@ -51,6 +51,30 @@ premerge_runs/
 └── README.md                        # you are here
 ```
 
+## Column naming convention (analysis-scoped)
+
+Every specimen-level analysis in this pattern prefixes its metric columns
+with its own natural scope so two analyses sharing the same specimens
+table never collide under the default fill-only COALESCE semantics:
+
+| Analysis | Writes columns |
+|---|---|
+| `merge` (run_merge.sh) | `merged_bam_path`, `merged_n_input_bams`, `merged_total_reads`, `merged_mapped_reads`, `merged_mapped_pct` |
+| `subset_chr17` (run_subset_chr.sh, CHR=chr17) | `chr17_bam_path`, `chr17_total_reads`, `chr17_mapped_reads` |
+| `modkit_merged` (BAM_COL=merged_bam_path) | `merged_n_cpg_sites`, `merged_mean_meth`, `merged_median_meth`, `merged_pct_high_conf` |
+| `modkit_chr17` (BAM_COL=chr17_bam_path) | `chr17_n_cpg_sites`, `chr17_mean_meth`, `chr17_median_meth`, `chr17_pct_high_conf` |
+
+**Why**: casetrack's default `append` semantics are fill-only (`SET col =
+COALESCE(col, ?)`), which protects concurrent SLURM array tasks from racing.
+But two analyses that both write a generic column like `n_cpg_sites` end up
+with the first-writer's values stuck — running the full-genome modkit after
+a chr17 demo will silently preserve the chr17 number. Prefixing by scope
+makes this impossible by construction.
+
+Exceptions (deliberately unprefixed): `qc_pass`, `qc_fail_reason`, `qc_warn`
+— these are v0.4 autoflag columns consumed by `casetrack append` by exact
+name to emit `qc_events` rows (proposal 0002 §0 #4).
+
 ## Usage — happy path
 
 ```bash

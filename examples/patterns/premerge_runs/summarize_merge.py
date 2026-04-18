@@ -3,13 +3,17 @@
 `casetrack append --level specimen --analysis merge` consumes.
 
 Reads a samtools flagstat run on the merged BAM (the merge's own QC)
-plus the list of input BAM paths. Output columns:
-  specimen_id, merged_bam_path, n_input_bams, total_reads, mapped_reads,
-  mapped_pct, qc_pass, qc_fail_reason, qc_warn
+plus the list of input BAM paths. Output columns (all prefixed `merged_`
+per the option-2 analysis-scoped convention — see the premerge_runs
+README — so other specimen-level analyses can't collide on generic
+names like 'total_reads' or 'mapped_pct'):
+  specimen_id, merged_bam_path, merged_n_input_bams, merged_total_reads,
+  merged_mapped_reads, merged_mapped_pct,
+  qc_pass, qc_fail_reason, qc_warn
 
-qc_pass is false if the merged BAM looks catastrophically broken
-(zero reads, mapped_pct below threshold) — same autoflag semantics as
-the pre-merge summarizer.
+qc_pass / qc_fail_reason / qc_warn are unprefixed because they are the
+v0.4 autoflag convention (proposal 0002 §0 #4) and casetrack's append
+path consumes them by exact name to emit qc_events rows.
 
 Author: Samuel Ahuno <ekwame001@gmail.com>
 Date:   2026-04-17
@@ -46,16 +50,17 @@ def main():
     flags = autoflag(stats, min_total_reads=args.min_total_reads,
                      min_mapped_pct=args.min_mapped_pct)
 
-    cols = ["specimen_id", "merged_bam_path", "n_input_bams",
-            "total_reads", "mapped_reads", "mapped_pct",
+    cols = ["specimen_id",
+            "merged_bam_path", "merged_n_input_bams",
+            "merged_total_reads", "merged_mapped_reads", "merged_mapped_pct",
             "qc_pass", "qc_fail_reason", "qc_warn"]
     row = {
         "specimen_id": args.specimen_id,
         "merged_bam_path": args.merged_bam_path,
-        "n_input_bams": len(inputs),
-        "total_reads": stats["total_reads"],
-        "mapped_reads": stats["mapped_reads"],
-        "mapped_pct": stats["mapped_pct"],
+        "merged_n_input_bams": len(inputs),
+        "merged_total_reads": stats["total_reads"],
+        "merged_mapped_reads": stats["mapped_reads"],
+        "merged_mapped_pct": stats["mapped_pct"],
         "qc_pass": flags["qc_pass"],
         "qc_fail_reason": flags["qc_fail_reason"],
         "qc_warn": flags["qc_warn"],
