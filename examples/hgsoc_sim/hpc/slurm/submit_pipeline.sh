@@ -183,8 +183,11 @@ phase_flagstat() {
         exports+=",MIN_TOTAL_READS=500,MIN_MAPPED_PCT=95.0"
 
         local jid
+        # Override pattern's --time=00:30:00; IRIS Prolog has been seen to
+        # burn 20-25 min before user code starts, leaving too little wall.
         jid=$(_dispatch "flagstat $assay_id" "$upstream" \
             --chdir="$PROJECT_DIR" --export=ALL,"$exports" \
+            --time=01:30:00 \
             "$PATTERN_DIR/run_premerge_flagstat.sh")
         [[ -n "$jid" ]] && deps+=("$jid")
     done < <(_ont_assays)
@@ -204,9 +207,10 @@ phase_merge() {
         local jid
         # Override the pattern's default --mem=16G; HGSOC sim runs sort+merge
         # on 2-run BAMs where samtools needs more headroom per the profile.
+        # Also bump --time for long IRIS Prolog.
         jid=$(_dispatch "merge $specimen_id" "$upstream" \
             --chdir="$PROJECT_DIR" --export=ALL,"$exports" \
-            --mem=64G \
+            --mem=64G --time=02:00:00 \
             "$PATTERN_DIR/run_merge.sh")
         [[ -n "$jid" ]] && deps+=("$jid")
     done < <(_specimens_with_ont)
@@ -298,9 +302,17 @@ case "$PHASE" in
         dep_modkit=$(phase_modkit "$dep_merge")
         phase_summary "$dep_modkit"
         ;;
+    resume_merge)
+        # Resume after flagstat data is also already in casetrack (e.g. if
+        # flagstat TSVs were appended from the login node after a SLURM
+        # timeout). Starts at merge; chains modkit → summary.
+        dep_merge=$(phase_merge "")
+        dep_modkit=$(phase_modkit "$dep_merge")
+        phase_summary "$dep_modkit"
+        ;;
     *)
         echo "Unknown phase: $PHASE" >&2
-        echo "Usage: PROJECT_DIR=... SANDBOX=... bash $0 {plan|synth|qc|merge|modkit|scrna|summary|all|resume} [--submit]" >&2
+        echo "Usage: PROJECT_DIR=... SANDBOX=... bash $0 {plan|synth|qc|merge|modkit|scrna|summary|all|resume|resume_merge} [--submit]" >&2
         exit 1
         ;;
 esac
