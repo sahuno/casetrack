@@ -2799,6 +2799,22 @@ def cmd_append_project(args):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # --column-prefix: rename analysis columns to {prefix}_{name} on the way in
+    # so two analyses sharing the same specimens table can't collide under
+    # fill-only COALESCE. Protects the key column, v0.4 autoflag columns, and
+    # the {analysis}_done timestamp — see the premerge_runs pattern README.
+    column_prefix = getattr(args, "column_prefix", None) or ""
+    if column_prefix:
+        import re as _re
+        if not _re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", column_prefix):
+            print(
+                f"Error: --column-prefix must be a valid identifier "
+                f"(letters/digits/underscores, not starting with a digit); "
+                f"got {column_prefix!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     results = pd.read_csv(results_path, sep="\t")
     if key_col not in results.columns:
         print(
@@ -2813,6 +2829,30 @@ def cmd_append_project(args):
     from casetrack_qc.autoflag import AUTOFLAG_COLUMNS as _QC_AUTOFLAG_COLS
     autoflag_cols_present = [c for c in _QC_AUTOFLAG_COLS if c in results.columns]
 
+    done_col = f"{analysis}{DONE_COLUMN_SUFFIX}"
+
+    # Compute the rename plan (original_name → prefixed_name) before renaming
+    # the DataFrame, so --col-type lookups below can still match original names.
+    prefix_rename: dict = {}
+    if column_prefix:
+        for c in results.columns:
+            if c == key_col:
+                continue
+            if c in _QC_AUTOFLAG_COLS:
+                continue
+            if c == done_col:
+                continue
+            prefix_rename[c] = f"{column_prefix}_{c}"
+    if prefix_rename:
+        results = results.rename(columns=prefix_rename)
+
+    # Translate --col-type overrides from TSV names to prefixed names so the
+    # user can keep writing them as they appear in their summary file.
+    if prefix_rename and col_type_overrides:
+        col_type_overrides = {
+            prefix_rename.get(k, k): v for k, v in col_type_overrides.items()
+        }
+
     analysis_cols = [
         c for c in results.columns
         if c != key_col and c not in _QC_AUTOFLAG_COLS
@@ -2824,7 +2864,6 @@ def cmd_append_project(args):
         )
         sys.exit(1)
 
-    done_col = f"{analysis}{DONE_COLUMN_SUFFIX}"
     if done_col not in results.columns:
         results[done_col] = datetime.datetime.now().strftime(TIMESTAMP_FMT)
         analysis_cols.append(done_col)
@@ -2990,6 +3029,8 @@ def cmd_append_project(args):
         "action": "append",
         "level": level,
         "analysis": analysis,
+        "column_prefix": column_prefix or None,
+        "prefix_rename": prefix_rename or None,
         "columns_added": columns_added,
         "rows_affected": rows_updated,
         "results_file": str(results_path),
@@ -5542,7 +5583,15 @@ Examples:
     )
     p_append.add_argument(
         "--col-type",
-        help="[project mode] Override inferred types, e.g. 'mean_meth:REAL,n_reads:INTEGER'",
+        help="[project mode] Override inferred types, e.g. 'mean_meth:REAL,n_reads:INTEGER'. "
+             "Names match the TSV (pre-prefix).",
+    )
+    p_append.add_argument(
+        "--column-prefix",
+        help="[project mode] Rename every analysis column to {prefix}_{name} on the way "
+             "in, so two analyses at different scopes (e.g. merged vs chr17) never "
+             "collide under fill-only COALESCE. Key column, qc_pass/qc_fail_reason/"
+             "qc_warn (v0.4 autoflag), and {analysis}_done are never prefixed.",
     )
     p_append.add_argument("--overwrite", action="store_true",
                           help="Overwrite existing non-null cells (default: fill-only)")

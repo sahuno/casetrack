@@ -53,6 +53,7 @@ def _reg_ns(project_dir: Path, *, level: str, id: str, parent: str | None = None
 
 def _append_ns(project_dir: Path, *, results: Path, analysis: str,
                level: str | None = None, col_type: str | None = None,
+               column_prefix: str | None = None,
                overwrite: bool = False) -> argparse.Namespace:
     return argparse.Namespace(
         manifest=None,
@@ -62,6 +63,7 @@ def _append_ns(project_dir: Path, *, results: Path, analysis: str,
         analysis=analysis,
         level=level,
         col_type=col_type,
+        column_prefix=column_prefix,
         overwrite=overwrite,
         allow_new=False,
         yes=False,
@@ -395,3 +397,152 @@ def test_flat_append_still_works(tmp_path: Path, initialized_manifest: Path,
     df = pd.read_csv(initialized_manifest, sep="\t")
     assert "val" in df.columns
     assert "a_done" in df.columns
+
+
+# ── --column-prefix (analysis-scoped columns) ─────────────────────────────────
+
+
+def test_column_prefix_renames_analysis_cols(seeded_project: Path, tmp_path: Path):
+    """Every analysis column in the TSV lands with {prefix}_ prepended."""
+    summary = _write_summary(tmp_path / "s.tsv", pd.DataFrame({
+        "assay_id": ["A001"],
+        "mean_meth": [0.7],
+        "n_cpg": [1234],
+    }))
+    casetrack.cmd_append(_append_ns(
+        seeded_project, results=summary, analysis="modkit_merged",
+        column_prefix="merged",
+    ))
+
+    with _conn(seeded_project) as c:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(assays)").fetchall()}
+    assert "merged_mean_meth" in cols
+    assert "merged_n_cpg" in cols
+    # Unprefixed originals must NOT be written.
+    assert "mean_meth" not in cols
+    assert "n_cpg" not in cols
+
+
+def test_column_prefix_skips_key_and_done_col(seeded_project: Path, tmp_path: Path):
+    """Key column and {analysis}_done are never prefixed."""
+    summary = _write_summary(tmp_path / "s.tsv", pd.DataFrame({
+        "assay_id": ["A001"], "val": [1.0],
+    }))
+    casetrack.cmd_append(_append_ns(
+        seeded_project, results=summary, analysis="modkit_merged",
+        column_prefix="merged",
+    ))
+
+    with _conn(seeded_project) as c:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(assays)").fetchall()}
+    # Key column is untouched (join key).
+    assert "assay_id" in cols
+    assert "merged_assay_id" not in cols
+    # {analysis}_done auto-added without prefix (already scoped by analysis name).
+    assert "modkit_merged_done" in cols
+    assert "merged_modkit_merged_done" not in cols
+
+
+def test_column_prefix_skips_autoflag_columns(seeded_project: Path, tmp_path: Path):
+    """qc_pass / qc_fail_reason / qc_warn are consumed by the autoflag path
+    and must never be prefixed — the consumer looks them up by exact name,
+    and a prefix would prevent it from firing at all."""
+    summary = _write_summary(tmp_path / "s.tsv", pd.DataFrame({
+        "assay_id": ["A001"],
+        "val": [1.0],
+        "qc_pass": [False],
+        "qc_fail_reason": ["synthetic fail for test"],
+    }))
+    casetrack.cmd_append(_append_ns(
+        seeded_project, results=summary, analysis="modkit_merged",
+        column_prefix="merged",
+    ))
+
+    with _conn(seeded_project) as c:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(assays)").fetchall()}
+        (n_events,) = c.execute(
+            "SELECT COUNT(*) FROM qc_events WHERE entity_id='A001' AND source='slurm'"
+        ).fetchone()
+    # Data columns DID get prefixed.
+    assert "merged_val" in cols
+    # Autoflag columns DID NOT get prefixed (prefix would break the consumer).
+    assert "merged_qc_pass" not in cols
+    assert "merged_qc_fail_reason" not in cols
+    # Proof the autoflag consumer fired: one slurm-source event on A001.
+    assert n_events == 1
+
+
+def test_column_prefix_col_type_uses_tsv_names(seeded_project: Path, tmp_path: Path):
+    """--col-type matches the ORIGINAL TSV column names, not the prefixed ones."""
+    summary = _write_summary(tmp_path / "s.tsv", pd.DataFrame({
+        "assay_id": ["A001"],
+        "counted": [100],  # would infer INTEGER
+    }))
+    casetrack.cmd_append(_append_ns(
+        seeded_project, results=summary, analysis="mx",
+        column_prefix="p1",
+        col_type="counted:REAL",  # reference the TSV name, pre-prefix
+    ))
+
+    with _conn(seeded_project) as c:
+        types = {r[1]: r[2] for r in c.execute("PRAGMA table_info(assays)").fetchall()}
+    assert types["p1_counted"] == "REAL"
+
+
+def test_column_prefix_rejects_invalid_identifier(seeded_project: Path, tmp_path: Path, capsys):
+    summary = _write_summary(tmp_path / "s.tsv", pd.DataFrame({
+        "assay_id": ["A001"], "val": [1.0],
+    }))
+    # Empty string is a legitimate "no prefix" signal and must NOT error.
+    for bad in ("1merged", "merged space", "me-rged", "merged;drop"):
+        with pytest.raises(SystemExit) as excinfo:
+            casetrack.cmd_append(_append_ns(
+                seeded_project, results=summary, analysis="x",
+                column_prefix=bad,
+            ))
+        assert excinfo.value.code == 1
+        assert "--column-prefix" in capsys.readouterr().err
+
+
+def test_column_prefix_lets_two_analyses_coexist(seeded_project: Path, tmp_path: Path):
+    """The whole point: run 'modkit' twice at different scopes, both sets of
+    columns land cleanly, neither clobbers the other."""
+    s1 = _write_summary(tmp_path / "s1.tsv", pd.DataFrame({
+        "assay_id": ["A001"], "n_cpg": [2_400_000], "mean_meth": [0.65],
+    }))
+    s2 = _write_summary(tmp_path / "s2.tsv", pd.DataFrame({
+        "assay_id": ["A001"], "n_cpg": [57_000_000], "mean_meth": [0.67],
+    }))
+    casetrack.cmd_append(_append_ns(
+        seeded_project, results=s1, analysis="modkit_chr17",
+        column_prefix="chr17",
+    ))
+    casetrack.cmd_append(_append_ns(
+        seeded_project, results=s2, analysis="modkit_merged",
+        column_prefix="merged",
+    ))
+
+    with _conn(seeded_project) as c:
+        row = c.execute(
+            "SELECT chr17_n_cpg, chr17_mean_meth, merged_n_cpg, merged_mean_meth "
+            "FROM assays WHERE assay_id='A001'"
+        ).fetchone()
+    assert row == (2_400_000, 0.65, 57_000_000, 0.67)
+
+
+def test_column_prefix_logged_to_provenance(seeded_project: Path, tmp_path: Path):
+    import json as _json
+    summary = _write_summary(tmp_path / "s.tsv", pd.DataFrame({
+        "assay_id": ["A001"], "val": [1.0],
+    }))
+    casetrack.cmd_append(_append_ns(
+        seeded_project, results=summary, analysis="m",
+        column_prefix="merged",
+    ))
+    entries = [
+        _json.loads(ln)
+        for ln in (seeded_project / "provenance.jsonl").read_text().splitlines()
+    ]
+    ap = next(e for e in entries if e["action"] == "append")
+    assert ap["column_prefix"] == "merged"
+    assert ap["prefix_rename"] == {"val": "merged_val"}

@@ -75,6 +75,15 @@ Exceptions (deliberately unprefixed): `qc_pass`, `qc_fail_reason`, `qc_warn`
 — these are v0.4 autoflag columns consumed by `casetrack append` by exact
 name to emit `qc_events` rows (proposal 0002 §0 #4).
 
+### Two ways to apply the convention
+
+| Approach | Where the prefix is applied | When it's right |
+|---|---|---|
+| **`casetrack append --column-prefix P`** (v0.4.1+) | casetrack rewrites the TSV header on the way in | Summarizers stay generic; prefix is declared at the append site. Less code to maintain, less risk of a summarizer author forgetting. |
+| **Summarizer writes already-prefixed columns** | Per-summarizer convention | The current scripts in this directory work this way. Fine for bespoke summarizers; move to `--column-prefix` for new work. |
+
+The two are equivalent in outcome. Mix and match freely.
+
 ## Usage — happy path
 
 ```bash

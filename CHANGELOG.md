@@ -4,6 +4,38 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-04-18
+
+One new flag + a worked real-cohort example.
+
+### Added
+
+- **`casetrack append --column-prefix P`** — rename every analysis column
+  in the results TSV to `{P}_{name}` on the way in, so two analyses at
+  different scopes (e.g. `merged` vs `chr17`) can't silently clobber each
+  other under fill-only COALESCE. Key column, v0.4 autoflag columns
+  (`qc_pass` / `qc_fail_reason` / `qc_warn`), and the `{analysis}_done`
+  timestamp are never prefixed. `--col-type` still matches the TSV's
+  original (pre-prefix) names. Prefix is validated as a plain identifier
+  and recorded in provenance (`column_prefix`, `prefix_rename` fields).
+  +7 tests (542 passing, was 535).
+- **`examples/patterns/premerge_runs/`** — reusable pattern for cohorts
+  with per-specimen pre-merge BAMs (flowcell runs, lanes). Pre-merge QC
+  at assay level → `_active` cascade excludes bad flowcells → `samtools
+  merge` at specimen level → downstream analyses (modkit, sniffles, …)
+  run on the merged BAM. Ships with a `subset_chr` helper for fast
+  per-chromosome iteration. Verified end-to-end against Project_17424
+  (6 patients × 2 flowcells, real ONT data).
+- **`examples/project_17424/`** — bootstrap + README for the MSKCC
+  Project_17424 tumor cohort, wired to the pre-merge-runs pattern.
+
+### Changed
+
+- `examples/patterns/premerge_runs/`: summarizers write pre-prefixed
+  columns by convention (merged_*, chr17_*) to avoid collisions. The new
+  `--column-prefix` flag is the recommended approach for new work; both
+  coexist.
+
 ## [0.4.0] — 2026-04-17
 
 QC / censoring / consent subsystem. Implements
