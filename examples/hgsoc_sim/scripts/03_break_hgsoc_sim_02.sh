@@ -20,8 +20,9 @@ DEMO_DIR="$(dirname "$SCRIPT_DIR")"
 REPO_ROOT="$(cd "$DEMO_DIR/../.." && pwd)"
 
 SANDBOX="${SANDBOX:-$REPO_ROOT/sandbox/hgsoc_sim}"
-TARGET_BAM="$SANDBOX/cohort/HGSOC_SIM_02/normal/laser/sim.srt.bam"
-BACKUP_BAM="$SANDBOX/cohort/HGSOC_SIM_02/normal/laser/sim.srt.full.bam"
+# Phase d: still breaking DNA. Phase g flips this to the RNA BAM.
+TARGET_BAM="$SANDBOX/cohort/HGSOC_SIM_02/normal/ONT-DNA/sim.srt.bam"
+BACKUP_BAM="$SANDBOX/cohort/HGSOC_SIM_02/normal/ONT-DNA/sim.srt.full.bam"
 
 if [[ ! -s "$TARGET_BAM" ]]; then
     echo "Error: $TARGET_BAM not found — run 02_run_visor.sh first." >&2

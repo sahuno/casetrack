@@ -2,11 +2,12 @@ name: hgsoc_sim-smoke
 
 # Lightweight smoke test for the examples/hgsoc_sim/ scaffold. Runs the
 # container-free steps (YAML → VISOR BED expansion) on every PR that
-# touches the demo. Does NOT run VISOR / Badread / minimap2 — those need
-# containers or a much larger runner image.
+# touches the demo. Does NOT run VISOR / Badread / NanoSim / minimap2 —
+# those need containers or a much larger runner image.
 #
 # Catches: config.yaml regressions, 01_prepare_visor_beds.py logic bugs,
-# unintended directory-layout changes. Runs in ~10s.
+# unintended directory-layout changes, multi-assay schema drift. Runs
+# in ~10s.
 
 on:
   push:
@@ -58,58 +59,69 @@ jobs:
           python examples/hgsoc_sim/scripts/01_prepare_visor_beds.py \
             --sandbox "${RUNNER_TEMP}/hgsoc_sim_smoke"
 
-      - name: Assert expected cohort shape
+      - name: Assert expected cohort shape (multi-assay)
         run: |
           python <<'PY'
-          import sys, os
+          import os
           from pathlib import Path
+          import yaml
 
-          root = Path(os.environ["RUNNER_TEMP"]) / "hgsoc_sim_smoke" / "cohort"
-          # 3 patients, 5 specimens total (HGSOC_SIM_03 is tumor-only).
-          expected = {
-              ("HGSOC_SIM_01", "normal"), ("HGSOC_SIM_01", "tumor"),
-              ("HGSOC_SIM_02", "normal"), ("HGSOC_SIM_02", "tumor"),
-              ("HGSOC_SIM_03", "tumor"),
-          }
-          got = set()
+          sandbox = Path(os.environ["RUNNER_TEMP"]) / "hgsoc_sim_smoke"
+          root = sandbox / "cohort"
+          cfg = yaml.safe_load(
+              Path("examples/hgsoc_sim/config.yaml").read_text()
+          )
+          valid_contigs = {s["name"] for s in cfg["reference"]["slices"]}
+          n_slices = len(valid_contigs)
+
+          # Build the expected (patient, specimen, assay_type) triples from
+          # config.yaml, skipping any non-DNA assay (those are handled by
+          # a different script in phase f).
+          DNA_TYPES = {"ONT-DNA"}
+          expected: set[tuple[str, str, str]] = set()
+          for patient in cfg["cohort"]:
+              pid = patient["patient_id"]
+              for spec in patient["specimens"]:
+                  suffix = spec["id_suffix"]
+                  for a in spec.get("assays") or []:
+                      if a["type"] in DNA_TYPES:
+                          expected.add((pid, suffix, a["type"]))
+
+          # Collect the actual triples from the emitted directory tree.
+          got: set[tuple[str, str, str]] = set()
           for p in root.iterdir():
               if not p.is_dir():
                   continue
               for s in p.iterdir():
-                  if s.is_dir():
-                      got.add((p.name, s.name))
+                  if not s.is_dir():
+                      continue
+                  for a in s.iterdir():
+                      if a.is_dir() and (a / "regions.laser.bed").exists():
+                          got.add((p.name, s.name, a.name))
+
           assert got == expected, f"cohort shape drift: {got} != {expected}"
 
-          # Every specimen must have both haplotype HACk BEDs + LASeR BED.
-          for patient, specimen in expected:
-              spec = root / patient / specimen
+          # Every DNA assay must have both haplotype HACk BEDs + LASeR BED.
+          for patient, specimen, assay in expected:
+              adir = root / patient / specimen / assay
               for required in ("haplotype1.hack.bed",
                                "haplotype2.hack.bed",
                                "regions.laser.bed"):
-                  assert (spec / required).exists(), f"missing {spec}/{required}"
+                  assert (adir / required).exists(), f"missing {adir}/{required}"
 
-          # Pull expected slice count from config.yaml so this assertion
-          # grows with the cohort without hard-coding.
-          import yaml
-          cfg = yaml.safe_load(
-              Path("examples/hgsoc_sim/config.yaml").read_text()
-          )
-          expected_slice_names = {s["name"] for s in cfg["reference"]["slices"]}
-          n_slices = len(expected_slice_names)
-
-          # HACk BEDs must be 6-col where non-empty; LASeR BEDs must be 5-col.
+          # HACk BEDs must be 6-col on declared contigs; LASeR must be 5-col
+          # with one row per slice.
           for bed in root.rglob("*.hack.bed"):
               for line in bed.read_text().splitlines():
                   if not line.strip():
                       continue
                   cols = line.split("\t")
                   assert len(cols) == 6, f"{bed}: expected 6 cols, got {len(cols)}"
-                  assert cols[0] in expected_slice_names, (
+                  assert cols[0] in valid_contigs, (
                       f"{bed}: variant on unknown contig {cols[0]!r}"
                   )
           for bed in root.rglob("*.laser.bed"):
               lines = [l for l in bed.read_text().splitlines() if l.strip()]
-              # One row per declared slice.
               assert len(lines) == n_slices, (
                   f"{bed}: expected {n_slices} rows, got {len(lines)}"
               )
@@ -117,24 +129,26 @@ jobs:
                   cols = line.split("\t")
                   assert len(cols) == 5, f"{bed}: expected 5 cols, got {len(cols)}"
 
-          # Variant count sanity check per config.yaml. For each specimen,
-          # add germline + (somatic if tumor) and assert the BED line total
-          # matches. Order-independent — keeps this robust to config edits.
+          # Variant count sanity check: for each DNA assay, germline +
+          # (somatic if tumor) must match the HACk BED line total.
           cohort = {p["patient_id"]: p for p in cfg["cohort"]}
-          for (patient, specimen) in expected:
+          for patient, specimen, assay in expected:
               p = cohort[patient]
               n_germ = len(p.get("germline", []))
               n_som = len(p.get("somatic", []))
               expected_n = n_germ + (n_som if specimen == "tumor" else 0)
-              spec = root / patient / specimen
-              h1 = [l for l in (spec / "haplotype1.hack.bed").read_text().splitlines()
+              adir = root / patient / specimen / assay
+              h1 = [l for l in (adir / "haplotype1.hack.bed").read_text().splitlines()
                     if l.strip()]
-              h2 = [l for l in (spec / "haplotype2.hack.bed").read_text().splitlines()
+              h2 = [l for l in (adir / "haplotype2.hack.bed").read_text().splitlines()
                     if l.strip()]
               got_n = len(h1) + len(h2)
               assert got_n == expected_n, (
-                  f"{patient}/{specimen}: expected {expected_n} variants, got {got_n}"
+                  f"{patient}/{specimen}/{assay}: expected {expected_n} variants, "
+                  f"got {got_n}"
               )
 
-          print("OK: cohort shape, BED formats, and variant counts all verified.")
+          print(f"OK: {len(expected)} DNA assay(s) verified across "
+                f"{len(set((p,s) for p,s,_ in expected))} specimen(s); "
+                f"BED formats + variant counts match config.yaml.")
           PY

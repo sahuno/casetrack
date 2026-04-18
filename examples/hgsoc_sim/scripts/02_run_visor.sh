@@ -1,25 +1,19 @@
 #!/bin/bash
-# 02_run_visor.sh — VISOR HACk + Badread (R10.4.1) + minimap2 pipeline.
+# 02_run_visor.sh — VISOR HACk + Badread (R10.4.1) + minimap2 pipeline (ONT-DNA).
 #
-# For each (patient, specimen) this script:
+# For each (patient, specimen, ONT-DNA assay) this script:
 #   1. Runs VISOR HACk to turn the variant BEDs into two haplotype FASTAs.
-#   2. Runs Badread per haplotype + (if purity < 100) per-reference-slice,
+#   2. Runs Badread per haplotype + (if purity < 100) per-reference slice,
 #      with per-source read budgets weighted so the mix reproduces the
 #      requested coverage and tumor purity.
 #   3. Aligns the merged reads with minimap2 (map-ont preset).
-#   4. Sorts and indexes with samtools → sandbox/.../laser/sim.srt.bam.
+#   4. Sorts and indexes with samtools → sandbox/.../<ASSAY>/sim.srt.bam.
 #
-# Why Badread + minimap2 instead of VISOR LASeR's bundled pbsim2:
-#   pbsim2 models R9.4.1 (ONT 2018-era). Badread's `nanopore2023` error +
-#   qscore models cover R10.4.1, matching the real HGSOC cohort chemistry.
-#
-# Purity math (for --purity P, total coverage C, two haplotypes):
-#   each tumor haplotype gets C * P / 200
-#   the reference (normal contamination) gets C * (1 - P/100)
-# When P=100, no normal contamination is emitted.
+# RNA assays (ONT-RNA) are NOT processed here — they have their own
+# pipeline in scripts/02b_run_nanosim.sh (phase f).
 #
 # Requires one of:
-#   - apptainer + the three SIFs under $CONTAINER_DIR (see containers/README.md)
+#   - apptainer + the four SIFs under $CONTAINER_DIR (see containers/README.md)
 #   - docker on PATH + RUNNER=docker
 #   - native VISOR + badread + minimap2 + samtools on PATH (RUNNER=native)
 #
@@ -34,6 +28,8 @@ REPO_ROOT="$(cd "$DEMO_DIR/../.." && pwd)"
 SANDBOX="${SANDBOX:-$REPO_ROOT/sandbox/hgsoc_sim}"
 COHORT_DIR="$SANDBOX/cohort"
 REF_FA="$SANDBOX/ref/ref.fa"
+
+DNA_ASSAY_TYPE="ONT-DNA"
 
 if [[ ! -s "$REF_FA" ]]; then
     echo "Error: reference FASTA not found at $REF_FA" >&2
@@ -76,9 +72,6 @@ _resolve_runner() {
     echo "[02] runner = $RUNNER"
 }
 
-# Tool wrappers — same interface regardless of runner. Each wrapper binds
-# the sandbox dir so container paths match host paths.
-
 _bind_args=(--bind "$SANDBOX" --bind "$REPO_ROOT")
 
 visor() {
@@ -119,17 +112,13 @@ samtools() {
 
 _resolve_runner
 
-# ── Coverage math helper ─────────────────────────────────────────────────────
-# Computes the --quantity value (bp) for a Badread run from (coverage_x,
-# fasta_size_bp). Badread accepts "Nx" directly, but we pass bp so the total
-# read budget is explicit in the command log and easy to audit.
+# ── Helper: compute --quantity (bp) from coverage×haplotype-length ────────────
 
 _quantity_bp() {
     local cov="$1"
     local fasta="$2"
     python3 -c "
 import pathlib
-# Strip FASTA headers; count residues including any newlines-in-sequence.
 p = pathlib.Path('$fasta')
 total = 0
 for line in p.read_text().splitlines():
@@ -140,7 +129,7 @@ print(int(total * $cov))
 "
 }
 
-# ── Per-specimen pipeline ────────────────────────────────────────────────────
+# ── Iterate DNA assays ──────────────────────────────────────────────────────
 
 shopt -s nullglob
 patients=("$COHORT_DIR"/*)
@@ -153,41 +142,39 @@ for patient_dir in "${patients[@]}"; do
     patient=$(basename "$patient_dir")
     for spec_dir in "$patient_dir"/*/; do
         specimen=$(basename "$spec_dir")
-        h1_bed="$spec_dir/haplotype1.hack.bed"
-        h2_bed="$spec_dir/haplotype2.hack.bed"
-        laser_bed="$spec_dir/regions.laser.bed"
-
-        hack_out="$spec_dir/hack"
-        reads_dir="$spec_dir/reads"
-        laser_out="$spec_dir/laser"      # kept under laser/ for compatibility with summarize script
-        out_bam="$laser_out/sim.srt.bam"
-
-        if [[ -s "$out_bam" ]]; then
-            echo "[02] $patient/$specimen — already simulated, skipping"
+        dna_dir="$spec_dir/$DNA_ASSAY_TYPE"
+        if [[ ! -d "$dna_dir" ]]; then
+            # This specimen doesn't have a DNA assay (rare) — skip quietly.
             continue
         fi
 
-        mkdir -p "$reads_dir" "$laser_out"
+        h1_bed="$dna_dir/haplotype1.hack.bed"
+        h2_bed="$dna_dir/haplotype2.hack.bed"
+        laser_bed="$dna_dir/regions.laser.bed"
+
+        hack_out="$dna_dir/hack"
+        reads_dir="$dna_dir/reads"
+        out_bam="$dna_dir/sim.srt.bam"
+
+        if [[ -s "$out_bam" ]]; then
+            echo "[02] $patient/$specimen/$DNA_ASSAY_TYPE — already simulated, skipping"
+            continue
+        fi
+
+        mkdir -p "$reads_dir"
         rm -rf "$hack_out"
 
         # ── Step 1: VISOR HACk → haplotype FASTAs ──────────────────────────
-        echo "[02] $patient/$specimen — HACk"
+        echo "[02] $patient/$specimen/$DNA_ASSAY_TYPE — HACk"
         visor HACk \
             -b "$h1_bed" "$h2_bed" \
             -g "$REF_FA" \
             -o "$hack_out"
 
-        # VISOR HACk writes h1.fa / h2.fa inside the output dir.
-        h1_fa="$hack_out/h1.fa"
-        h2_fa="$hack_out/h2.fa"
-
         # ── Step 2: pull coverage + purity from the LASeR BED ──────────────
-        # Coverage and purity are shared across all slices in a specimen's
-        # LASeR BED, so we read them from the first row.
         read -r _slice _start _end coverage purity < <(awk 'NR==1' "$laser_bed")
 
         # ── Step 3: Badread on each haplotype ──────────────────────────────
-        # Tumor reads split equally across h1/h2 to preserve het signals.
         tumor_frac=$(python3 -c "print(float($purity) / 100.0)")
         per_hap_cov=$(python3 -c "print(round(float($coverage) * $tumor_frac / 2, 3))")
 
@@ -199,7 +186,7 @@ for patient_dir in "${patients[@]}"; do
                 continue
             fi
             q_bp=$(_quantity_bp "$per_hap_cov" "$hap_fa")
-            echo "[02] $patient/$specimen — badread $hap (≈${per_hap_cov}x, ${q_bp} bp)"
+            echo "[02] $patient/$specimen/$DNA_ASSAY_TYPE — badread $hap (≈${per_hap_cov}x, ${q_bp} bp)"
             badread simulate \
                 --reference "$hap_fa" \
                 --quantity "${q_bp}" \
@@ -210,13 +197,11 @@ for patient_dir in "${patients[@]}"; do
         done
 
         # ── Step 4: normal-contamination reads from the raw reference ──────
-        # If purity < 100, the rest of the coverage comes from the pristine
-        # reference — simulating normal cells mixed into the tumor biopsy.
         if (( $(python3 -c "print(int($purity < 100))") )); then
             normal_cov=$(python3 -c "print(round(float($coverage) * (1.0 - float($purity)/100.0), 3))")
             q_bp=$(_quantity_bp "$normal_cov" "$REF_FA")
             out_fq="$reads_dir/normal_contam.fq.gz"
-            echo "[02] $patient/$specimen — badread normal contam (≈${normal_cov}x, ${q_bp} bp)"
+            echo "[02] $patient/$specimen/$DNA_ASSAY_TYPE — badread normal contam (≈${normal_cov}x, ${q_bp} bp)"
             badread simulate \
                 --reference "$REF_FA" \
                 --quantity "${q_bp}" \
@@ -227,17 +212,14 @@ for patient_dir in "${patients[@]}"; do
         fi
 
         # ── Step 5: align with minimap2 and sort with samtools ────────────
-        echo "[02] $patient/$specimen — minimap2 + samtools"
-        # Stream all .fq.gz files into minimap2; output to sorted, indexed BAM.
-        # -ax map-ont → preset for ONT reads.
-        # --MD tag helps downstream callers; -Y avoids hard-clipping.
+        echo "[02] $patient/$specimen/$DNA_ASSAY_TYPE — minimap2 + samtools"
         zcat "$reads_dir"/*.fq.gz | \
             minimap2 -ax map-ont -t 4 --MD -Y "$REF_FA" - 2>/dev/null | \
             samtools sort -@ 4 -o "$out_bam" -
         samtools index "$out_bam"
 
-        echo "[02] $patient/$specimen → $out_bam"
+        echo "[02] $patient/$specimen/$DNA_ASSAY_TYPE → $out_bam"
     done
 done
 
-echo "[02] all specimens simulated under $COHORT_DIR"
+echo "[02] all ${DNA_ASSAY_TYPE} assays simulated under $COHORT_DIR"

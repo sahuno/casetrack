@@ -1,18 +1,22 @@
 # hgsoc_sim cohort definition — one YAML for the whole simulation.
 #
-# scripts/01_prepare_visor_beds.py turns this into per-patient VISOR BED
+# scripts/01_prepare_visor_beds.py turns this into per-assay VISOR BED
 # files. Coordinates are 0-based half-open (BED convention).
 #
+# ── Layout (v0.4.2) ───────────────────────────────────────────────────────────
+# Each specimen lists its assays — typically ONT-DNA and ONT-RNA side by side.
+# Every assay gets its own directory under cohort/<PATIENT>/<SPECIMEN>/<ASSAY>/
+# so DNA and RNA lanes never share working files.
+#
+# The demo pipeline branches by assay type:
+#   ONT-DNA  →  VISOR HACk → Badread (R10.4.1 genomic) → minimap2 map-ont
+#   ONT-RNA  →  NanoSim cDNA (R10.4.1) → minimap2 splice              (phase f)
+#
 # Reference is a concatenation of small GRCh38 slices, each renamed to its
-# own contig so coordinates count from 0 within the slice. The BRCA1 slice
-# (~1 Mb) and TP53 slice (~100 kb) together cover the two most common
-# HGSOC driver loci; total ~1.1 Mb keeps simulation under a minute.
+# own contig. The BRCA1 slice (~1 Mb) and TP53 slice (~100 kb) together
+# cover the two most common HGSOC driver loci.
 #
-# Variants are placed per-slice via the `chrom` field — e.g.
-# `chrom: chr17_brca1` lands the variant inside the BRCA1 contig.
-# `pos` is the 0-based offset within that slice.
-#
-# Variant types supported by VISOR HACk (subset):
+# ── Variant types supported by VISOR HACk (subset) ────────────────────────────
 #   SNP           - single-nucleotide substitution (alt required)
 #   deletion      - straight deletion of the region (length required)
 #   insertion     - literal insert (alt = sequence string)
@@ -45,19 +49,24 @@ cohort:
     specimens:
       - id_suffix: normal
         tissue_site: normal
-        assay_type: ONT
-        coverage: 25
-        purity: 100            # no tumor contamination — pure germline
+        assays:
+          - type: ONT-DNA
+            coverage: 25
+            purity: 100      # no tumor contamination — pure germline
+          # RNA landing in phase f:
+          # - type: ONT-RNA
+          #   depth: 30
+          #   expression_profile: baseline
       - id_suffix: tumor
         tissue_site: tumor
-        assay_type: ONT
-        coverage: 35
-        purity: 70             # 30% normal contamination
+        assays:
+          - type: ONT-DNA
+            coverage: 35
+            purity: 70       # 30% normal contamination
 
   - patient_id: HGSOC_SIM_02
-    # Broken pair — same design as SIM_01, but the normal BAM is deliberately
-    # downsampled by 03_break_hgsoc_sim_02.sh post-simulation. The summarize
-    # script's coverage check will then emit qc_pass=False → autoflag fires.
+    # Broken pair — normal RNA deliberately truncated in phase g so
+    # `qc_pass=False` fires on its autoflag. DNA passes in this patient.
     germline:
       - { chrom: chr17_brca1, pos: 120000, type: SNP, alt: C, note: "het SNP upstream of BRCA1" }
     somatic:
@@ -65,14 +74,16 @@ cohort:
     specimens:
       - id_suffix: normal
         tissue_site: normal
-        assay_type: ONT
-        coverage: 25            # will be truncated to ~2x post-sim
-        purity: 100
+        assays:
+          - type: ONT-DNA
+            coverage: 25
+            purity: 100
       - id_suffix: tumor
         tissue_site: tumor
-        assay_type: ONT
-        coverage: 30
-        purity: 75
+        assays:
+          - type: ONT-DNA
+            coverage: 30
+            purity: 75
 
   - patient_id: HGSOC_SIM_03
     # Singleton — tumor only, no normal produced. Surfaces via cohort
@@ -86,6 +97,7 @@ cohort:
     specimens:
       - id_suffix: tumor
         tissue_site: tumor
-        assay_type: ONT
-        coverage: 30
-        purity: 80
+        assays:
+          - type: ONT-DNA
+            coverage: 30
+            purity: 80

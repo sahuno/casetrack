@@ -7,11 +7,16 @@ Creates:
         casetrack.db
         provenance.jsonl
 
-Registers each patient / specimen / assay from config.yaml, then appends the
-per-assay summary TSVs emitted by 04_summarize_mock.py. Autoflag kicks in
-on HGSOC_SIM_02-normal (qc_pass=False in its summary), producing a
-qc_events row inside the append transaction — the v0.4 QC path being
-demonstrated.
+Registers each patient / specimen / assay from config.yaml, then appends
+the per-assay summary TSVs emitted by 04_summarize_mock.py. Appends use
+`--column-prefix` to namespace per-assay-type metrics — so DNA's
+`mock_mean_meth` lands as `ont_dna_mock_mean_meth` on the assays table,
+and RNA's lands as `ont_rna_mock_mean_meth`. This is the convention v0.4.1
+introduced for per-analysis scoping (see CHANGELOG).
+
+Autoflag kicks in on any assay whose summary has `qc_pass=False`,
+producing a `qc_events` row inside the same transaction as the append —
+the v0.4 QC path being demonstrated.
 
 Idempotent on second invocation: strict-FK re-registration is a no-op for
 rows that already exist, and `append` fills NaN-only cells on re-run.
@@ -37,8 +42,17 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config.yaml"
 DEFAULT_SANDBOX = REPO_ROOT / "sandbox" / "hgsoc_sim"
 
 
+# Column-prefix per assay type. Keeps DNA and RNA metrics in separate
+# columns on the shared `assays` table so they never silently clobber
+# each other (the v0.4.1 --column-prefix use case).
+COLUMN_PREFIX_BY_ASSAY: dict[str, str] = {
+    "ONT-DNA": "ont_dna",
+    "ONT-RNA": "ont_rna",
+}
+
+
 def _ct(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    """Thin wrapper over `casetrack`. Mirrors examples/giab_chr21/bootstrap.py."""
+    """Thin wrapper over `casetrack`."""
     return subprocess.run(
         ["casetrack", *args], check=check, capture_output=True, text=True
     )
@@ -51,8 +65,7 @@ def _register_if_missing(
     parent: str | None = None,
     meta: str | None = None,
 ) -> None:
-    """Call `casetrack register`, tolerating 'already exists' collisions
-    (exit 1 with UNIQUE constraint message) — this is the idempotency hack."""
+    """Call `casetrack register`, tolerating 'already exists' collisions."""
     args: list[str] = [
         "register", "--project-dir", str(project_dir),
         "--level", level, "--id", row_id,
@@ -65,7 +78,6 @@ def _register_if_missing(
     if result.returncode == 0:
         print(f"[05] registered {level:<8} {row_id}")
         return
-    # Tolerate UNIQUE-constraint collisions silently (project already has row).
     if (
         "UNIQUE constraint" in result.stderr
         or "already exists" in result.stderr.lower()
@@ -87,8 +99,7 @@ def bootstrap(config: Path, sandbox: Path) -> Path:
         )
         sys.exit(1)
 
-    # 1. Init the project (once). --force blows away any stale DB so the
-    # script is re-runnable.
+    # 1. Init the project (once).
     if not (project_dir / "casetrack.toml").exists():
         project_dir.mkdir(parents=True, exist_ok=True)
         _ct("init", "--project-dir", str(project_dir), "--from-template", "hgsoc")
@@ -108,45 +119,56 @@ def bootstrap(config: Path, sandbox: Path) -> Path:
                 parent=pid,
                 meta=f"tissue_site={spec['tissue_site']}",
             )
-            assay_id = f"{pid}-{suffix}-{spec['assay_type']}"
-            _register_if_missing(
-                project_dir, "assay", assay_id,
-                parent=specimen_id,
-                meta=f"assay_type={spec['assay_type']}",
-            )
+            for assay in spec.get("assays") or []:
+                atype = assay["type"]
+                assay_id = f"{specimen_id}-{atype}"
+                _register_if_missing(
+                    project_dir, "assay", assay_id,
+                    parent=specimen_id,
+                    meta=f"assay_type={atype}",
+                )
 
-    # 3. Append the mock summaries. The qc_pass/qc_fail_reason columns will
-    # auto-emit qc_events on the single broken-normal row.
+    # 3. Append each assay's mock summary. Column-prefix is keyed on assay
+    # type so DNA and RNA columns never collide on the shared assays table.
+    # Autoflag will fire on any summary with qc_pass=False.
     for patient in cfg["cohort"]:
         pid = patient["patient_id"]
         for spec in patient["specimens"]:
             suffix = spec["id_suffix"]
-            assay_id = f"{pid}-{suffix}-{spec['assay_type']}"
-            tsv = summary_dir / f"{assay_id}.summary.tsv"
-            if not tsv.exists():
-                print(f"[05] WARN: missing summary for {assay_id} — skipping",
-                      file=sys.stderr)
-                continue
-            result = _ct(
-                "append",
-                "--project-dir", str(project_dir),
-                "--results", str(tsv),
-                "--analysis", "mock_modkit",
-                check=False,
-            )
-            if result.returncode != 0:
-                sys.stderr.write(result.stderr)
-                result.check_returncode()
-            # Echo casetrack's own summary line so the demo feels live.
-            for line in result.stdout.strip().splitlines():
-                print(f"[05]   {line}")
+            for assay in spec.get("assays") or []:
+                atype = assay["type"]
+                assay_id = f"{pid}-{suffix}-{atype}"
+                tsv = summary_dir / f"{assay_id}.summary.tsv"
+                if not tsv.exists():
+                    print(f"[05] WARN: missing summary for {assay_id} — skipping",
+                          file=sys.stderr)
+                    continue
+
+                prefix = COLUMN_PREFIX_BY_ASSAY.get(atype)
+                append_args = [
+                    "append",
+                    "--project-dir", str(project_dir),
+                    "--results", str(tsv),
+                    "--analysis", f"mock_summary_{atype.lower().replace('-', '_')}",
+                ]
+                if prefix:
+                    append_args += ["--column-prefix", prefix]
+
+                result = _ct(*append_args, check=False)
+                if result.returncode != 0:
+                    sys.stderr.write(result.stderr)
+                    result.check_returncode()
+                for line in result.stdout.strip().splitlines():
+                    print(f"[05]   {line}")
 
     print()
     print(f"[05] project ready: {project_dir}")
     print(f"[05] try:")
     print(f"     casetrack status  --project-dir {project_dir} --usable")
     print(f"     casetrack cohort  --project-dir {project_dir} "
-          f"--assay-type ONT --pair-by tissue_site")
+          f"--assay-type ONT-DNA --pair-by tissue_site")
+    print(f"     casetrack cohort  --project-dir {project_dir} "
+          f"--assay-type ONT-RNA --pair-by tissue_site   # after phase f")
     return project_dir
 
 

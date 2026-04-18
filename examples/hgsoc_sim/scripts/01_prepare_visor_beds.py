@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""01_prepare_visor_beds.py — expand config.yaml into per-patient VISOR BEDs.
+"""01_prepare_visor_beds.py — expand config.yaml into per-assay VISOR BEDs.
 
-Reads the cohort config and emits, for every (patient, specimen):
+Emits, for every (patient, specimen, DNA assay):
 
-    sandbox/hgsoc_sim/cohort/<PATIENT>/<SPECIMEN>/
+    sandbox/hgsoc_sim/cohort/<PATIENT>/<SPECIMEN>/<ASSAY_TYPE>/
         haplotype1.hack.bed     # 6-col VISOR HACk BED for haplotype 1
         haplotype2.hack.bed     # 6-col VISOR HACk BED for haplotype 2
         regions.laser.bed       # 5-col VISOR LASeR BED (one row per slice)
 
+RNA assays (e.g. ONT-RNA) are silently skipped here — they have their own
+prep path in phase f (transcript extraction + expression vectors).
+
 VISOR HACk places variants from the 6-col BED into a reference contig,
-producing two haplotype FASTAs per specimen. We split variants between the
+producing two haplotype FASTAs per assay. We split variants between the
 two haplotype BEDs deterministically: SNPs alternate (het by default),
 structural variants land on haplotype 1 (simulating heterozygous SVs).
 
 Germline variants go on both the normal and tumor specimens of a patient.
-Somatic variants go only on tumor. Purity comes from the config.
+Somatic variants go only on tumor. Coverage and purity come from the
+specimen's DNA assay entry.
 
-Multi-slice support (v2): variants carry a `chrom` field naming which
-reference slice they belong to. The LASeR BED emits one row per slice —
-VISOR LASeR simulates each region independently with the same coverage
-and purity, which is what we want for an HGSOC paired design.
+Multi-assay layout (v0.4.2): every specimen has a `assays: [...]` list.
+DNA lives at {PATIENT}/{SPECIMEN}/ONT-DNA/; RNA at {PATIENT}/{SPECIMEN}/ONT-RNA/.
 
 Author: Samuel Ahuno (ekwame001@gmail.com)
 """
@@ -43,17 +45,16 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config.yaml"
 DEFAULT_SANDBOX = REPO_ROOT / "sandbox" / "hgsoc_sim"
 
+# Which assay types this script handles. RNA flows through a different
+# prep script (phase f) that uses transcript FASTAs, not genomic slices.
+DNA_ASSAY_TYPES: tuple[str, ...] = ("ONT-DNA",)
+
 
 # ── HACk BED formatting ────────────────────────────────────────────────────────
 
 
 def _hack_row(contig: str, pos: int, variant: dict) -> tuple[str, list[str]]:
-    """Return (haplotype_hint, 6-col HACk BED row) for a config variant.
-
-    haplotype_hint is "h1" or "h2" — lets the caller split variants across
-    the two haplotype BEDs to simulate heterozygosity. SNPs are alternated
-    by the caller; SVs default to h1.
-    """
+    """Return (haplotype_hint, 6-col HACk BED row) for a config variant."""
     vtype = variant["type"]
     if vtype == "SNP":
         alt = variant["alt"]
@@ -77,16 +78,7 @@ def _hack_row(contig: str, pos: int, variant: dict) -> tuple[str, list[str]]:
 
 
 def _split_variants(variants: list[dict]) -> dict[str, list[list[str]]]:
-    """Split variants into h1/h2 BEDs.
-
-    SNPs alternate between haplotypes so every other germline SNP is het on
-    h1 and the next on h2 — good enough for demo purposes. SVs default to
-    h1 only (heterozygous SVs are the common real case).
-
-    Variants are emitted in the order they appear in config.yaml, grouped
-    by target haplotype. VISOR HACk requires rows to be coordinate-sorted
-    within each contig, so we sort per-contig-per-haplotype before writing.
-    """
+    """Split variants into h1/h2 BEDs with heterozygous-SNP alternation."""
     per_hap: dict[str, list[list[str]]] = {"h1": [], "h2": []}
     snp_counter = 0
     for v in variants:
@@ -111,7 +103,7 @@ def _split_variants(variants: list[dict]) -> dict[str, list[list[str]]]:
 def _write_hack_beds(
     out_dir: Path, per_hap: dict[str, list[list[str]]]
 ) -> None:
-    """Emit haplotype1.hack.bed and haplotype2.hack.bed — always both, even if empty."""
+    """Emit haplotype1.hack.bed and haplotype2.hack.bed — always both."""
     for idx, hap_key in enumerate(("h1", "h2"), start=1):
         dest = out_dir / f"haplotype{idx}.hack.bed"
         with open(dest, "w") as f:
@@ -130,7 +122,6 @@ def _write_laser_bed(
     with open(dest, "w") as f:
         for sl in slices:
             slice_len = int(sl["end"]) - int(sl["start"])
-            # Slice coords start at 0 inside the renamed contig.
             f.write(
                 "\t".join([
                     sl["name"], "0", str(slice_len),
@@ -159,6 +150,8 @@ def main() -> int:
     cohort_dir = sandbox / "cohort"
 
     summary: list[str] = []
+    skipped: list[str] = []
+
     for patient in cfg["cohort"]:
         pid = patient["patient_id"]
         germline = patient.get("germline", [])
@@ -174,30 +167,46 @@ def main() -> int:
 
         for spec in patient["specimens"]:
             suffix = spec["id_suffix"]
-            coverage = int(spec["coverage"])
-            purity = float(spec["purity"])
+            assays = spec.get("assays") or []
+            if not assays:
+                raise SystemExit(
+                    f"Error: {pid}/{suffix} has no assays declared"
+                )
 
             variants = list(germline)
-            # Tumor specimens additionally carry the somatic set.
             if spec["tissue_site"] == "tumor":
                 variants += list(somatic)
 
-            out_dir = cohort_dir / pid / suffix
-            out_dir.mkdir(parents=True, exist_ok=True)
-            per_hap = _split_variants(variants)
-            _write_hack_beds(out_dir, per_hap)
-            _write_laser_bed(out_dir, ref_slices, coverage, purity)
+            for assay in assays:
+                atype = assay["type"]
+                if atype not in DNA_ASSAY_TYPES:
+                    # RNA assays are prepped elsewhere (phase f).
+                    skipped.append(f"{pid}/{suffix}/{atype}")
+                    continue
 
-            n_vars = sum(len(v) for v in per_hap.values())
-            summary.append(
-                f"  {pid}/{suffix}: {n_vars} variants across "
-                f"{len(ref_slices)} slice(s) → cov={coverage}x, "
-                f"purity={purity}% → {out_dir}"
-            )
+                coverage = int(assay["coverage"])
+                purity = float(assay["purity"])
+
+                out_dir = cohort_dir / pid / suffix / atype
+                out_dir.mkdir(parents=True, exist_ok=True)
+                per_hap = _split_variants(variants)
+                _write_hack_beds(out_dir, per_hap)
+                _write_laser_bed(out_dir, ref_slices, coverage, purity)
+
+                n_vars = sum(len(v) for v in per_hap.values())
+                summary.append(
+                    f"  {pid}/{suffix}/{atype}: {n_vars} variants across "
+                    f"{len(ref_slices)} slice(s) → cov={coverage}x, "
+                    f"purity={purity}% → {out_dir}"
+                )
 
     print(f"[01] emitted VISOR BEDs under {cohort_dir}")
     for line in summary:
         print(line)
+    if skipped:
+        print(f"[01] (skipped {len(skipped)} non-DNA assay(s) — handled in phase f):")
+        for s in skipped:
+            print(f"       {s}")
     return 0
 
 
