@@ -659,6 +659,48 @@ def fill_nan_cells(manifest: "pd.DataFrame", results: "pd.DataFrame",
 
 # ── Core Commands ──────────────────────────────────────────────────────────────
 
+# Proposal 0003: `casetrack init` scaffolds a full project tree by default.
+# Leaves listed here get `mkdir -p` + a `.gitkeep` file so the layout survives
+# git clone. `results/<analysis>/<assay_id>/` is intentionally NOT here —
+# pipelines create those on first append, and the analysis mix varies per
+# project. `--bare` on init skips this scaffold.
+SCAFFOLD_LEAVES: tuple[str, ...] = (
+    "data/raw",
+    "data/ref",
+    "data/validation",
+    "results",
+    "scripts",
+    "docs/research",
+    "docs/hypothesis",
+    "manuscript/figures/scripts/png",
+    "manuscript/figures/scripts/pdf",
+    "manuscript/figures/scripts/svg",
+    "manuscript/draft",
+    "manuscript/proofs",
+    "manuscript/references",
+    "logs",
+    "containers",
+    "sandbox",
+)
+
+
+def _scaffold_project_tree(project_dir: Path) -> list[str]:
+    """Create SCAFFOLD_LEAVES under `project_dir` with `.gitkeep` in each leaf.
+
+    Idempotent: existing dirs and .gitkeep files are left alone (no mtime
+    change). Returns the list of leaf paths (relative) that now exist.
+    """
+    created: list[str] = []
+    for leaf in SCAFFOLD_LEAVES:
+        d = project_dir / leaf
+        d.mkdir(parents=True, exist_ok=True)
+        keeper = d / ".gitkeep"
+        if not keeper.exists():
+            keeper.touch()
+        created.append(leaf)
+    return created
+
+
 def cmd_init(args):
     """Dispatch `casetrack init` to flat (--manifest) or project (--project-dir) mode."""
     if getattr(args, "project_dir", None):
@@ -741,6 +783,14 @@ def cmd_init_project(args):
     if not gitignore_path.exists():
         gitignore_path.write_text(_project_gitignore_contents())
 
+    # Proposal 0003: scaffold the full project tree unless the caller opted
+    # out with --bare. Idempotent so re-running init on an existing project
+    # only fills in missing leaves.
+    bare = bool(getattr(args, "bare", False))
+    scaffold_leaves: list[str] = []
+    if not bare:
+        scaffold_leaves = _scaffold_project_tree(project_dir)
+
     log_project_provenance(project_dir, {
         "action": "init_project",
         "transaction_id": _new_transaction_id(),
@@ -750,26 +800,56 @@ def cmd_init_project(args):
         "schema_v_after": schema["project"]["schema_v"],
         "sql": schema_to_ddl(schema) + qc_ddl,
         "qc_schema_v": 1,
+        "scaffold": "full" if not bare else "bare",
+        "scaffold_leaves": scaffold_leaves,
     })
 
-    print(
-        f"Initialized casetrack project at {project_dir}/\n"
-        f"  - {PROJECT_TOML_NAME}  ({template} template)\n"
-        f"  - {PROJECT_DB_NAME}    (three levels: {', '.join(LEVEL_ORDER)})\n"
-        f"  - {PROJECT_PROVENANCE_NAME}\n"
-        f"  - {PROJECT_GITIGNORE_NAME}"
-    )
+    lines = [
+        f"Initialized casetrack project at {project_dir}/",
+        f"  - {PROJECT_TOML_NAME}  ({template} template)",
+        f"  - {PROJECT_DB_NAME}    (three levels: {', '.join(LEVEL_ORDER)})",
+        f"  - {PROJECT_PROVENANCE_NAME}",
+        f"  - {PROJECT_GITIGNORE_NAME}",
+    ]
+    if not bare:
+        lines.append(f"  - scaffold: {len(scaffold_leaves)} leaf directories (.gitkeep in each)")
+    print("\n".join(lines))
 
 
 def _project_gitignore_contents() -> str:
-    """Contents of `.gitignore` for a fresh project (proposal 0001 §5, §19 Q6)."""
+    """Contents of `.gitignore` for a fresh project.
+
+    Extended in proposal 0003 to cover large analysis artifacts that belong
+    in the manifest (via bam_path columns etc.) rather than in git: raw
+    inputs under data/raw/, Apptainer SIFs, merged BAMs, bedMethyl.gz, VCF
+    bundles. `.gitkeep` files created by the scaffold are explicitly
+    re-included with `!` negations so empty leaves survive commit.
+    """
     return (
-        "# casetrack project .gitignore — proposal 0001 Q6\n"
+        "# casetrack project .gitignore — proposals 0001 §5 + 0003\n"
         "# DB is binary and regenerable from casetrack.toml + provenance.jsonl.\n"
         f"{PROJECT_DB_NAME}\n"
         f"{PROJECT_DB_NAME}-wal\n"
         f"{PROJECT_DB_NAME}-shm\n"
+        "\n"
+        "# Large artifacts — tracked in the manifest, not in git.\n"
+        "data/raw/*\n"
+        "!data/raw/.gitkeep\n"
+        "containers/*.sif\n"
+        "!containers/.gitkeep\n"
+        "results/**/*.bam\n"
+        "results/**/*.bam.bai\n"
+        "results/**/*.cram\n"
+        "results/**/*.cram.crai\n"
+        "results/**/*.bedMethyl.gz\n"
+        "results/**/*.tbi\n"
+        "results/**/*.vcf.gz\n"
+        "results/**/*.fastq.gz\n"
+        "\n"
+        "# Exports and working artifacts.\n"
         "exports/\n"
+        "sandbox/*\n"
+        "!sandbox/.gitkeep\n"
     )
 
 
@@ -5558,6 +5638,12 @@ Examples:
         "--force",
         action="store_true",
         help="Overwrite existing manifest (flat) or casetrack.db (project)",
+    )
+    p_init.add_argument(
+        "--bare",
+        action="store_true",
+        help="[project mode] Skip the full directory scaffold (proposal 0003); "
+             "emit only casetrack.{toml,db}, provenance.jsonl, .gitignore.",
     )
 
     # ── append ──

@@ -90,6 +90,34 @@ casetrack --help
 Python ≥ 3.10. Runtime deps: `pandas`, `duckdb`, `tomli` (backport on 3.10).
 Optional extras: `openpyxl` (xlsx), `pyarrow` (parquet).
 
+## Project layout (v0.4.2+)
+
+`casetrack init --project-dir <path>` scaffolds a full, publication-ready
+project tree by default. The enforced triad — `casetrack.toml` (schema),
+`casetrack.db` (SQLite), `provenance.jsonl` (audit log) — lives at the root
+alongside a set of leaf directories for inputs, references, outputs, docs,
+manuscript artifacts, logs, containers, and sandbox space:
+
+```
+cohort/
+├── casetrack.{toml,db}           # schema + DB (DB gitignored)
+├── provenance.jsonl              # append-only audit log
+├── .gitignore                    # excludes DB, raw data, sifs, large outputs
+├── data/{raw,ref,validation}/    # immutable inputs, references, truth sets
+├── results/                      # analysis outputs (pipelines create subdirs)
+├── scripts/                      # top-level analysis scripts (01_, 02_, …)
+├── docs/{research,hypothesis}/   # literature notes, analysis plans
+├── manuscript/
+│   ├── figures/scripts/{png,pdf,svg}/    # composed manuscript figures
+│   ├── draft/ proofs/ references/
+├── logs/ containers/ sandbox/
+```
+
+Every leaf ships a `.gitkeep` so the tree survives `git clone`. Re-running
+`init` on an existing project fills in missing leaves without touching
+existing files. Opt out with `casetrack init --project-dir <path> --bare`
+if you already have a layout. Full design: `docs/proposals/0003-init-scaffold.md`.
+
 ## Quick start — v0.3 project mode (recommended)
 
 ```bash

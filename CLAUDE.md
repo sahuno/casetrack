@@ -6,7 +6,7 @@ Manifest-centric case management CLI for bioinformatics pipelines on HPC (SLURM)
 
 - **Repo**: https://github.com/sahuno/casetrack (private)
 - **Author**: Samuel Ahuno (ekwame001@gmail.com / sahuno@mskcc.org)
-- **Current release**: v0.4.0 — QC / censoring / consent subsystem on the v0.3 SQLite backend
+- **Current release**: v0.4.2 — full project-tree scaffold on `casetrack init` (proposal 0003)
 - **Next release**: v0.5.x (assay-level `batch_id`) → v1.0 (flat-mode removal)
 - **HPC target**: IRIS @ MSKCC (SLURM, WekaFS shared storage, Apptainer containers)
 
@@ -14,6 +14,7 @@ Manifest-centric case management CLI for bioinformatics pipelines on HPC (SLURM)
 
 | File | What it tells you |
 |---|---|
+| `docs/proposals/0003-init-scaffold.md` | **The shipped v0.4.2 design.** `casetrack init` now scaffolds 16 leaf directories + expanded .gitignore. `--bare` opts out. |
 | `docs/proposals/0002-qc-events-and-censoring.md` | **The shipped v0.4 design.** QC events, cascade semantics, consent rules, cohort `--pair-by`. §0 has the 13 locked-in decisions. |
 | `docs/proposals/0001-sqlite-normalized-backend.md` | **The shipped v0.3 design.** Three-level hierarchy, SQLite backend, concurrency strategy. |
 | `docs/MIGRATION_v0.3_to_v0.4.md` | Step-by-step upgrade guide (one command: `casetrack migrate-qc`). |

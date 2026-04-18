@@ -21,7 +21,7 @@ import casetrack
 
 
 def _init_ns(project_dir: Path, *, template: str = "blank", force: bool = False,
-             project_name: str | None = None) -> argparse.Namespace:
+             project_name: str | None = None, bare: bool = False) -> argparse.Namespace:
     return argparse.Namespace(
         manifest=None,
         project_dir=str(project_dir),
@@ -32,6 +32,7 @@ def _init_ns(project_dir: Path, *, template: str = "blank", force: bool = False,
         from_template=template,
         project_name=project_name,
         force=force,
+        bare=bare,
     )
 
 
@@ -246,3 +247,94 @@ def test_flat_init_without_samples_errors(tmp_path: Path):
     )
     assert res.returncode != 0
     assert "--samples" in res.stderr
+
+
+# ── Proposal 0003: directory scaffold ─────────────────────────────────────────
+
+
+def test_init_creates_full_scaffold(tmp_path: Path):
+    """Default init lays out every leaf in SCAFFOLD_LEAVES with a .gitkeep."""
+    proj = tmp_path / "proj"
+    casetrack.cmd_init(_init_ns(proj))
+    for leaf in casetrack.SCAFFOLD_LEAVES:
+        d = proj / leaf
+        assert d.is_dir(), f"missing scaffold dir: {leaf}"
+        assert (d / ".gitkeep").exists(), f"missing .gitkeep in {leaf}"
+
+
+def test_init_bare_skips_scaffold(tmp_path: Path):
+    """--bare produces only the four enforced files; none of the tree leaves."""
+    proj = tmp_path / "proj"
+    casetrack.cmd_init(_init_ns(proj, bare=True))
+    # Four required files present.
+    assert (proj / "casetrack.toml").exists()
+    assert (proj / "casetrack.db").exists()
+    assert (proj / "provenance.jsonl").exists()
+    assert (proj / ".gitignore").exists()
+    # None of the scaffold leaves exist.
+    for leaf in casetrack.SCAFFOLD_LEAVES:
+        assert not (proj / leaf).exists(), f"bare init should not have created {leaf}"
+
+
+def test_init_scaffold_is_idempotent(tmp_path: Path):
+    """Re-running init --force on an existing project preserves .gitkeep mtimes."""
+    proj = tmp_path / "proj"
+    casetrack.cmd_init(_init_ns(proj))
+    keeper = proj / "data/raw/.gitkeep"
+    first_mtime = keeper.stat().st_mtime_ns
+
+    # Also drop a user-authored file inside a scaffold leaf; it must survive.
+    user_file = proj / "docs/research/note.md"
+    user_file.write_text("my research note")
+
+    casetrack.cmd_init(_init_ns(proj, force=True))
+    assert keeper.exists()
+    assert keeper.stat().st_mtime_ns == first_mtime, ".gitkeep was rewritten"
+    assert user_file.exists(), "user file under a scaffold leaf was wiped"
+    assert user_file.read_text() == "my research note"
+
+
+def test_gitignore_includes_scaffold_patterns(tmp_path: Path):
+    """.gitignore default (post-0003) excludes large artifacts + negates .gitkeep."""
+    proj = tmp_path / "proj"
+    casetrack.cmd_init(_init_ns(proj))
+    contents = (proj / ".gitignore").read_text()
+    # Large-artifact excludes.
+    assert "data/raw/*" in contents
+    assert "containers/*.sif" in contents
+    assert "results/**/*.bam" in contents
+    assert "results/**/*.bedMethyl.gz" in contents
+    # Negations keep the empty leaves visible to git.
+    assert "!data/raw/.gitkeep" in contents
+    assert "!containers/.gitkeep" in contents
+    assert "!sandbox/.gitkeep" in contents
+
+
+def test_init_provenance_records_scaffold(tmp_path: Path):
+    """Provenance entry distinguishes scaffold=full vs scaffold=bare."""
+    proj_full = tmp_path / "proj_full"
+    casetrack.cmd_init(_init_ns(proj_full))
+    entry = json.loads((proj_full / "provenance.jsonl").read_text().splitlines()[-1])
+    assert entry["scaffold"] == "full"
+    assert set(entry["scaffold_leaves"]) == set(casetrack.SCAFFOLD_LEAVES)
+
+    proj_bare = tmp_path / "proj_bare"
+    casetrack.cmd_init(_init_ns(proj_bare, bare=True))
+    entry = json.loads((proj_bare / "provenance.jsonl").read_text().splitlines()[-1])
+    assert entry["scaffold"] == "bare"
+    assert entry["scaffold_leaves"] == []
+
+
+def test_cli_init_bare_flag_smoke(tmp_path: Path):
+    """Exercise `--bare` through the real CLI entrypoint."""
+    proj = tmp_path / "proj"
+    res = subprocess.run(
+        [
+            sys.executable, str(Path(casetrack.__file__)),
+            "init", "--project-dir", str(proj), "--bare",
+        ],
+        capture_output=True, text=True,
+    )
+    assert res.returncode == 0, f"stderr: {res.stderr}"
+    assert (proj / "casetrack.db").exists()
+    assert not (proj / "data").exists(), "bare should skip scaffold"

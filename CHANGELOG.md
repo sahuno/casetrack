@@ -4,6 +4,38 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] — 2026-04-18
+
+Full project-directory scaffold on `casetrack init` (proposal 0003).
+
+### Added
+
+- **`casetrack init` scaffolds a full project tree by default.** Besides the
+  four enforced files (`casetrack.toml`, `casetrack.db`, `provenance.jsonl`,
+  `.gitignore`), init now lays out 16 leaf directories — `data/{raw,ref,
+  validation}/`, `results/`, `scripts/`, `docs/{research,hypothesis}/`,
+  `manuscript/{figures/scripts/{png,pdf,svg},draft,proofs,references}/`,
+  `logs/`, `containers/`, `sandbox/` — with a `.gitkeep` in each leaf so the
+  tree round-trips through git. Scaffolding is idempotent: re-running init
+  on an existing project fills in missing leaves and leaves existing
+  `.gitkeep` mtimes alone.
+- **`casetrack init --bare`** opts out of the scaffold for users
+  retrofitting projects with their own layout. Emits only the four
+  enforced files.
+- Provenance entry for `init_project` now records `scaffold: full|bare`
+  and the list of leaves created.
+
+### Changed
+
+- Default `.gitignore` expanded to cover large analysis artifacts
+  (`data/raw/*`, `containers/*.sif`, `results/**/*.{bam,cram,bedMethyl.gz,
+  vcf.gz,fastq.gz}`, `sandbox/*`) with `!…/.gitkeep` negations so empty
+  scaffold leaves stay visible to git.
+
+### Docs
+
+- `docs/proposals/0003-init-scaffold.md` — full design doc.
+
 ## [0.4.1] — 2026-04-18
 
 One new flag + a worked real-cohort example.
