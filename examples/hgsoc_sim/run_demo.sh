@@ -37,15 +37,23 @@ echo "==> [00c/5] Fetching NanoSim pre-trained cDNA model…"
 bash "$SCRIPTS/00c_fetch_nanosim_model.sh"
 
 echo
-echo "==> [01/5] Preparing VISOR BEDs (DNA lane)…"
+echo "==> [01a/5] Preparing VISOR BEDs (DNA lane)…"
 python3 "$SCRIPTS/01_prepare_visor_beds.py"
 
 echo
-echo "==> [02/5] Running VISOR HACk + Badread + minimap2 for every specimen…"
+echo "==> [01b/5] Preparing NanoSim expression TSVs (RNA lane)…"
+python3 "$SCRIPTS/01b_prepare_expression.py"
+
+echo
+echo "==> [02a/5] Simulating DNA reads: VISOR HACk + Badread + minimap2…"
 bash "$SCRIPTS/02_run_visor.sh"
 
 echo
-echo "==> [03/5] Truncating HGSOC_SIM_02 normal (to simulate a broken library)…"
+echo "==> [02b/5] Simulating RNA reads: NanoSim + minimap2 splice…"
+bash "$SCRIPTS/02b_run_nanosim.sh"
+
+echo
+echo "==> [03/5] Truncating HGSOC_SIM_02 normal RNA (simulates failed library)…"
 bash "$SCRIPTS/03_break_hgsoc_sim_02.sh"
 
 echo

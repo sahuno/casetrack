@@ -1,20 +1,34 @@
 # hgsoc_sim cohort definition — one YAML for the whole simulation.
 #
 # scripts/01_prepare_visor_beds.py turns this into per-assay VISOR BED
-# files. Coordinates are 0-based half-open (BED convention).
+# files (DNA lane). scripts/01b_prepare_expression.py turns it into per-
+# assay NanoSim expression TSVs (RNA lane).
 #
 # ── Layout (v0.4.2) ───────────────────────────────────────────────────────────
 # Each specimen lists its assays — typically ONT-DNA and ONT-RNA side by side.
 # Every assay gets its own directory under cohort/<PATIENT>/<SPECIMEN>/<ASSAY>/
 # so DNA and RNA lanes never share working files.
 #
-# The demo pipeline branches by assay type:
+# Pipelines branch by assay.type:
 #   ONT-DNA  →  VISOR HACk → Badread (R10.4.1 genomic) → minimap2 map-ont
-#   ONT-RNA  →  NanoSim cDNA (R10.4.1) → minimap2 splice              (phase f)
+#   ONT-RNA  →  NanoSim (R9.4.1 cDNA, see containers/README.md) → minimap2 splice
 #
 # Reference is a concatenation of small GRCh38 slices, each renamed to its
 # own contig. The BRCA1 slice (~1 Mb) and TP53 slice (~100 kb) together
 # cover the two most common HGSOC driver loci.
+#
+# ── DNA assay fields ──────────────────────────────────────────────────────────
+#   type        e.g. "ONT-DNA"
+#   coverage    integer — target depth (×) across the reference slices
+#   purity      float 0–100 — tumor purity %; 100 = no normal contamination
+#
+# ── RNA assay fields ──────────────────────────────────────────────────────────
+#   type        e.g. "ONT-RNA"
+#   n_reads     integer — number of cDNA reads to simulate (NanoSim -n)
+#   expression:
+#     gene_multipliers:    # optional — per-gene scaling on baseline log-normal
+#       BRCA1: 0.1         # tumor-specific knockdown (e.g. LOF/1× allele)
+#       TP53:  0.2         # or over-expression (values > 1)
 #
 # ── Variant types supported by VISOR HACk (subset) ────────────────────────────
 #   SNP           - single-nucleotide substitution (alt required)
@@ -39,7 +53,7 @@ reference:
 
 cohort:
   - patient_id: HGSOC_SIM_01
-    # Complete pair — both specimens sim'd at healthy coverage and pass QC.
+    # Complete pair — both specimens pass QC on both assays.
     germline:
       - { chrom: chr17_brca1, pos: 150000, type: SNP, alt: T, note: "het SNP upstream of BRCA1" }
     somatic:
@@ -52,21 +66,24 @@ cohort:
         assays:
           - type: ONT-DNA
             coverage: 25
-            purity: 100      # no tumor contamination — pure germline
-          # RNA landing in phase f:
-          # - type: ONT-RNA
-          #   depth: 30
-          #   expression_profile: baseline
+            purity: 100      # no tumor contamination
+          - type: ONT-RNA
+            n_reads: 8000    # baseline, no multipliers
       - id_suffix: tumor
         tissue_site: tumor
         assays:
           - type: ONT-DNA
             coverage: 35
             purity: 70       # 30% normal contamination
+          - type: ONT-RNA
+            n_reads: 8000
+            expression:
+              gene_multipliers:
+                BRCA1: 0.1   # LOF → strong down-regulation
 
   - patient_id: HGSOC_SIM_02
     # Broken pair — normal RNA deliberately truncated in phase g so
-    # `qc_pass=False` fires on its autoflag. DNA passes in this patient.
+    # `qc_pass=False` fires on its autoflag. All other assays pass.
     germline:
       - { chrom: chr17_brca1, pos: 120000, type: SNP, alt: C, note: "het SNP upstream of BRCA1" }
     somatic:
@@ -78,16 +95,23 @@ cohort:
           - type: ONT-DNA
             coverage: 25
             purity: 100
+          - type: ONT-RNA
+            n_reads: 8000    # will be truncated in phase g
       - id_suffix: tumor
         tissue_site: tumor
         assays:
           - type: ONT-DNA
             coverage: 30
             purity: 75
+          - type: ONT-RNA
+            n_reads: 8000
+            expression:
+              gene_multipliers:
+                TP53: 0.2    # hotspot → moderate down-regulation
 
   - patient_id: HGSOC_SIM_03
-    # Singleton — tumor only, no normal produced. Surfaces via cohort
-    # --pair-by tissue_site as "singleton".
+    # Singleton — tumor only. Surfaces via cohort --pair-by tissue_site
+    # as "singleton" for both DNA and RNA.
     germline:
       - { chrom: chr17_brca1, pos: 180000, type: SNP, alt: G, note: "het SNP upstream of BRCA1" }
     somatic:
@@ -101,3 +125,8 @@ cohort:
           - type: ONT-DNA
             coverage: 30
             purity: 80
+          - type: ONT-RNA
+            n_reads: 8000
+            expression:
+              gene_multipliers:
+                BRCA1: 0.2
