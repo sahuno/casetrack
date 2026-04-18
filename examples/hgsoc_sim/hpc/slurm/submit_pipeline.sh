@@ -204,6 +204,10 @@ phase_merge() {
         local exports="SPECIMEN_ID=$specimen_id,PROJECT_DIR=$PROJECT_DIR"
         exports+=",DEMO_SCRIPTS_DIR=$PATTERN_DIR,CASETRACK_BIN=$CASETRACK_BIN"
         exports+=",SAMTOOLS_CONTAINER=$SAMTOOLS_CONTAINER"
+        # Match the flagstat thresholds — 1.1 Mb sim slice produces ~2k reads
+        # per specimen, nowhere near the 1M default. Lower threshold so the
+        # demo cohort passes on its simulated scale.
+        exports+=",MIN_TOTAL_READS=1000,MIN_MAPPED_PCT=95.0"
         local jid
         # Override the pattern's default --mem=16G; HGSOC sim runs sort+merge
         # on 2-run BAMs where samtools needs more headroom per the profile.
