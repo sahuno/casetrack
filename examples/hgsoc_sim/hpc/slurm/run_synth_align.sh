@@ -3,7 +3,7 @@
 #SBATCH --account=greenbab
 #SBATCH --partition=componc_cpu
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=32G
+#SBATCH --mem=128G
 #SBATCH --time=02:00:00
 #SBATCH --output=logs/synth_align_%A_%a.out
 #SBATCH --error=logs/synth_align_%A_%a.err

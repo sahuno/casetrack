@@ -59,20 +59,20 @@ slurm:
   jobs:
     synth_align:          # VISOR HACk → Badread → minimap2 → sort+index
       cpus: 16
-      mem: 32G
+      mem: 128G            # headroom for Badread + minimap2 at 35x on 1.1 Mb
       time: "02:00:00"
     premerge_flagstat:    # per-assay pre-merge QC (reuses patterns/premerge_runs)
       cpus: 2
       mem: 4G
       time: "00:30:00"
     merge_ont:            # samtools merge on 2 flowcell-runs per specimen
-      cpus: 4
-      mem: 8G
-      time: "00:30:00"
-    modkit_merged:        # modkit pileup on the merged BAM
-      cpus: 16
-      mem: 32G
-      time: "02:00:00"
+      cpus: 8                # follows pattern default; overridden via sbatch --mem at dispatch
+      mem: 64G
+      time: "04:00:00"
+    modkit_merged:        # modkit pileup on the merged BAM (pattern default is 64G)
+      cpus: 8
+      mem: 64G
+      time: "08:00:00"
     mock_scrna:           # deterministic mock summary
       cpus: 1
       mem: 2G

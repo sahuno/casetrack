@@ -202,8 +202,11 @@ phase_merge() {
         exports+=",DEMO_SCRIPTS_DIR=$PATTERN_DIR,CASETRACK_BIN=$CASETRACK_BIN"
         exports+=",SAMTOOLS_CONTAINER=$SAMTOOLS_CONTAINER"
         local jid
+        # Override the pattern's default --mem=16G; HGSOC sim runs sort+merge
+        # on 2-run BAMs where samtools needs more headroom per the profile.
         jid=$(_dispatch "merge $specimen_id" "$upstream" \
             --chdir="$PROJECT_DIR" --export=ALL,"$exports" \
+            --mem=64G \
             "$PATTERN_DIR/run_merge.sh")
         [[ -n "$jid" ]] && deps+=("$jid")
     done < <(_specimens_with_ont)
