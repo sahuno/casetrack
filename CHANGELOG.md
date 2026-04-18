@@ -4,6 +4,86 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] — 2026-04-18
+
+Multi-assay HGSOC simulation demo. No library changes — purely an
+`examples/hgsoc_sim/` expansion. Exercises casetrack's v0.4 per-assay QC
+paths end-to-end on a realistic DNA + RNA cancer cohort.
+
+### Added
+
+- **`examples/hgsoc_sim/` multi-assay cohort** — every specimen now has
+  both an ONT-DNA and an ONT-RNA assay side by side. 10 assays total
+  across 3 patients / 5 specimens. The broken case matches proposal
+  0002 §4.5 exactly: HGSOC_SIM_02's normal ONT-RNA fails while its DNA
+  passes — per-assay QC, not per-specimen.
+- **RNA simulation lane** — NanoSim cDNA (`human_NA12878_cDNA_Bham1_guppy`,
+  R9.4.1) + minimap2 splice-aware alignment. Per-assay expression TSVs
+  generated from a log-normal baseline + gene-level multipliers in
+  `config.yaml` (`BRCA1: 0.1` in a BRCA1-LOF tumor, etc.).
+- **`config.yaml` multi-assay schema** — `specimen.assay_type` (scalar)
+  replaced with `specimen.assays: [{type, coverage/purity, ...}, ...]`.
+  Each assay gets its own directory under
+  `sandbox/hgsoc_sim/cohort/<PATIENT>/<SPECIMEN>/<ASSAY>/`.
+- **`scripts/00b_fetch_gencode.sh`** — downloads GENCODE v47 GTF,
+  slices + rewrites coords to match the renamed reference contigs, runs
+  gffread to extract per-slice transcript FASTAs. Output:
+  `ref/transcripts.fa` + `ref/transcripts.tsv` (transcript_id, gene_name,
+  slice, length).
+- **`scripts/00c_fetch_nanosim_model.sh`** — pulls the NanoSim pre-trained
+  cDNA model tarball from GitHub, extracts under
+  `sandbox/hgsoc_sim/nanosim_models/`. Override via `NANOSIM_MODEL=...`.
+- **`scripts/01b_prepare_expression.py`** — emits per-RNA-assay NanoSim
+  expression TSVs. Deterministic baseline (fixed seed) + specimen-specific
+  multipliers. NumPy + pandas.
+- **`scripts/02b_run_nanosim.sh`** — per-RNA-assay simulation pipeline.
+  Mirrors `02_run_visor.sh`'s runner-fallback chain (apptainer / docker /
+  native).
+- **`containers/README.md`** — expanded to six images (+gffread, +NanoSim).
+  Documents pipeline overview for both lanes + the R9.4.1-cDNA vs R10.4.1
+  chemistry caveat and the `NANOSIM_MODEL` escape hatch.
+- **CI smoke workflow extended** — now also exercises
+  `01b_prepare_expression.py` against a stub `transcripts.tsv`, verifies
+  every RNA assay's expression TSV has the correct header + sums to its
+  configured `n_reads`.
+- **`05_bootstrap_casetrack.py` uses `--column-prefix`** (the v0.4.1
+  flag) per assay type — DNA metrics land as `ont_dna_*` columns, RNA as
+  `ont_rna_*`, so they never collide on the shared `assays` table.
+
+### Changed
+
+- **`scripts/03_break_hgsoc_sim_02.sh`** — target flipped from DNA to
+  RNA. HGSOC_SIM_02's normal RNA BAM is downsampled to ~3% of reads
+  (~240 reads, below MIN_READS=5000) to trigger `qc_pass=False` +
+  autoflag. DNA on the same specimen stays intact.
+- **`scripts/02_run_visor.sh`** — iterates the per-specimen assay list
+  instead of assuming one assay per specimen. Output path now includes
+  the assay type: `<SPECIMEN>/ONT-DNA/sim.srt.bam`.
+- **`scripts/04_summarize_mock.py`** — walks the three-level directory
+  tree (patient / specimen / assay) and emits one summary TSV per assay.
+- **`run_demo.sh`** — step labels updated to make the DNA/RNA lanes
+  explicit (01a/01b, 02a/02b).
+
+### Pipeline summary
+
+| Lane | Pipeline | Chemistry |
+|---|---|---|
+| ONT-DNA | VISOR HACk → Badread → minimap2 `-ax map-ont` | R10.4.1 |
+| ONT-RNA | NanoSim transcriptome → minimap2 `-ax splice -uf -k14` | R9.4.1 cDNA (see caveat) |
+
+### Cohort shape after running `run_demo.sh`
+
+```
+                  ONT-DNA    ONT-RNA
+HGSOC_SIM_01 N     pass       pass
+HGSOC_SIM_01 T     pass       pass
+HGSOC_SIM_02 N     pass       FAIL    ← matches proposal 0002 §4.5
+HGSOC_SIM_02 T     pass       pass
+HGSOC_SIM_03 T     pass       pass
+
+10 assays  ·  9 pass / 1 FAIL
+```
+
 ## [0.4.1] — 2026-04-18
 
 One new flag + a worked real-cohort example.

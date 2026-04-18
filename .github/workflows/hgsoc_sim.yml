@@ -39,8 +39,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (pyyaml only)
-        run: python -m pip install pyyaml
+      - name: Install deps
+        # pyyaml for config parsing; numpy + pandas for 01b expression prep.
+        run: python -m pip install pyyaml numpy pandas
 
       - name: Shell-lint the scripts
         run: |
@@ -58,6 +59,29 @@ jobs:
       - name: Run 01_prepare_visor_beds.py into a tmpdir
         run: |
           python examples/hgsoc_sim/scripts/01_prepare_visor_beds.py \
+            --sandbox "${RUNNER_TEMP}/hgsoc_sim_smoke"
+
+      - name: Build a stub transcripts.tsv and run 01b_prepare_expression.py
+        run: |
+          # The RNA prep script needs ref/transcripts.tsv. In the real flow
+          # that's produced by 00b_fetch_gencode.sh via GENCODE + gffread.
+          # CI doesn't have those tools; instead we synthesize a stub with
+          # the three genes the config.yaml multipliers reference (BRCA1,
+          # TP53) plus a couple of neighbors so the normalization has
+          # something to work with.
+          mkdir -p "${RUNNER_TEMP}/hgsoc_sim_smoke/ref"
+          cat > "${RUNNER_TEMP}/hgsoc_sim_smoke/ref/transcripts.tsv" <<'TSV'
+          transcript_id	gene_name	slice	length
+          ENST_BRCA1_01	BRCA1	chr17_brca1	7200
+          ENST_BRCA1_02	BRCA1	chr17_brca1	6500
+          ENST_TP53_01	TP53	chr17_tp53	2600
+          ENST_TP53_02	TP53	chr17_tp53	1800
+          ENST_NBR1_01	NBR1	chr17_brca1	3500
+          ENST_NBR2_01	NBR2	chr17_brca1	2900
+          TSV
+          # Strip the leading whitespace from the heredoc (indented yaml).
+          sed -i 's/^          //' "${RUNNER_TEMP}/hgsoc_sim_smoke/ref/transcripts.tsv"
+          python examples/hgsoc_sim/scripts/01b_prepare_expression.py \
             --sandbox "${RUNNER_TEMP}/hgsoc_sim_smoke"
 
       - name: Assert expected cohort shape (multi-assay)
@@ -149,7 +173,45 @@ jobs:
                   f"got {got_n}"
               )
 
-          print(f"OK: {len(expected)} DNA assay(s) verified across "
-                f"{len(set((p,s) for p,s,_ in expected))} specimen(s); "
-                f"BED formats + variant counts match config.yaml.")
+          # ── RNA expression TSV checks ──────────────────────────────────
+          RNA_TYPES = {"ONT-RNA"}
+          expected_rna: set[tuple[str, str, str]] = set()
+          per_rna_target: dict[tuple[str, str, str], int] = {}
+          for patient in cfg["cohort"]:
+              pid = patient["patient_id"]
+              for spec in patient["specimens"]:
+                  suffix = spec["id_suffix"]
+                  for a in spec.get("assays") or []:
+                      if a["type"] in RNA_TYPES:
+                          key = (pid, suffix, a["type"])
+                          expected_rna.add(key)
+                          per_rna_target[key] = int(a.get("n_reads", 10000))
+
+          # Every RNA assay must have expression.tsv emitted by 01b.
+          for patient, specimen, assay in expected_rna:
+              adir = root / patient / specimen / assay
+              tsv = adir / "expression.tsv"
+              assert tsv.exists(), f"missing {tsv}"
+              lines = tsv.read_text().splitlines()
+              # Header + at least one row.
+              assert lines[0].split("\t") == ["target_id", "est_counts", "tpm"], (
+                  f"{tsv}: header drift — got {lines[0]!r}"
+              )
+              assert len(lines) >= 2, f"{tsv}: empty data"
+              # est_counts column must sum to the configured n_reads.
+              total = 0
+              for line in lines[1:]:
+                  cols = line.split("\t")
+                  assert len(cols) == 3, f"{tsv}: expected 3 cols, got {len(cols)}"
+                  total += int(cols[1])
+              want = per_rna_target[(patient, specimen, assay)]
+              assert total == want, (
+                  f"{tsv}: est_counts sum {total} != n_reads {want}"
+              )
+
+          print(
+              f"OK: {len(expected)} DNA assay(s) + {len(expected_rna)} RNA assay(s) "
+              f"verified across {len(set((p,s) for p,s,_ in expected | expected_rna))} "
+              f"specimen(s); BED/expression formats + variant counts match config.yaml."
+          )
           PY
