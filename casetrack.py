@@ -4044,9 +4044,109 @@ def _filesystem_name(path: Path) -> str:
     return "unknown"
 
 
-def cmd_doctor_project(args):
-    project_dir, _schema = _resolve_project(args.project_dir)
+def _suggest_clean_id(bad: str) -> str | None:
+    """Return a regex-compliant slug derived from `bad`, or None if not possible.
+
+    Heuristic: replace each run of forbidden characters with a single `_`,
+    strip leading `_`/`-`/`.`, truncate to 64. If the result matches the
+    default _ID_PATTERN, return it; else return None (manual rename needed).
+    """
+    if not isinstance(bad, str):
+        return None
+    # Collapse runs of forbidden chars to a single underscore.
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", bad)
+    # Strip leading/trailing separators.
+    cleaned = cleaned.lstrip("_-.")
+    cleaned = cleaned.rstrip("_-.")
+    cleaned = cleaned[:64]
+    if not cleaned:
+        return None
+    return cleaned if _ID_PATTERN.fullmatch(cleaned) else None
+
+
+def _scan_ids_for_format(project_dir: Path, schema: dict) -> list[dict]:
+    """Scan patients / specimens / assays for IDs that violate the schema's
+    format rules. Returns a list of violation dicts with level, id, rule,
+    and an optional suggestion. Read-only — never mutates.
+    """
     db_path = project_dir / PROJECT_DB_NAME
+    violations: list[dict] = []
+    conn = open_project_db(db_path)
+    try:
+        for level in LEVEL_ORDER:
+            level_spec = schema["levels"][level]
+            key_col = level_spec["key"]
+            table = f"{level}s"
+            rows = conn.execute(
+                f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
+            ).fetchall()
+            for (value,) in rows:
+                try:
+                    validate_hierarchy_id(value, schema, level)
+                except ValueError as e:
+                    violations.append({
+                        "level": level,
+                        "id": value,
+                        "rule": str(e),
+                        "suggestion": _suggest_clean_id(
+                            value if isinstance(value, str) else str(value)
+                        ),
+                    })
+    finally:
+        conn.close()
+    return violations
+
+
+def _print_id_format_report(violations: list[dict], fmt: str) -> None:
+    """Emit the scan report in either human-table or TSV form."""
+    if fmt == "tsv":
+        print("level\tid\tsuggestion\trule")
+        for v in violations:
+            sug = v["suggestion"] or ""
+            print(f"{v['level']}\t{v['id']}\t{sug}\t{v['rule']}")
+        return
+    # Human-readable table.
+    if not violations:
+        print("✓ All hierarchy IDs conform to the schema's format rules.")
+        return
+    print(f"Found {len(violations)} malformed hierarchy ID(s):\n")
+    for v in violations:
+        sug = v["suggestion"]
+        hint = f" → suggested rename: {sug!r}" if sug else " → no safe suggestion (manual rename needed)"
+        print(f"  [{v['level']}] {v['id']!r}{hint}")
+        print(f"      rule: {v['rule']}")
+        print()
+    print(
+        "No auto-rename: patient/specimen/assay renames have FK cascade "
+        "implications. Produce a migration TSV (old_id → new_id) and apply "
+        "it manually, or loosen the rule via [levels.<level>] id_pattern / "
+        "allow_case_variants / [project] allow_unicode_ids in casetrack.toml."
+    )
+
+
+def cmd_doctor_project(args):
+    project_dir, schema = _resolve_project(args.project_dir)
+    db_path = project_dir / PROJECT_DB_NAME
+
+    # v0.6: --id-format switches to hierarchy-ID scan mode (proposal 0005
+    # Part A). Read-only; exits non-zero if any non-conforming IDs exist so
+    # CI can catch drift without the user having to re-parse free-text output.
+    if getattr(args, "id_format", False):
+        fmt = getattr(args, "fmt", None) or "table"
+        if fmt not in ("table", "tsv"):
+            print(
+                f"Error: --fmt must be one of table|tsv, got {fmt!r}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        try:
+            violations = _scan_ids_for_format(project_dir, schema)
+        except sqlite3.Error as e:
+            print(f"Error: DB read failed: {e}", file=sys.stderr)
+            sys.exit(2)
+        _print_id_format_report(violations, fmt)
+        sys.exit(1 if violations else 0)
+
     workers = args.workers or 8
     writes = args.writes or 50
 
@@ -6480,13 +6580,23 @@ Examples:
     # ── doctor ──
     p_doctor = subparsers.add_parser(
         "doctor",
-        help="[v0.3] Stress-test SQLite concurrency on the project's filesystem",
+        help="[v0.3] Stress-test SQLite concurrency; [v0.6] --id-format scans hierarchy IDs",
     )
     p_doctor.add_argument("--project-dir", required=True, help="Casetrack project directory")
     p_doctor.add_argument("--workers", type=int, default=8,
                           help="Concurrent writer processes (default: 8)")
     p_doctor.add_argument("--writes", type=int, default=50,
                           help="INSERTs per worker (default: 50)")
+    p_doctor.add_argument(
+        "--id-format", action="store_true",
+        help="[v0.6] Scan patient/specimen/assay IDs against the schema's "
+             "format rules (proposal 0005 Part A). Read-only. Exits 0 if "
+             "clean, 1 if any malformed IDs are found.",
+    )
+    p_doctor.add_argument(
+        "--fmt", choices=["table", "tsv"], default="table",
+        help="[v0.6] Output format for --id-format (default: table)",
+    )
 
     # ── recover ──
     p_recover = subparsers.add_parser(
