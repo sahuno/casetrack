@@ -1,7 +1,7 @@
 # Proposal 0004 — Nextflow integration via `casetrack-nf-subworkflows`
 
-**Status**: accepted (v0.1.0 pilot shipped 2026-04-18)
-**Target release**: casetrack v0.5.0 + casetrack-nf-subworkflows v0.1.0
+**Status**: accepted (v0.4.0 drop-in shipped 2026-04-19; v0.1.0 pilot shipped 2026-04-18)
+**Target release**: casetrack v0.5.0 + casetrack-nf-subworkflows v0.4.0
 **Breaking**: no (additive; opt-in via `[layout]` / `[analyses]` TOML sections)
 **Author**: Samuel Ahuno
 
@@ -191,7 +191,7 @@ CASETRACK_REGISTER(tuple(meta, tool_name, summary_filename, summary_tsv))
 // -> emits tuple(meta, tool_name) on .out.ok after the DB write succeeds
 ```
 
-## Current state (v0.1.0)
+## Current state (v0.4.0)
 
 | Component | Status | Notes |
 |---|---|---|
@@ -203,12 +203,13 @@ CASETRACK_REGISTER(tuple(meta, tool_name, summary_filename, summary_tsv))
 | Stub smoke test | ✅ shipped | ~5 sec end-to-end; now covers L1 + L2 |
 | L2 trace parser | ✅ shipped v0.2.0 | `bin/trace_to_casetrack.py` + `workflow.onComplete` hook; one `casetrack append --analysis <tool>_trace` per tool |
 | L3 versions parser | ✅ shipped v0.3.0 | `channel.topic('versions').collectFile(...)` → `versions.yml` → `bin/versions_to_casetrack.py` → `{prefix}_{tool}_version` columns |
+| Drop-in config for unmodified nf-core pipelines | ✅ shipped v0.4.0 | `conf/casetrack_dropin.config` — L2 + L3 via `-c` for any pipeline; see §Drop-in below |
+| Level-aware L2/L3 helpers | ✅ shipped v0.4.0 | `--level {patient,specimen,assay}` + `--samplesheet-key-col` in `trace_to_casetrack.py` / `versions_to_casetrack.py` |
+| nf-core/methylseq drop-in config | ✅ shipped v0.4.0 | Covered by the generic drop-in above; no methylseq-specific work needed |
 | Tutorial + worked example | ✅ shipped | `casetrack-nf-subworkflows/docs/TUTORIAL.md` + `examples/giab_chr21/` |
-| L3 versions manifest | ⏳ pending | Section below |
-| Additional wrappers (DORADO, CALLMODS, SORT, SNIFFLES2) | ⏳ pending | Mechanical — one per week |
-| nf-core/methylseq drop-in config | ⏳ pending | v0.3+ |
 | Real-data validation | ✅ shipped | GIAB HG006_PAY77227 chr21 — see §Pilot below |
-| Publish to GitHub | ⏳ pending | After L2 + real-data |
+| Additional wrappers (DORADO, CALLMODS, SORT, SNIFFLES2) | ⏳ pending | Mechanical — one per week |
+| Publish to GitHub with CI | ⏳ pending | Repo is public; `.github/workflows/` not yet added |
 
 ## Implemented — L2: trace → manifest (v0.2.0)
 
@@ -251,6 +252,33 @@ Versions are run-level (same tool version for every assay touched by the run), s
 ### Opt out
 
 `--casetrack_import_versions=false` on the pipeline invocation.
+
+## Implemented — v0.4.0: drop-in config for unmodified nf-core pipelines
+
+The L1 wrapper pattern (`*_tracked.nf`) only applies to pipelines you author — a stock `nf-core/methylseq` or `nf-core/sarek` run can't import our subworkflows without editing its `main.nf`. v0.4.0 ships a second integration mode that attaches L2 + L3 to *any* Nextflow pipeline via `-c`, with no code changes upstream.
+
+### What shipped
+
+- `casetrack-nf-subworkflows/conf/casetrack_dropin.config` — a standalone Nextflow config. Enables extended trace fields, publishes reports under `<casetrack_project_dir>/results/_nextflow/<run_tag>/`, and registers a `workflow.onComplete` handler that invokes `bin/trace_to_casetrack.py` (L2) and `bin/versions_to_casetrack.py` (L3). For nf-core pipelines, it auto-discovers versions at `${outdir}/pipeline_info/*_versions.yml` as fallback when no explicit topic channel is collected.
+- **Level-aware helpers** — `bin/trace_to_casetrack.py` and `bin/versions_to_casetrack.py` both accept `--level {patient,specimen,assay}` and `--samplesheet-key-col <name>`, so the same binaries work against a patient-level, specimen-level, or assay-level casetrack project. Resolves the L2/L3 half of open question Q4.
+- **New pipeline params**: `--casetrack_level`, `--casetrack_samplesheet_key_col`, `--casetrack_bin` (in addition to the existing `--casetrack_project_dir`, `--run_tag`, `--casetrack_import_trace`, `--casetrack_import_versions`).
+
+### Usage
+
+```bash
+nextflow run nf-core/methylseq -r 3.0.0 \
+    -c /path/to/casetrack-nf-subworkflows/conf/casetrack_dropin.config \
+    --casetrack_project_dir /abs/path/to/project \
+    --run_tag 20260419_hg38_methylseq_v1 \
+    --casetrack_level specimen \
+    --input samplesheet.csv
+```
+
+No edits to the methylseq repo. No wrapper subworkflows. L2 trace + L3 versions land in `casetrack.db` after the run.
+
+### Scope limitation
+
+L1 data columns (`{prefix}_mean_meth`, etc.) still require `*_tracked.nf` wrappers — the drop-in doesn't know which tool outputs are scientifically meaningful. For pipelines you author, wrappers give you L1+L2+L3; for stock pipelines, the drop-in gives you L2+L3 only.
 
 ## Pilot — GIAB HG006 chr21 (2026-04-19)
 
@@ -311,9 +339,11 @@ Medium-term (next month):
 6. Document on mkdocs/Pages with one fully-worked example pipeline.
 
 Long-term:
-7. Drop-in `-c casetrack.config` for nf-core/methylseq.
-8. `casetrack-nf-subworkflows` publishes to `nf-core/subworkflows` if the upstream community wants it.
-9. L3 (versions → manifest) formalization.
+7. `casetrack-nf-subworkflows` publishes to `nf-core/subworkflows` if the upstream community wants it.
+
+Shipped since original roadmap:
+- Drop-in `-c casetrack_dropin.config` — now generic, covers nf-core/methylseq (v0.4.0).
+- L3 (versions → manifest) formalization (v0.3.0).
 
 ## Open questions
 
@@ -331,7 +361,7 @@ If `CASETRACK_REGISTER` fails (e.g. DB busy), does the wrapper's `.out.casetrack
 
 ### Q4 — patient-level and specimen-level tracked subworkflows
 
-All shipped wrappers are assay-level. A cohort-level DMR caller would be patient-level (or "cohort-level" which doesn't map to casetrack today). Do we need to extend the scheme? Probably. Defer to when the first non-assay wrapper is requested.
+**Partially resolved in v0.4.0.** The drop-in config + level-aware L2/L3 helpers (`--level {patient,specimen,assay}`) now handle trace and versions tracking at any level. L1 wrappers (`*_tracked.nf`) remain assay-only — extending the `CASETRACK_REGISTER` contract to patient/specimen outputs is still deferred to when the first non-assay wrapper is requested.
 
 ### Q5 — interaction with QC autoflag
 
