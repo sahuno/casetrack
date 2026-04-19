@@ -202,6 +202,8 @@ CASETRACK_REGISTER(tuple(meta, tool_name, summary_filename, summary_tsv))
 | Extended samplesheet schema | ✅ shipped | JSON Schema, `nf-validation`-compatible |
 | Stub smoke test | ✅ shipped | ~5 sec end-to-end; now covers L1 + L2 |
 | L2 trace parser | ✅ shipped v0.2.0 | `bin/trace_to_casetrack.py` + `workflow.onComplete` hook; one `casetrack append --analysis <tool>_trace` per tool |
+| L3 versions parser | ✅ shipped v0.3.0 | `channel.topic('versions').collectFile(...)` → `versions.yml` → `bin/versions_to_casetrack.py` → `{prefix}_{tool}_version` columns |
+| Tutorial + worked example | ✅ shipped | `casetrack-nf-subworkflows/docs/TUTORIAL.md` + `examples/giab_chr21/` |
 | L3 versions manifest | ⏳ pending | Section below |
 | Additional wrappers (DORADO, CALLMODS, SORT, SNIFFLES2) | ⏳ pending | Mechanical — one per week |
 | nf-core/methylseq drop-in config | ⏳ pending | v0.3+ |
@@ -236,18 +238,19 @@ Original design proposed `add-metadata`. Turns out `add-metadata` rejects column
 
 Nextflow's `process` trace field contains `SUBWORKFLOW:MODULE` (e.g. `MODKIT_PILEUP_TRACKED:MODKIT_PILEUP`). Last `:`-separated segment is the tool name (matched case-insensitively against `[analyses.<tool>]` keys). Nextflow's `tag` trace field carries `tag "${meta.id}"` from each process — because we require `meta.id == meta.assay_id` in §0.2, that's our join key. Rows with a tool not in `[analyses]` (e.g. `SUMMARIZE_MODKIT`, `CASETRACK_REGISTER`) are silently skipped.
 
-## Planned — L3: versions → manifest
+## Implemented — L3: versions → manifest (v0.3.0)
 
-nf-core modules emit a `topic: versions` channel that collects tool + version tuples across all processes. We collect to one `versions.yml` per run and write as run-level metadata:
+Every nf-core module emits a `topic: versions` channel with `(process_name, tool, version)` tuples. We collect them to a single `results/_nextflow/<run_tag>/versions.yml` (nf-core's YAML shape) via `channel.topic('versions').collectFile(...)`, then `workflow.onComplete` invokes `bin/versions_to_casetrack.py` which parses the YAML and emits one `casetrack append --analysis <tool>_versions --column-prefix <prefix>` per tracked tool.
 
-```toml
-[analyses.<tool>]
-level = "assay"
-# …
-versions_column = "{prefix}_tool_version"   # optional: stores the version in the per-assay row
-```
+### Columns added
 
-Or, simpler: a single `results/_nextflow/<run_tag>/versions.yml` next to the trace files, referenced from the run_manifest.json without per-row duplication.
+`{prefix}_{tool}_version` (TEXT). Verbose for single-tool processes (`modkit_modkit_version`), but preserves fidelity when a process reports multiple tools — e.g. a `SUMMARIZE_MODKIT` process might report both `python` and `pandas`.
+
+Versions are run-level (same tool version for every assay touched by the run), so they're broadcast to every `assay_id` from the samplesheet. If historical versioning matters, the `versions.yml` next to the trace files preserves per-run provenance without bloating the DB.
+
+### Opt out
+
+`--casetrack_import_versions=false` on the pipeline invocation.
 
 ## Pilot — GIAB HG006 chr21 (2026-04-19)
 
