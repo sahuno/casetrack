@@ -205,7 +205,7 @@ CASETRACK_REGISTER(tuple(meta, tool_name, summary_filename, summary_tsv))
 | L3 versions manifest | ⏳ pending | Section below |
 | Additional wrappers (DORADO, CALLMODS, SORT, SNIFFLES2) | ⏳ pending | Mechanical — one per week |
 | nf-core/methylseq drop-in config | ⏳ pending | v0.3+ |
-| Real-data validation | ⏳ pending | GIAB chr21 ONT next |
+| Real-data validation | ✅ shipped | GIAB HG006_PAY77227 chr21 — see §Pilot below |
 | Publish to GitHub | ⏳ pending | After L2 + real-data |
 
 ## Implemented — L2: trace → manifest (v0.2.0)
@@ -248,6 +248,52 @@ versions_column = "{prefix}_tool_version"   # optional: stores the version in th
 ```
 
 Or, simpler: a single `results/_nextflow/<run_tag>/versions.yml` next to the trace files, referenced from the run_manifest.json without per-row duplication.
+
+## Pilot — GIAB HG006 chr21 (2026-04-19)
+
+Ran `MODKIT_PILEUP_TRACKED` on one real GIAB BAM:
+
+- **Input**: `HG006_PAY77227.hg38.chr21.bam` (1.5 GB, R10.4.1 ONT WGS, chr21 only).
+- **Reference**: `/data1/greenbab/database/hg38/v0/Homo_sapiens_assembly38.fasta`.
+- **Run tag**: `20260419_hg38_modkit_v1`.
+- **Profile**: `slurm,apptainer` on IRIS (`componc_cpu`, 4 CPUs, 16 GB RAM).
+
+Final casetrack row for `HG006_PAY77227` (assay level):
+
+| Column | Value | Source |
+|---|---|---|
+| `modkit_mean_meth`     | 0.0424 | L1 (summarize_modkit.py, mod='m', min_cov=5) |
+| `modkit_n_cpgs`        | 14,406,945 | L1 |
+| `modkit_mean_cov`      | 16.64 | L1 |
+| `modkit_run_tag`       | 20260419_hg38_modkit_v1 | L1 auto-injected |
+| `modkit_pileup_done`   | 2026-04-19T01:28:47 | L1 |
+| `modkit_slurm_job_id`  | 19512075 | **L2** — real SLURM id |
+| `modkit_realtime_sec`  | 155 | **L2** |
+| `modkit_peak_rss_bytes`| 9,985,798,963 | **L2** — real memory usage |
+| `modkit_exit_status`   | 0 | **L2** |
+| `modkit_attempts`      | 1 | **L2** |
+| `modkit_queue`         | componc_cpu | **L2** |
+
+### Bugs the pilot uncovered (all fixed)
+
+1. **Local modkit SIF was v0.5.0; nf-core module needs ≥0.6.1**. The `--bgzf` / `--bgzf-threads` flags don't exist in 0.5.0 — first run exited 1 with no modkit stderr (nf-core module version assumption is silent). Fix: pin the Galaxy depot singularity URL directly in the run's `custom.config`:
+   ```groovy
+   process {
+       withName: 'MODKIT_PILEUP_TRACKED:MODKIT_PILEUP' {
+           container = 'https://depot.galaxyproject.org/singularity/ont-modkit:0.6.1--hcdda2d0_0'
+       }
+   }
+   ```
+
+2. **Nextflow's `workflow.containerEngine` isn't `'singularity'` under Apptainer** in recent Nextflow versions. The stock nf-core module's container ternary fell through to the `biocontainers/...` docker.io URL, which requires auth. Same fix (container pin) resolves it.
+
+3. **`summarize_modkit.py` OOMed at 2 GB on a 522 MB bedMethyl (~55M rows)** because the original implementation stored per-site pct/coverage lists. Fix: streaming single-pass stats (see `1e9c765`); also filter to `--mod-code m` because modkit emits three rows per site (m/h/a) which isn't meaningful averaged together.
+
+### Lessons for future wrappers
+
+- **Pin Galaxy depot singularity URLs explicitly** in `custom.config` for any pipeline run — the stock nf-core container ternary is brittle under Apptainer.
+- **Stub smoke tests can't catch scale problems.** Every new `SUMMARIZE_<TOOL>` script must be single-pass streaming; tiny-data unit tests won't exercise the OOM edge.
+- **Watch for tool version drift.** nf-core modules assume specific versions (their `environment.yml`). Local SIFs that look compatible (`modkit --help` works) can still fail on new flags. When in doubt, use the module's declared container.
 
 ## Roadmap — priorities
 
