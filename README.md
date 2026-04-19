@@ -346,6 +346,47 @@ The `qc_pass` / `qc_fail_reason` / `qc_warn` columns are **consumed** by
 See `examples/run_modkit.sh` for a complete worked example and
 `examples/scripts/summarize_*.py` for the summarize-script contract.
 
+### One-flag append via path inference (v0.5)
+
+If the pipeline writes into a tool-first directory tree, phase 3 collapses
+to a single flag:
+
+```
+results/
+└── modkit_pileup/                    # tool name → matches [analyses.modkit_pileup]
+    └── 20260418_hg38_v1/             # run_tag = {date}_{genome}_{description}
+        └── P01/P01_primary/P01_primary_ONT1/
+            └── modkit_summary.tsv
+```
+
+The project's `casetrack.toml` declares the layout and the tool:
+
+```toml
+[layout]
+results_dir = "results"
+
+[layout.path_templates]
+assay = "{tool}/{run_tag}/{patient_id}/{specimen_id}/{assay_id}"
+
+[analyses.modkit_pileup]
+level         = "assay"
+column_prefix = "modkit"
+summary_tsv   = "modkit_summary.tsv"
+```
+
+Then from any leaf directory:
+
+```bash
+cd results/modkit_pileup/20260418_hg38_v1/P01/P01_primary/P01_primary_ONT1
+casetrack append --infer-from-path
+```
+
+The CLI walks up to `casetrack.toml`, matches the path against the
+templates, and fills `--project-dir`, `--level`, `--analysis`,
+`--column-prefix`, and `--results` from the `[analyses.<tool>]` entry. The
+run_tag is injected as `{prefix}_run_tag` in the target row so re-runs can
+be compared later via `casetrack query`. Explicit flags still override.
+
 ## Concurrency & safety rails
 
 - **SQLite WAL + `busy_timeout=30000`** in project mode (`BEGIN IMMEDIATE`

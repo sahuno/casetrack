@@ -78,6 +78,14 @@ VALID_COLUMN_TYPES = {"TEXT", "INTEGER", "REAL", "BOOLEAN", "DATE"}
 # Hardcoded hierarchy for v0.3 (Q1 from proposal 0001 §19): patient → specimen → assay.
 LEVEL_ORDER = ("patient", "specimen", "assay")
 
+# Placeholders allowed in [layout.path_templates.<level>] entries.
+# {tool}    — the analysis tool (matches an [analyses.<tool>] section name)
+# {run_tag} — the run identifier (date_genome_description convention)
+# {patient_id}, {specimen_id}, {assay_id} — level keys
+LAYOUT_PLACEHOLDER_NAMES = {
+    "tool", "run_tag", "patient_id", "specimen_id", "assay_id",
+}
+
 # Default pragma values for every SQLite connection casetrack opens.
 SQLITE_BUSY_TIMEOUT_MS = 30000
 
@@ -157,6 +165,26 @@ default_level = "assay"
 [engine]
 wal             = true
 busy_timeout_ms = {SQLITE_BUSY_TIMEOUT_MS}
+
+# Tool-first results directory convention — consumed by
+# `casetrack append --infer-from-path`. Re-running a tool keeps outputs
+# grouped under the same tool/, with separate {{run_tag}} subtrees per run.
+[layout]
+results_dir = "results"
+
+[layout.path_templates]
+patient  = "{{tool}}/{{run_tag}}/{{patient_id}}"
+specimen = "{{tool}}/{{run_tag}}/{{patient_id}}/{{specimen_id}}"
+assay    = "{{tool}}/{{run_tag}}/{{patient_id}}/{{specimen_id}}/{{assay_id}}"
+
+# Declare each tool that writes into results/ so inference can reject typos
+# and apply the right --column-prefix / summary-file convention per analysis.
+# Example:
+#
+# [analyses.modkit_pileup]
+# level         = "assay"
+# column_prefix = "modkit"
+# summary_tsv   = "modkit_summary.tsv"
 """
 
 
@@ -212,6 +240,28 @@ default_level = "assay"
 [engine]
 wal             = true
 busy_timeout_ms = {SQLITE_BUSY_TIMEOUT_MS}
+
+# Tool-first results directory convention — see the blank template comment.
+[layout]
+results_dir = "results"
+
+[layout.path_templates]
+patient  = "{{tool}}/{{run_tag}}/{{patient_id}}"
+specimen = "{{tool}}/{{run_tag}}/{{patient_id}}/{{specimen_id}}"
+assay    = "{{tool}}/{{run_tag}}/{{patient_id}}/{{specimen_id}}/{{assay_id}}"
+
+# Declare one [analyses.<tool>] table per tool your pipeline runs.
+# Example seeded for HGSOC ONT cohorts:
+#
+# [analyses.modkit_pileup]
+# level         = "assay"
+# column_prefix = "modkit"
+# summary_tsv   = "modkit_summary.tsv"
+#
+# [analyses.cohort_dmr]
+# level         = "patient"
+# column_prefix = "dmr"
+# summary_tsv   = "dmr_cohort_summary.tsv"
 """
 
 
@@ -270,6 +320,27 @@ default_level = "assay"
 [engine]
 wal             = true
 busy_timeout_ms = {SQLITE_BUSY_TIMEOUT_MS}
+
+# Tool-first results directory convention — see the blank template comment.
+[layout]
+results_dir = "results"
+
+[layout.path_templates]
+patient  = "{{tool}}/{{run_tag}}/{{patient_id}}"
+specimen = "{{tool}}/{{run_tag}}/{{patient_id}}/{{specimen_id}}"
+assay    = "{{tool}}/{{run_tag}}/{{patient_id}}/{{specimen_id}}/{{assay_id}}"
+
+# Example tool entries for GIAB ONT cohorts (extend as needed):
+#
+# [analyses.dorado_basecaller]
+# level         = "assay"
+# column_prefix = "dorado"
+# summary_tsv   = "dorado_summary.tsv"
+#
+# [analyses.clair3]
+# level         = "assay"
+# column_prefix = "clair3"
+# summary_tsv   = "clair3_summary.tsv"
 """
 
 
@@ -323,6 +394,95 @@ def validate_schema(schema: dict) -> None:
             raise SchemaError(
                 f"[levels.{level}] parent mismatch: expected {expected!r}, got {actual!r}"
             )
+
+    # [layout] and [analyses] are optional, additive across any schema_v. They
+    # describe a tool-first results directory convention and the known tools
+    # that write into it — consumed by `casetrack append --infer-from-path`.
+    if "layout" in schema:
+        _validate_layout(schema["layout"])
+    if "analyses" in schema:
+        _validate_analyses(schema["analyses"])
+
+
+def _validate_layout(layout: dict) -> None:
+    if not isinstance(layout, dict):
+        raise SchemaError("[layout] must be a table")
+    results_dir = layout.get("results_dir", "results")
+    if not isinstance(results_dir, str) or not results_dir:
+        raise SchemaError("[layout] results_dir must be a non-empty string")
+    templates = layout.get("path_templates")
+    if templates is None:
+        raise SchemaError("[layout] missing [layout.path_templates]")
+    if not isinstance(templates, dict) or not templates:
+        raise SchemaError("[layout.path_templates] must be a non-empty table")
+    import re as _re
+    placeholder_re = _re.compile(r"\{(\w+)\}")
+    for level, tmpl in templates.items():
+        if level not in LEVEL_ORDER:
+            raise SchemaError(
+                f"[layout.path_templates.{level}] unknown level; must be one of "
+                f"{list(LEVEL_ORDER)}"
+            )
+        if not isinstance(tmpl, str) or not tmpl:
+            raise SchemaError(
+                f"[layout.path_templates.{level}] must be a non-empty string"
+            )
+        for ph in placeholder_re.findall(tmpl):
+            if ph not in LAYOUT_PLACEHOLDER_NAMES:
+                raise SchemaError(
+                    f"[layout.path_templates.{level}] unknown placeholder "
+                    f"{{{ph}}}; allowed: {sorted(LAYOUT_PLACEHOLDER_NAMES)}"
+                )
+        # Every template must carry {tool} so the tool-first layout is enforceable.
+        if "{tool}" not in tmpl:
+            raise SchemaError(
+                f"[layout.path_templates.{level}] must contain the {{tool}} placeholder"
+            )
+        # Level-appropriate key must be the deepest placeholder so inference
+        # can map a path unambiguously to a row.
+        required_key = {"patient": "patient_id",
+                        "specimen": "specimen_id",
+                        "assay": "assay_id"}[level]
+        if f"{{{required_key}}}" not in tmpl:
+            raise SchemaError(
+                f"[layout.path_templates.{level}] must contain {{{required_key}}}"
+            )
+
+
+def _validate_analyses(analyses: dict) -> None:
+    if not isinstance(analyses, dict):
+        raise SchemaError("[analyses] must be a table")
+    import re as _re
+    tool_re = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    prefix_re = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    for tool, spec in analyses.items():
+        if not tool_re.match(tool):
+            raise SchemaError(
+                f"[analyses.{tool}] tool name must be a valid identifier "
+                f"(letters/digits/underscores, not starting with a digit)"
+            )
+        if not isinstance(spec, dict):
+            raise SchemaError(f"[analyses.{tool}] must be an inline table")
+        level = spec.get("level")
+        if level is None:
+            raise SchemaError(f"[analyses.{tool}] missing required key: level")
+        if level not in LEVEL_ORDER:
+            raise SchemaError(
+                f"[analyses.{tool}] level={level!r} must be one of {list(LEVEL_ORDER)}"
+            )
+        prefix = spec.get("column_prefix")
+        if prefix is not None:
+            if not isinstance(prefix, str) or not prefix_re.match(prefix):
+                raise SchemaError(
+                    f"[analyses.{tool}] column_prefix must be a valid identifier; "
+                    f"got {prefix!r}"
+                )
+        summary_tsv = spec.get("summary_tsv")
+        if summary_tsv is not None:
+            if not isinstance(summary_tsv, str) or not summary_tsv:
+                raise SchemaError(
+                    f"[analyses.{tool}] summary_tsv must be a non-empty string"
+                )
 
 
 def _validate_level(level: str, spec: dict) -> None:
@@ -917,10 +1077,94 @@ def cmd_init_flat(args):
 
 
 def cmd_append(args):
-    """Dispatch `casetrack append` to flat (--manifest) or project (--project-dir) mode."""
+    """Dispatch `casetrack append` to flat (--manifest) or project (--project-dir) mode.
+
+    When ``--infer-from-path`` is given, resolve the project and fill missing
+    args (project_dir, level, analysis, column_prefix, results, inferred
+    run_tag) before dispatching to project-mode.
+    """
+    if getattr(args, "infer_from_path", None) is not None:
+        _apply_path_inference(args)
+
+    if not getattr(args, "project_dir", None) and not getattr(args, "manifest", None):
+        print(
+            "Error: one of --project-dir, --manifest, or --infer-from-path is required.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not getattr(args, "results", None):
+        print("Error: --results is required (or infer it with --infer-from-path)",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not getattr(args, "analysis", None):
+        print("Error: --analysis is required (or infer it with --infer-from-path)",
+              file=sys.stderr)
+        sys.exit(1)
+
     if getattr(args, "project_dir", None):
         return cmd_append_project(args)
     return cmd_append_flat(args)
+
+
+def _apply_path_inference(args) -> None:
+    """Populate ``args`` in place from the path-inference result.
+
+    The CLI flag ``--infer-from-path`` may come in as ``""`` (bare flag, use
+    ``$PWD``), an absolute path, or a relative path. Explicit values on
+    ``args`` (e.g. ``--level assay``) always win over inferred ones.
+    """
+    from casetrack_qc.path_infer import (
+        InferenceError,
+        find_project_root,
+        infer_from_path,
+    )
+
+    raw = args.infer_from_path
+    start = Path(raw) if raw else Path.cwd()
+    try:
+        project_dir = find_project_root(start)
+    except InferenceError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        schema = load_schema(project_dir / PROJECT_TOML_NAME)
+    except SchemaError as e:
+        print(f"Error: invalid schema in {project_dir / PROJECT_TOML_NAME}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        inferred = infer_from_path(project_dir, start, schema)
+    except InferenceError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Fill args that the user didn't supply explicitly.
+    if not getattr(args, "project_dir", None):
+        args.project_dir = str(inferred["project_dir"])
+    if not getattr(args, "level", None):
+        args.level = inferred["level"]
+    if not getattr(args, "analysis", None):
+        args.analysis = inferred["tool"]
+    if not getattr(args, "column_prefix", None) and inferred.get("column_prefix"):
+        args.column_prefix = inferred["column_prefix"]
+    if not getattr(args, "results", None):
+        summary = inferred.get("summary_tsv") or "summary.tsv"
+        candidate = inferred["leaf_dir"] / summary
+        if not candidate.exists():
+            print(
+                f"Error: expected summary TSV not found: {candidate}\n"
+                f"  [analyses.{inferred['tool']}].summary_tsv = {summary!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        args.results = str(candidate)
+
+    # Stash run_tag so cmd_append_project can inject it as a column.
+    args._inferred_run_tag = inferred["run_tag"]
 
 
 def cmd_append_flat(args):
@@ -2904,6 +3148,14 @@ def cmd_append_project(args):
         )
         sys.exit(1)
 
+    # v0.5: inject the inferred run_tag as a column so it flows through the
+    # normal column-prefix / type-inference / UPDATE pathway. Users re-running
+    # the same tool with a new run_tag must pass --overwrite; the fill-only
+    # default preserves the first run_tag that landed.
+    inferred_run_tag = getattr(args, "_inferred_run_tag", None)
+    if inferred_run_tag and "run_tag" not in results.columns:
+        results["run_tag"] = inferred_run_tag
+
     # v0.4: carve out the autoflag columns (qc_pass / qc_fail_reason / qc_warn)
     # before column-type inference so they never become analysis columns.
     from casetrack_qc.autoflag import AUTOFLAG_COLUMNS as _QC_AUTOFLAG_COLS
@@ -3121,6 +3373,7 @@ def cmd_append_project(args):
         "schema_v_before": schema["project"]["schema_v"],
         "schema_v_after": schema["project"]["schema_v"],
         "autoflag_events": [e["qc_event_id"] for e in autoflag_emitted],
+        "run_tag": inferred_run_tag,
     })
 
     # One `censor` provenance entry per autoflag event, all sharing the
@@ -5651,17 +5904,21 @@ Examples:
         "append",
         help="Append analysis results to a manifest (flat) or project (v0.3 SQLite)",
     )
-    g_append_target = p_append.add_mutually_exclusive_group(required=True)
+    # Not required at argparse level: --infer-from-path can supply --project-dir.
+    # cmd_append enforces "one of manifest / project_dir / infer_from_path" below.
+    g_append_target = p_append.add_mutually_exclusive_group(required=False)
     g_append_target.add_argument("--manifest", help="[flat mode] Path to manifest TSV")
     g_append_target.add_argument(
         "--project-dir",
         help="[project mode] Casetrack project directory",
     )
-    p_append.add_argument("--results", required=True, help="Path to results TSV")
+    p_append.add_argument("--results",
+                          help="Path to results TSV (inferred from path when --infer-from-path is used)")
     p_append.add_argument("--key", default="sample_id",
                           help="[flat mode] Key column to join on (default: sample_id)")
-    p_append.add_argument("--analysis", required=True,
-                          help="Name of this analysis (e.g. modkit_methylation)")
+    p_append.add_argument("--analysis",
+                          help="Name of this analysis (e.g. modkit_methylation); "
+                               "inferred from [analyses.<tool>] when --infer-from-path is used")
     p_append.add_argument(
         "--level",
         choices=list(LEVEL_ORDER),
@@ -5689,6 +5946,18 @@ Examples:
         "--force-append-on-censored",
         action="store_true",
         help="[v0.4] Allow append on censored entities (requires --yes)",
+    )
+    p_append.add_argument(
+        "--infer-from-path",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="[v0.5] Walk up from PATH (default: $PWD) to find a casetrack "
+             "project, then map the path to level/tool/run_tag/ids via "
+             "[layout.path_templates]. Fills --project-dir, --level, "
+             "--analysis, --column-prefix, and --results from the leaf dir. "
+             "Explicit flags still override.",
     )
 
     # ── status ──

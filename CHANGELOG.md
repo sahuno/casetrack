@@ -4,6 +4,49 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-04-18
+
+Tool-first results directory convention + one-flag `append` via path inference.
+
+### Added
+
+- **Optional `[layout]` and `[analyses]` sections in `casetrack.toml`.**
+  `[layout.path_templates]` declares per-level directory templates for
+  results (default:
+  `assay = "{tool}/{run_tag}/{patient_id}/{specimen_id}/{assay_id}"`).
+  `[analyses.<tool>]` declares each tool the pipeline runs, with its
+  `level`, `column_prefix`, and `summary_tsv`. Both sections are additive
+  and validated; existing projects keep working without them.
+- **`casetrack append --infer-from-path [PATH]`** — walks up from PATH
+  (default: `$PWD`) to find the project root, matches the path against
+  `[layout.path_templates]`, and populates `--project-dir`, `--level`,
+  `--analysis`, `--column-prefix`, and `--results` from the matched
+  `[analyses.<tool>]` declaration. Explicit flags still override. A
+  `run_tag` column is injected into the summary TSV so the run identifier
+  flows through the normal `--column-prefix` pathway
+  (→ `{prefix}_run_tag`). Provenance captures `run_tag` as a first-class
+  field.
+- All three shipped templates (`blank`, `hgsoc`, `giab_ont`) include a
+  default `[layout]` block plus commented `[analyses.<tool>]` examples
+  appropriate to the cohort.
+
+### Changed
+
+- `append`'s mutually-exclusive `--manifest` / `--project-dir` pair is no
+  longer required at argparse level, since `--infer-from-path` can supply
+  `--project-dir`. `cmd_append` enforces "one of the three is set".
+- `--analysis` and `--results` are no longer required at argparse level
+  when `--infer-from-path` is used.
+
+### Tests
+
+- `tests/test_path_infer.py` — 18 new tests covering `[layout]` /
+  `[analyses]` validation, `find_project_root` walk-up, `infer_from_path`
+  happy and error paths (unknown tool, level mismatch, outside results
+  root, deepest-first template resolution), and the end-to-end `append
+  --infer-from-path` flow including explicit-flag overrides.
+- Full suite: 566 passing.
+
 ## [0.4.2] — 2026-04-18
 
 Full project-directory scaffold on `casetrack init` (proposal 0003).
