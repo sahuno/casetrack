@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Author** | Samuel Ahuno ([ekwame001@gmail.com](mailto:ekwame001@gmail.com)) |
-| **Status** | Part A shipped 2026-04-19 (v0.6.0-part-a); Part B still draft |
+| **Status** | Part A complete (shipped 2026-04-19, v0.6.0-part-a); Part B still draft |
 | **Date** | 2026-04-19 |
 | **Target release** | v0.6.0 |
 | **Breaking** | Yes — new required field (`project_id`) + stricter validation on patient/specimen/assay IDs. One-shot migration path. |
@@ -15,7 +15,7 @@
 |---|---|---|
 | **Part A — hierarchy ID format enforcement** | ✅ shipped | Validators wired into `cmd_register`, `_insert_rows_by_level` (migrate), `cmd_add_metadata_project --allow-new`. Recover paths tolerant of legacy IDs by design. 37 new tests. casetrack commit `1849cc6`. |
 | **Part A — Nextflow integration surface** | ✅ shipped | Part A surfaces through `casetrack register` called from init scripts. Negative smoke test (`test/run_test_malformed.sh`) + tutorial notes shipped in `casetrack-nf-subworkflows` commit `9f958a1`. |
-| **Part A — `casetrack doctor --id-format`** | ⏳ pending | Scan-only; non-blocking for enforcement. Tracked in §7. |
+| **Part A — `casetrack doctor --id-format`** | ✅ shipped | Scan-only health check + rename suggestions; `--fmt table\|tsv`. casetrack commit `9e4369e`. |
 | **Part B — project identity (`project_id`, `project_meta`, registry)** | ⏳ draft | No code yet. §5 + §6.1 + §6.3 untouched. |
 
 ## 0. Accepted decisions
@@ -306,7 +306,7 @@ Provenance entry written.
 - Idempotent: re-running on a project that already has `project_id` no-ops with a message.
 - Batch mode: `casetrack migrate-project-id --scan /data1/greenbab/...` walks a root, finds all `casetrack.db` files, migrates each (with `--yes` to skip interactive confirmation).
 
-For hierarchy IDs, `casetrack doctor --id-format` (⏳ pending) scans all three tables, reports non-conforming IDs, and exits with a suggested rename map. No auto-rename — the user must produce a migration TSV mapping old → new IDs, because a patient/specimen/assay rename has FK cascade implications that shouldn't be automatic.
+For hierarchy IDs, `casetrack doctor --id-format` ✅ shipped — scans all three tables, reports non-conforming IDs, and exits non-zero if any are found. Each violation includes a `_suggest_clean_id()` heuristic rename when the cleaned slug passes the default regex; otherwise the report flags "no safe suggestion — manual rename needed." No auto-rename — patient/specimen/assay renames have FK cascade implications that shouldn't be automatic. Output: `--fmt table` (default, human-readable) or `--fmt tsv` (machine-readable for CI).
 
 ### 7.1 Backward compatibility with v0.5 and earlier projects
 
@@ -355,7 +355,7 @@ If a project opts in to `allow_unicode_ids`, the per-assay summary TSVs must be 
 
 ### Remaining Part A items
 
-- `casetrack doctor --id-format` — scan existing tables, report non-conforming IDs with a suggested rename map (§7). Scan-only; does not auto-rename.
+✅ All Part A items shipped. `casetrack doctor --id-format` is the final piece (commit `9e4369e`, 25 new tests, 628 total passing). Part A is complete.
 
 ## 10. References
 
