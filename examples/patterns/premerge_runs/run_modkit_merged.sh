@@ -168,10 +168,15 @@ PY
 cat "${SUMMARY_TSV}"
 
 # ── Phase 3: append at specimen level ─────────────────────────────────────────
+# --overwrite: modkit is a single-writer-per-specimen contract, and re-runs
+# against a refreshed merged BAM (e.g. after methylation-tag injection) need
+# to refresh the cached columns. Fill-only default is meant for concurrent
+# array tasks writing disjoint rows — not this case.
 "${CASETRACK_BIN}" append \
     --project-dir "${PROJECT_DIR}" \
     --level specimen \
     --analysis "${ANALYSIS_NAME}" \
+    --overwrite \
     --results "${SUMMARY_TSV}"
 echo "[Phase 3] Appended at specimen level."
 

@@ -26,3 +26,10 @@ Thumbs.db
 # Local transcripts (save-last output, etc. — not project artifacts)
 .docs/
 
+# Claude Code local harness state (per-checkout settings, slash commands)
+.claude/
+
+# hgsoc_sim HPC demo run artifacts — dashboards + benchmark reports are
+# regenerated every run by the summary phase, not source.
+examples/hgsoc_sim/hpc/benchmarks/
+

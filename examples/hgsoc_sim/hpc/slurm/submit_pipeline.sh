@@ -144,6 +144,31 @@ phase_synth() {
     printf '%s\n' "${deps[@]}" | paste -sd: -
 }
 
+# ── Phase 1.5: inject_methyl ──────────────────────────────────────────────────
+# Stamps per-read MM/ML tags onto each synth_align BAM so modkit pileup sees a
+# non-zero 5mC signal. Writes sim.meth.srt.bam next to sim.srt.bam and rewrites
+# metadata.tsv so attach_bams (and everything downstream) consumes the tagged
+# BAM. Specimen type (tumor/normal) drives the per-CpG target rate; DMR signal
+# emerges from the tumor/normal contrast.
+phase_inject_methyl() {
+    local upstream="${1:-}"
+    local deps=()
+    log "=== Phase 1.5: inject_methyl ==="
+    while IFS=$'\t' read -r assay_id specimen_id; do
+        [[ -z "$assay_id" ]] && continue
+        local run_id="${assay_id##*-}"
+        local exports="SPECIMEN=$specimen_id,RUN_ID=$run_id,ASSAY_ID=$assay_id"
+        exports+=",SANDBOX=$SANDBOX,REF_FASTA=$REF_FASTA,SCRIPTS_DIR=$SCRIPTS"
+        local jid
+        jid=$(_dispatch "inject $assay_id" "$upstream" \
+            --chdir="$SANDBOX" --export=ALL,"$exports" \
+            --output=logs/inject_methyl_%A.out --error=logs/inject_methyl_%A.err \
+            "$HERE/run_inject_methyl.sh")
+        [[ -n "$jid" ]] && deps+=("$jid")
+    done < <(_ont_assays)
+    printf '%s\n' "${deps[@]}" | paste -sd: -
+}
+
 # ── Phase 2: attach_bams ──────────────────────────────────────────────────────
 # Runs `casetrack add-metadata` once all synths are done, routing each
 # assay's bam_path from its synth_align metadata.tsv back onto the assays
@@ -277,8 +302,9 @@ phase_summary() {
 
 case "$PHASE" in
     plan)
-        SUBMIT="" ; phase_synth ; phase_attach_bams ; phase_flagstat ; phase_merge ; phase_modkit ; phase_scrna ; phase_summary ;;
+        SUBMIT="" ; phase_synth ; phase_inject_methyl ; phase_attach_bams ; phase_flagstat ; phase_merge ; phase_modkit ; phase_scrna ; phase_summary ;;
     synth)        phase_synth ;;
+    inject)       phase_inject_methyl ;;
     qc)           phase_flagstat "$(phase_attach_bams)" ;;
     merge)        phase_merge ;;
     modkit)       phase_modkit ;;
@@ -286,7 +312,8 @@ case "$PHASE" in
     summary)      phase_summary ;;
     all)
         dep_synth=$(phase_synth)
-        dep_attach=$(phase_attach_bams "$dep_synth")
+        dep_inject=$(phase_inject_methyl "$dep_synth")
+        dep_attach=$(phase_attach_bams "$dep_inject")
         dep_flag=$(phase_flagstat "$dep_attach")
         dep_merge=$(phase_merge "$dep_flag")
         dep_modkit=$(phase_modkit "$dep_merge")
@@ -306,6 +333,36 @@ case "$PHASE" in
         dep_modkit=$(phase_modkit "$dep_merge")
         phase_summary "$dep_modkit"
         ;;
+    resume_attach)
+        # Resume after synth_align has landed BAMs on disk but attach_bams
+        # and everything downstream still need to run. Mirrors `all` minus
+        # phase 1 (synth). Skips methylation injection — use when you
+        # don't care about modkit 5mC signal. scRNA fans out in parallel.
+        dep_attach=$(phase_attach_bams "")
+        dep_flag=$(phase_flagstat "$dep_attach")
+        dep_merge=$(phase_merge "$dep_flag")
+        dep_modkit=$(phase_modkit "$dep_merge")
+        dep_scrna=$(phase_scrna "")
+        summary_dep="${dep_modkit}"
+        [[ -n "$dep_scrna" ]] && summary_dep="${dep_modkit}:${dep_scrna}"
+        phase_summary "$summary_dep"
+        ;;
+    resume_methyl)
+        # Resume after synth_align. Stamps methylation tags, then runs
+        # attach → flagstat → merge → modkit → summary. Use this instead
+        # of `resume_attach` when you want modkit's 5mC signal to be
+        # non-zero (tumor/normal contrast drives a DMR signal). scRNA
+        # fans out in parallel with the ONT chain.
+        dep_inject=$(phase_inject_methyl "")
+        dep_attach=$(phase_attach_bams "$dep_inject")
+        dep_flag=$(phase_flagstat "$dep_attach")
+        dep_merge=$(phase_merge "$dep_flag")
+        dep_modkit=$(phase_modkit "$dep_merge")
+        dep_scrna=$(phase_scrna "")
+        summary_dep="${dep_modkit}"
+        [[ -n "$dep_scrna" ]] && summary_dep="${dep_modkit}:${dep_scrna}"
+        phase_summary "$summary_dep"
+        ;;
     resume_merge)
         # Resume after flagstat data is also already in casetrack (e.g. if
         # flagstat TSVs were appended from the login node after a SLURM
@@ -316,7 +373,7 @@ case "$PHASE" in
         ;;
     *)
         echo "Unknown phase: $PHASE" >&2
-        echo "Usage: PROJECT_DIR=... SANDBOX=... bash $0 {plan|synth|qc|merge|modkit|scrna|summary|all|resume|resume_merge} [--submit]" >&2
+        echo "Usage: PROJECT_DIR=... SANDBOX=... bash $0 {plan|synth|inject|qc|merge|modkit|scrna|summary|all|resume|resume_attach|resume_methyl|resume_merge} [--submit]" >&2
         exit 1
         ;;
 esac

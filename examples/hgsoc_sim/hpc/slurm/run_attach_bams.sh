@@ -37,6 +37,7 @@ cat "$TSV"
 "$CASETRACK_BIN" append \
     --project-dir "$PROJECT_DIR" \
     --analysis attach_bams \
+    --overwrite \
     --results "$TSV"
 
 rm -f "$TSV"
