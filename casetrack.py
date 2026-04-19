@@ -30,6 +30,7 @@ import fcntl
 import html
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -378,6 +379,15 @@ def validate_schema(schema: dict) -> None:
         if key not in proj:
             raise SchemaError(f"[project] missing required key: {key}")
 
+    # v0.6: [project] allow_unicode_ids (proposal 0005 Part A) — opt in to
+    # relaxed hierarchy ID validation when non-ASCII characters are required.
+    allow_unicode_ids = proj.get("allow_unicode_ids")
+    if allow_unicode_ids is not None and not isinstance(allow_unicode_ids, bool):
+        raise SchemaError(
+            f"[project] allow_unicode_ids must be a boolean, "
+            f"got {type(allow_unicode_ids).__name__}"
+        )
+
     if "levels" not in schema or not isinstance(schema["levels"], dict):
         raise SchemaError("missing [levels.*] sections")
 
@@ -507,6 +517,34 @@ def _validate_level(level: str, spec: dict) -> None:
             f"[levels.{level}] parent_key {parent_key!r} not in [levels.{level}.columns]"
         )
 
+    # v0.6: optional id_pattern override + allow_case_variants flag
+    # (proposal 0005 Part A). Both are cached on the level_spec dict by
+    # validate_hierarchy_id / check_id_case_unique on first use.
+    id_pattern = spec.get("id_pattern")
+    if id_pattern is not None:
+        if not isinstance(id_pattern, str) or not id_pattern:
+            raise SchemaError(
+                f"[levels.{level}] id_pattern must be a non-empty string"
+            )
+        if not (id_pattern.startswith("^") and id_pattern.endswith("$")):
+            raise SchemaError(
+                f"[levels.{level}] id_pattern {id_pattern!r} must anchor "
+                f"with ^ and $"
+            )
+        try:
+            re.compile(id_pattern)
+        except re.error as e:
+            raise SchemaError(
+                f"[levels.{level}] id_pattern {id_pattern!r} is not a valid "
+                f"regex: {e}"
+            )
+    acv = spec.get("allow_case_variants")
+    if acv is not None and not isinstance(acv, bool):
+        raise SchemaError(
+            f"[levels.{level}] allow_case_variants must be a boolean, "
+            f"got {type(acv).__name__}"
+        )
+
 
 def _validate_column(level: str, name: str, spec) -> None:
     if not isinstance(spec, dict):
@@ -523,6 +561,167 @@ def _validate_column(level: str, name: str, spec) -> None:
             raise SchemaError(
                 f"[levels.{level}.columns.{name}] enum must be a list of strings"
             )
+
+
+# ── v0.6 hierarchy ID format enforcement (proposal 0005 Part A) ────────────────
+#
+# Validator runs only on INSERT paths (register, migrate flat→project,
+# add-metadata --allow-new). Read paths (query, export, dashboard, recover)
+# tolerate pre-existing malformed IDs unchanged. Opt-in loosening per level
+# via [levels.<level>] id_pattern and allow_case_variants in casetrack.toml.
+# Project-wide unicode opt-in via [project] allow_unicode_ids = true.
+
+# Default ASCII regex: alnum start, then alnum / underscore / hyphen / dot, 1-64 chars.
+# Use \A...\Z (not ^...$) because $ matches before a trailing \n in Python's
+# default re flags — we want strict end-of-string anchoring.
+_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+
+# Characters forbidden in IDs in both ASCII and unicode modes — whitespace,
+# path separators, shell metacharacters, control chars, null byte.
+_ID_FORBIDDEN_CHARS = re.compile(
+    r"[\s/\\:;|&<>'\"`$*?!()\x00-\x1f\x7f]"
+)
+
+# Reserved literals that would poison path joins even when otherwise valid.
+_RESERVED_ID_LITERALS = frozenset({".", ".."})
+
+
+def _get_level_id_pattern(schema: dict, level: str):
+    """Return compiled custom id_pattern for a level, or None for default rules."""
+    level_spec = schema["levels"][level]
+    if "_compiled_id_pattern" in level_spec:
+        return level_spec["_compiled_id_pattern"]
+    custom = level_spec.get("id_pattern")
+    compiled = re.compile(custom) if custom else None
+    level_spec["_compiled_id_pattern"] = compiled
+    return compiled
+
+
+def validate_hierarchy_id(value, schema: dict, level: str) -> None:
+    """Validate a hierarchy key value against the schema's format rules.
+
+    Runs in order: null/empty check, reserved-literal rejection, then either
+    the configured id_pattern (if set), the unicode-relaxed rules (if the
+    project opted in), or the default ASCII regex.
+
+    Raises ValueError with a message naming the offending value and rule.
+    """
+    if value is None:
+        raise ValueError(f"{level}_id cannot be null")
+    # pd.isna() raises TypeError for unhashable / array-like values — ignore
+    # that path. Never swallow our own ValueError raised below on NA match.
+    try:
+        is_na = pd.isna(value)
+    except (TypeError, ValueError):
+        is_na = False
+    if is_na is True:
+        raise ValueError(f"{level}_id cannot be null")
+    s = str(value)
+    if not s or not s.strip():
+        raise ValueError(
+            f"{level}_id cannot be empty or whitespace-only (got {value!r})"
+        )
+    if s.strip() in _RESERVED_ID_LITERALS:
+        raise ValueError(
+            f"{level}_id cannot be {s!r} (reserved literal; path-traversal hazard)"
+        )
+
+    custom = _get_level_id_pattern(schema, level)
+    if custom is not None:
+        # fullmatch() avoids Python's default "$ matches before trailing \n"
+        # semantics, which would otherwise let "P01\n" sneak past a user's
+        # ^...$-anchored override regex.
+        if not custom.fullmatch(s):
+            raise ValueError(
+                f"{level}_id {value!r} does not match configured "
+                f"[levels.{level}] id_pattern {custom.pattern!r}"
+            )
+        return
+
+    allow_unicode = bool(schema.get("project", {}).get("allow_unicode_ids", False))
+    if allow_unicode:
+        if len(s) < 1 or len(s) > 64:
+            raise ValueError(
+                f"{level}_id {value!r} length must be 1-64 chars (got {len(s)})"
+            )
+        if _ID_FORBIDDEN_CHARS.search(s):
+            raise ValueError(
+                f"{level}_id {value!r} contains a forbidden character "
+                f"(whitespace, shell metacharacter, path separator, or control)"
+            )
+        if s[0] in "-.":
+            raise ValueError(
+                f"{level}_id {value!r} cannot start with '-' or '.'"
+            )
+        return
+
+    if not _ID_PATTERN.fullmatch(s):
+        raise ValueError(
+            f"{level}_id {value!r} is not a valid identifier. "
+            f"Must match {_ID_PATTERN.pattern!r} "
+            f"(ASCII alnum start, then alnum/underscore/hyphen/dot, 1-64 chars). "
+            f"To loosen, set [levels.{level}] id_pattern = \"...\" or "
+            f"[project] allow_unicode_ids = true in casetrack.toml."
+        )
+
+
+def check_id_case_unique(
+    conn: sqlite3.Connection,
+    schema: dict,
+    level: str,
+    value: str,
+    folded_existing: set | None = None,
+) -> None:
+    """Reject the insert if a case-variant of `value` already exists.
+
+    `folded_existing` is an optional pre-computed casefold()-set of IDs
+    already in the table; pass it for batch inserts to avoid an O(N) query
+    per row. If omitted, a single SELECT runs per call.
+    """
+    level_spec = schema["levels"][level]
+    if level_spec.get("allow_case_variants"):
+        return
+    key_col = level_spec["key"]
+    table = f"{level}s"
+    folded = str(value).casefold()
+    if folded_existing is not None:
+        if folded not in folded_existing:
+            return
+        # Case-variant found — fetch the actual value for the error message.
+        row = conn.execute(
+            f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)} "
+            f"WHERE lower({_quote_ident(key_col)}) = lower(?) LIMIT 1",
+            (str(value),),
+        ).fetchone()
+        existing = row[0] if row else "?"
+    else:
+        row = conn.execute(
+            f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)} "
+            f"WHERE lower({_quote_ident(key_col)}) = lower(?) LIMIT 1",
+            (str(value),),
+        ).fetchone()
+        if not row or row[0] == str(value):
+            return
+        existing = row[0]
+    raise ValueError(
+        f"{level}_id {value!r} conflicts with existing case-variant {existing!r}. "
+        f"Set [levels.{level}] allow_case_variants = true in casetrack.toml to allow."
+    )
+
+
+def _preload_folded_ids(
+    conn: sqlite3.Connection, schema: dict, level: str
+) -> set:
+    """Return the casefold()-set of IDs currently in `{level}s` — for batch inserts."""
+    level_spec = schema["levels"][level]
+    key_col = level_spec["key"]
+    table = f"{level}s"
+    return {
+        str(r[0]).casefold()
+        for r in conn.execute(
+            f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
+        ).fetchall()
+    }
 
 
 # ── v0.3 SQLite engine ─────────────────────────────────────────────────────────
@@ -2479,10 +2678,16 @@ def _insert_rows_by_level(
     specimen_col: str,
     assay_col: str,
     classifications: dict,
+    schema: dict | None = None,
 ) -> dict:
     """Insert deduplicated rows into patients → specimens → assays.
 
     Returns {level: n_inserted}. Runs in the caller's transaction.
+
+    When `schema` is provided (migrate path), validates every new hierarchy
+    key value against the schema's format rules (proposal 0005 Part A).
+    When `schema` is None (recover path), validation is skipped — recover
+    must replay existing IDs exactly, including any that predate Part A.
     """
     counts = {"patient": 0, "specimen": 0, "assay": 0}
 
@@ -2490,6 +2695,19 @@ def _insert_rows_by_level(
     level_cols = {lv: [] for lv in LEVEL_ORDER}
     for col, level in classifications.items():
         level_cols[level].append(col)
+
+    # v0.6: validate every unique hierarchy key from the source TSV before
+    # any INSERT runs. Surfaces the offending value + rule at the top of the
+    # transaction so partial writes don't happen and the error message
+    # points at the actual problem.
+    if schema is not None:
+        for level, col in (
+            ("patient", patient_col),
+            ("specimen", specimen_col),
+            ("assay", assay_col),
+        ):
+            for value in df[col].dropna().unique():
+                validate_hierarchy_id(value, schema, level)
 
     # Patients: one row per unique patient_id. Collapse metadata by taking the
     # first non-NaN value in each patient group.
@@ -2692,8 +2910,20 @@ def cmd_migrate(args):
                 conn.execute(ddl)
         with begin_immediate(conn):
             counts = _insert_rows_by_level(
-                conn, df, patient_col, specimen_col, assay_col, classifications
+                conn, df, patient_col, specimen_col, assay_col, classifications,
+                schema=schema,
             )
+    except ValueError as e:
+        # Raised by validate_hierarchy_id when the source TSV contains an
+        # ID that violates the schema's format rules (proposal 0005 Part A).
+        conn.close()
+        print(
+            f"Error: migration aborted — {e}\n"
+            f"Hint: clean the source TSV IDs, or loosen the rules via "
+            f"[levels.<level>] id_pattern in the generated casetrack.toml.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     except sqlite3.IntegrityError as e:
         conn.close()
         print(
@@ -2943,6 +3173,18 @@ def cmd_register(args):
             )
             sys.exit(1)
 
+    # v0.6: hierarchy ID format check (proposal 0005 Part A). Validate the
+    # target --id and --parent against the schema's format rules before we
+    # open the DB — fail loudly with a clear message at the root of the
+    # problem, not three commands downstream.
+    try:
+        validate_hierarchy_id(args.id, schema, level)
+        if parent_level and args.parent is not None:
+            validate_hierarchy_id(args.parent, schema, parent_level)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     db_path = project_dir / PROJECT_DB_NAME
     conn = open_project_db(db_path)
     executed_sql: list[str] = []
@@ -2951,6 +3193,9 @@ def cmd_register(args):
 
     try:
         with begin_immediate(conn):
+            # Case-variant check runs inside the transaction so concurrent
+            # writers can't race between the check and the insert.
+            check_id_case_unique(conn, schema, level, args.id)
             # Parent-existence check runs *inside* the transaction so a
             # concurrent writer can't race us between check and insert.
             if parent_level and not _parent_exists(conn, parent_level, args.parent):
@@ -2958,6 +3203,8 @@ def cmd_register(args):
                     # Roll back so we don't emit a provenance entry or partial writes.
                     raise _ParentMissing(parent_level, args.parent)
                 parent_created = True
+                # Parent will be created as a stub — validate its case-uniqueness too.
+                check_id_case_unique(conn, schema, parent_level, args.parent)
 
             if parent_created:
                 parent_table = f"{parent_level}s"
@@ -2995,6 +3242,11 @@ def cmd_register(args):
             file=sys.stderr,
         )
         sys.exit(2)
+    except ValueError as e:
+        # Raised by check_id_case_unique when a case-variant already exists.
+        conn.close()
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     except sqlite3.IntegrityError as e:
         conn.close()
         print(f"Error: register aborted — {type(e).__name__}: {e}", file=sys.stderr)
@@ -5134,6 +5386,24 @@ def cmd_add_metadata_project(args):
 
             # INSERTs for new keys.
             if args.allow_new and missing_keys:
+                # v0.6: validate every new key against the schema's format
+                # rules (proposal 0005 Part A) before the INSERT runs, so
+                # malformed IDs surface at the source of the problem.
+                for new_key in missing_keys:
+                    validate_hierarchy_id(new_key, schema, level)
+                # Also validate parent keys we're about to reference — if
+                # missing_parents was non-empty, we've already failed above;
+                # here we only reach valid parents, but their case-variants
+                # still need checking.
+                if parent_level:
+                    for parent_id in parents_needed:
+                        validate_hierarchy_id(parent_id, schema, parent_level)
+                # Case-variant check against existing rows, once per batch.
+                folded_existing = _preload_folded_ids(conn, schema, level)
+                for new_key in missing_keys:
+                    check_id_case_unique(
+                        conn, schema, level, new_key, folded_existing
+                    )
                 new_rows = metadata[metadata[key_col].astype(str).isin(missing_keys)]
                 insert_cols = [key_col] + meta_cols
                 quoted_cols = ", ".join(_quote_ident(c) for c in insert_cols)
@@ -5171,6 +5441,12 @@ def cmd_add_metadata_project(args):
                 file=sys.stderr,
             )
         sys.exit(2)
+    except ValueError as e:
+        # Raised by validate_hierarchy_id / check_id_case_unique when a new
+        # key violates the schema's format rules (proposal 0005 Part A).
+        conn.close()
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     except sqlite3.IntegrityError as e:
         conn.close()
         print(f"Error: add-metadata aborted — {type(e).__name__}: {e}",

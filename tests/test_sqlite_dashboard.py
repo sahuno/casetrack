@@ -226,12 +226,25 @@ def test_empty_project_renders_without_crash(tmp_path: Path):
 
 
 def test_patient_id_is_html_escaped(tmp_path: Path):
-    """IDs that contain HTML-special chars should be escaped."""
+    """Dashboard must HTML-escape legacy malformed IDs that predate v0.6 format
+    enforcement. v0.6+ register rejects such IDs at source (proposal 0005
+    Part A), but pre-v0.6 DBs may already contain them — read paths must
+    still render safely.
+    """
     proj = tmp_path / "proj"
     casetrack.cmd_init(_init_ns(proj))
-    casetrack.cmd_register(_reg_ns(
-        proj, level="patient", id="P<script>alert(1)</script>",
-    ))
+    # Bypass the register validator to simulate a legacy malformed ID that
+    # slipped into the DB before v0.6 enforcement.
+    import sqlite3
+    conn = sqlite3.connect(str(proj / "casetrack.db"))
+    try:
+        conn.execute(
+            "INSERT INTO patients (patient_id) VALUES (?)",
+            ("P<script>alert(1)</script>",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     out = tmp_path / "dash.html"
     casetrack.cmd_dashboard(_dash_ns(proj, out))
     html = out.read_text()
