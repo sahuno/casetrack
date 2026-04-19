@@ -197,20 +197,20 @@ CASETRACK_REGISTER(tuple(meta, tool_name, summary_filename, summary_tsv))
 |---|---|---|
 | `casetrack [layout] + [analyses]` TOML validation | ✅ shipped | Additive; any `schema_v` |
 | `casetrack append --infer-from-path` | ✅ shipped | Auto-injects `run_tag` column |
-| `casetrack-nf-subworkflows` scaffold | ✅ shipped | 14 files, MIT license (planned) |
+| `casetrack-nf-subworkflows` scaffold | ✅ shipped | MIT, public at github.com/sahuno/casetrack-nf-subworkflows |
 | `MODKIT_PILEUP_TRACKED` subworkflow | ✅ shipped | Pilot reference |
 | Extended samplesheet schema | ✅ shipped | JSON Schema, `nf-validation`-compatible |
-| Stub smoke test | ✅ shipped | ~5 sec end-to-end |
-| L2 trace parser | ⏳ pending | Section below |
+| Stub smoke test | ✅ shipped | ~5 sec end-to-end; now covers L1 + L2 |
+| L2 trace parser | ✅ shipped v0.2.0 | `bin/trace_to_casetrack.py` + `workflow.onComplete` hook; one `casetrack append --analysis <tool>_trace` per tool |
 | L3 versions manifest | ⏳ pending | Section below |
 | Additional wrappers (DORADO, CALLMODS, SORT, SNIFFLES2) | ⏳ pending | Mechanical — one per week |
 | nf-core/methylseq drop-in config | ⏳ pending | v0.3+ |
 | Real-data validation | ⏳ pending | GIAB chr21 ONT next |
 | Publish to GitHub | ⏳ pending | After L2 + real-data |
 
-## Planned — L2: trace → manifest
+## Implemented — L2: trace → manifest (v0.2.0)
 
-Parse `results/_nextflow/<run_tag>/execution_trace.txt` (Nextflow's tab-separated per-task resource log) after every pipeline run, merge against `<tool>_tracked.nf` provenance, write per-assay columns:
+Parses `results/_nextflow/<run_tag>/execution_trace.txt` (Nextflow's tab-separated per-task resource log) after every pipeline run, merges against `[analyses.<tool>]` tool declarations, writes per-assay columns:
 
 | Column | Source (trace.txt field) | Type |
 |---|---|---|
@@ -221,14 +221,20 @@ Parse `results/_nextflow/<run_tag>/execution_trace.txt` (Nextflow's tab-separate
 | `{prefix}_attempts`         | `attempt` | INTEGER |
 | `{prefix}_queue`            | `queue` | TEXT |
 
-Implementation options (decide at implementation time):
+### What shipped
 
-1. **Post-process script in Nextflow** — `workflow.onComplete` invokes a Python helper that loops over trace rows and calls `casetrack add-metadata` per assay. Simplest; no new casetrack subcommand.
-2. **New `casetrack trace-import` subcommand** — reads a trace.txt, infers the project, writes columns in one transaction. Cleaner, reusable outside Nextflow (e.g. from SLURM trace imports).
+- `casetrack-nf-subworkflows/bin/trace_to_casetrack.py` — stdlib-only Python helper, reads casetrack.toml, parses trace.txt, pivots to per-tool TSVs, shells out to `casetrack append`.
+- `workflow.onComplete` hook in `main.nf` — invokes the helper with `--project-dir`, `--trace`, `--run-tag`. Always runs (success OR failure) so partial traces still land. Controlled by `params.casetrack_import_trace` (default `true`).
+- `nextflow.config` — enables extended trace fields: `task_id,hash,native_id,process,tag,name,status,exit,submit,start,complete,duration,realtime,%cpu,peak_rss,peak_vmem,rchar,wchar,queue,attempt` (default set omits `process`/`tag`/`queue`/`attempt`).
+- Extended `test/run_test.sh` — asserts `modkit_exit_status`, `modkit_attempts`, `modkit_realtime_sec`, `modkit_queue`, `modkit_peak_rss_bytes`, `modkit_slurm_job_id` columns are created by the L2 import.
 
-Recommendation: start with option 1 (already have `casetrack add-metadata`), promote to option 2 only if a second consumer appears.
+### Why `casetrack append` instead of `casetrack add-metadata`
 
-**Key design decision open**: how do we map a trace row to `(tool, assay_id)`? Nextflow records `name = <PROCESS> (meta.id)`; parse `<PROCESS>` for the tool name and `meta.id` for `assay_id`. Alternative: have each wrapper emit a `(tool, assay_id, task_id)` tuple into a side channel that we merge against trace.txt by `task_id`. Second option is more robust but more wiring.
+Original design proposed `add-metadata`. Turns out `add-metadata` rejects columns not pre-declared in casetrack.toml (that's its job — fill known columns). Trace columns are per-tool and not known until a tool's `[analyses.<tool>]` entry exists, so pre-declaring them would require code-generating TOML. `append` auto-creates columns via ALTER TABLE, which is exactly what we need. The helper calls one `casetrack append --analysis <tool>_trace --column-prefix <prefix>` per tool; the `<tool>_trace_done` timestamp it creates doubles as "when did we last import this tool's trace for this assay."
+
+### Trace-row → (tool, assay_id) mapping
+
+Nextflow's `process` trace field contains `SUBWORKFLOW:MODULE` (e.g. `MODKIT_PILEUP_TRACKED:MODKIT_PILEUP`). Last `:`-separated segment is the tool name (matched case-insensitively against `[analyses.<tool>]` keys). Nextflow's `tag` trace field carries `tag "${meta.id}"` from each process — because we require `meta.id == meta.assay_id` in §0.2, that's our join key. Rows with a tool not in `[analyses]` (e.g. `SUMMARIZE_MODKIT`, `CASETRACK_REGISTER`) are silently skipped.
 
 ## Planned — L3: versions → manifest
 
