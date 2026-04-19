@@ -90,6 +90,30 @@ LAYOUT_PLACEHOLDER_NAMES = {
 # Default pragma values for every SQLite connection casetrack opens.
 SQLITE_BUSY_TIMEOUT_MS = 30000
 
+# Casetrack version stamped into project_meta.casetrack_version on init
+# (proposal 0005 Part B). Reflects the release that created the row, so
+# future schema migrations can decide whether the row needs touch-ups.
+_CASETRACK_VERSION = "0.6.0a1"
+
+# project_meta DDL — proposal 0005 §6.1. CHECK constraint mirrors the
+# Python-side _PROJECT_ID_PATTERN so a hand-edit of the SQLite file can't
+# land a malformed slug. One row per database, written at init, never
+# updated, never deleted.
+_PROJECT_META_DDL = """
+CREATE TABLE IF NOT EXISTS project_meta (
+    project_id         TEXT NOT NULL PRIMARY KEY,
+    name               TEXT NOT NULL,
+    schema_v           INTEGER NOT NULL,
+    created_at         TEXT NOT NULL,
+    casetrack_version  TEXT NOT NULL,
+    CHECK (
+        length(project_id) BETWEEN 3 AND 64
+        AND project_id GLOB '[a-z0-9]*'
+        AND project_id NOT GLOB '*[^a-z0-9-]*'
+    )
+)
+""".strip()
+
 # Emitted once per invocation; silenced by CASETRACK_NO_DEPRECATION=1.
 _DEPRECATION_EMITTED = False
 
@@ -127,11 +151,12 @@ class SchemaError(ValueError):
     """Raised when a casetrack.toml schema is malformed or internally inconsistent."""
 
 
-def _blank_toml_template(project_name: str) -> str:
+def _blank_toml_template(project_name: str, project_id: str = "") -> str:
     """Minimal schema with just the primary keys and enforced parent FKs."""
     now = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    pid_line = f'project_id = "{project_id}"\n' if project_id else ""
     return f"""[project]
-name     = "{project_name}"
+{pid_line}name     = "{project_name}"
 schema_v = 1
 created  = "{now}"
 
@@ -189,11 +214,12 @@ assay    = "{{tool}}/{{run_tag}}/{{patient_id}}/{{specimen_id}}/{{assay_id}}"
 """
 
 
-def _hgsoc_toml_template(project_name: str) -> str:
+def _hgsoc_toml_template(project_name: str, project_id: str = "") -> str:
     """Template matching the example in proposal 0001 §6."""
     now = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    pid_line = f'project_id = "{project_id}"\n' if project_id else ""
     return f"""[project]
-name     = "{project_name}"
+{pid_line}name     = "{project_name}"
 schema_v = 1
 created  = "{now}"
 
@@ -266,14 +292,15 @@ assay    = "{{tool}}/{{run_tag}}/{{patient_id}}/{{specimen_id}}/{{assay_id}}"
 """
 
 
-def _giab_ont_toml_template(project_name: str) -> str:
+def _giab_ont_toml_template(project_name: str, project_id: str = "") -> str:
     """Template for Oxford Nanopore WGS cohorts — e.g. Genome-in-a-Bottle
     reference samples. patient = biological sample (HG002, HG006, ...);
     specimen = one DNA extraction; assay = one flowcell run.
     """
     now = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    pid_line = f'project_id = "{project_id}"\n' if project_id else ""
     return f"""[project]
-name     = "{project_name}"
+{pid_line}name     = "{project_name}"
 schema_v = 1
 created  = "{now}"
 
@@ -387,6 +414,17 @@ def validate_schema(schema: dict) -> None:
             f"[project] allow_unicode_ids must be a boolean, "
             f"got {type(allow_unicode_ids).__name__}"
         )
+
+    # v0.6: [project] project_id (proposal 0005 Part B). Optional in TOML
+    # (legacy v0.5 projects don't have one); when present, must be a valid
+    # DNS-label slug. Required at `casetrack init` (added by templates) but
+    # not required to load an existing schema.
+    project_id_value = proj.get("project_id")
+    if project_id_value is not None:
+        try:
+            validate_project_id(project_id_value)
+        except ValueError as e:
+            raise SchemaError(f"[project] {e}") from e
 
     if "levels" not in schema or not isinstance(schema["levels"], dict):
         raise SchemaError("missing [levels.*] sections")
@@ -722,6 +760,277 @@ def _preload_folded_ids(
             f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
         ).fetchall()
     }
+
+
+# ── v0.6 project identity (proposal 0005 Part B) ──────────────────────────────
+#
+# `project_id` is a DNS-label-shaped slug that uniquely identifies a casetrack
+# project on this machine. Stored in three places at init time and cross-checked
+# at every command:
+#   1. casetrack.toml [project] project_id  — human-editable source of truth
+#   2. project_meta SQLite table             — DB self-describes
+#   3. ~/.casetrack/registry.json            — single-user registry for
+#                                              `casetrack --project <id>` lookup
+#
+# Stricter than hierarchy IDs: lowercase only, hyphens (not underscores or dots),
+# 3–64 chars. Matches Docker repo / Kubernetes namespace naming so it's safe in
+# URLs, CLI flags, and shell pipelines.
+
+_PROJECT_ID_PATTERN = re.compile(r"\A[a-z0-9][a-z0-9-]{2,63}\Z")
+
+
+def validate_project_id(value) -> None:
+    """Raise ValueError if `value` is not a valid project_id slug.
+
+    Format: ^[a-z0-9][a-z0-9-]{2,63}$ (DNS-label shape, 3-64 chars,
+    lowercase-only, hyphens allowed).
+    """
+    if value is None:
+        raise ValueError("project_id cannot be null")
+    if not isinstance(value, str):
+        raise ValueError(
+            f"project_id must be a string; got {type(value).__name__}: {value!r}"
+        )
+    if not _PROJECT_ID_PATTERN.fullmatch(value):
+        raise ValueError(
+            f"project_id {value!r} is not a valid identifier. "
+            f"Must match {_PROJECT_ID_PATTERN.pattern!r} "
+            f"(DNS-label shape: lowercase, hyphens, 3-64 chars). "
+            f"Examples: hgsoc-2026, giab-pilot, methylation-cohort-spring-2026."
+        )
+
+
+def suggest_project_id(name: str) -> str | None:
+    """Derive a valid project_id slug from a free-form name or directory.
+
+    Heuristic: lowercase, replace runs of non-alnum with single hyphen,
+    strip leading/trailing hyphens, truncate to 64 chars. Returns the
+    cleaned slug iff it matches _PROJECT_ID_PATTERN, else None.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return None
+    s = name.lower()
+    # Collapse runs of non-(a-z0-9) into a single hyphen.
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = s.strip("-")
+    s = s[:64]
+    return s if s and _PROJECT_ID_PATTERN.fullmatch(s) else None
+
+
+def write_project_meta(
+    conn: sqlite3.Connection,
+    project_id: str,
+    name: str,
+    schema_v: int,
+) -> None:
+    """Insert the single project_meta row at init. Idempotent on existing rows."""
+    validate_project_id(project_id)
+    conn.execute(_PROJECT_META_DDL)
+    conn.execute(
+        "INSERT OR IGNORE INTO project_meta "
+        "(project_id, name, schema_v, created_at, casetrack_version) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            project_id,
+            name,
+            int(schema_v),
+            datetime.datetime.now().strftime(TIMESTAMP_FMT),
+            _CASETRACK_VERSION,
+        ),
+    )
+
+
+def read_project_meta(conn: sqlite3.Connection) -> dict | None:
+    """Return the project_meta row as a dict, or None if the table doesn't
+    exist (legacy v0.5 project) or is empty.
+    """
+    try:
+        row = conn.execute(
+            "SELECT project_id, name, schema_v, created_at, casetrack_version "
+            "FROM project_meta LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None  # table doesn't exist — legacy project
+    if row is None:
+        return None
+    return {
+        "project_id": row[0],
+        "name": row[1],
+        "schema_v": row[2],
+        "created_at": row[3],
+        "casetrack_version": row[4],
+    }
+
+
+# ── v0.6 registry: ~/.casetrack/registry.json (proposal 0005 §6.3) ────────────
+#
+# Single-user JSON registry mapping project_id → {path, name, created, last_seen}.
+# Enables `casetrack --project hgsoc-2026 query "..."` without remembering paths.
+# fcntl.flock guards concurrent writes from parallel casetrack invocations.
+# Team-shared / globally-unique-UUID variants are deferred to a later proposal
+# (§8 Q1 / Q2).
+
+_REGISTRY_SCHEMA_V = 1
+
+
+def _registry_path() -> Path:
+    """Return ~/.casetrack/registry.json — env override via CASETRACK_REGISTRY."""
+    override = os.environ.get("CASETRACK_REGISTRY")
+    if override:
+        return Path(override)
+    return Path.home() / ".casetrack" / "registry.json"
+
+
+def _registry_load(path: Path | None = None) -> dict:
+    """Read the registry, returning {schema_v, projects} (empty if missing)."""
+    p = path or _registry_path()
+    if not p.exists():
+        return {"schema_v": _REGISTRY_SCHEMA_V, "projects": {}}
+    try:
+        data = json.loads(p.read_text() or "{}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"registry at {p} is corrupt JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"registry at {p} is not a JSON object")
+    data.setdefault("schema_v", _REGISTRY_SCHEMA_V)
+    data.setdefault("projects", {})
+    return data
+
+
+@contextlib.contextmanager
+def _registry_locked(path: Path | None = None):
+    """Yield (registry_dict, lock_fd). Saves + releases on normal exit."""
+    p = path or _registry_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # Open in 'a+' so the file is created if missing without truncating.
+    fd = os.open(str(p), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            os.lseek(fd, 0, 0)
+            raw = os.read(fd, 1 << 24).decode("utf-8") or "{}"
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"registry at {p} is corrupt JSON: {e}") from e
+            data.setdefault("schema_v", _REGISTRY_SCHEMA_V)
+            data.setdefault("projects", {})
+            yield data
+            # Write back atomically: truncate + write under the same lock.
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, 0)
+            payload = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
+            os.write(fd, payload)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def registry_register(
+    project_id: str,
+    project_dir: Path | str,
+    name: str,
+    *,
+    registry_path: Path | None = None,
+) -> None:
+    """Add or refresh a registry entry. Idempotent on existing project_id."""
+    validate_project_id(project_id)
+    abs_path = str(Path(project_dir).resolve())
+    now = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    with _registry_locked(registry_path) as reg:
+        existing = reg["projects"].get(project_id)
+        if existing and existing.get("path") != abs_path:
+            raise ValueError(
+                f"registry conflict: project_id {project_id!r} already maps "
+                f"to {existing['path']!r}, refusing to clobber with "
+                f"{abs_path!r}. Use `casetrack projects deregister "
+                f"{project_id}` first if you really want to retarget."
+            )
+        if existing:
+            # Just bump last_seen + name; keep created.
+            existing["name"] = name
+            existing["last_seen"] = now
+        else:
+            reg["projects"][project_id] = {
+                "path": abs_path,
+                "name": name,
+                "created": now,
+                "last_seen": now,
+            }
+
+
+def registry_deregister(
+    project_id: str, *, registry_path: Path | None = None
+) -> bool:
+    """Remove an entry. Returns True if removed, False if not present."""
+    with _registry_locked(registry_path) as reg:
+        return reg["projects"].pop(project_id, None) is not None
+
+
+def registry_resolve(
+    project_id: str, *, registry_path: Path | None = None
+) -> Path | None:
+    """Return the project directory path for `project_id`, or None if unknown.
+
+    Read-only — does not bump last_seen. (last_seen is bumped via
+    `registry_touch` once a command has confirmed the project loads.)
+    """
+    reg = _registry_load(registry_path)
+    entry = reg["projects"].get(project_id)
+    return Path(entry["path"]) if entry else None
+
+
+def registry_touch(
+    project_id: str, *, registry_path: Path | None = None
+) -> None:
+    """Bump last_seen for `project_id`. Silent no-op if not registered."""
+    now = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    try:
+        with _registry_locked(registry_path) as reg:
+            entry = reg["projects"].get(project_id)
+            if entry is not None:
+                entry["last_seen"] = now
+    except (OSError, ValueError):
+        # Don't fail commands over a registry hiccup — purely cosmetic.
+        pass
+
+
+def check_project_identity_consistency(
+    conn: sqlite3.Connection, schema: dict, project_dir: Path | None = None
+) -> None:
+    """Compare TOML's [project] project_id to the project_meta row.
+
+    Hard error on mismatch — someone copied casetrack.db into the wrong
+    project directory or hand-edited project_id in TOML after init. Either
+    way we refuse to proceed because subsequent operations would corrupt
+    the registry's path↔project_id mapping.
+
+    Skipped silently when:
+      - project_meta row is absent (legacy v0.5 project)
+      - TOML has no project_id (legacy or partially-migrated project)
+
+    Both paths are tolerated for the alpha rollout — the v0.6.0 final
+    release will tighten this to a hard requirement.
+    """
+    toml_project_id = schema.get("project", {}).get("project_id")
+    if not toml_project_id:
+        return  # legacy TOML — skip
+    meta = read_project_meta(conn)
+    if meta is None:
+        return  # legacy DB — skip
+    if meta["project_id"] != toml_project_id:
+        loc = f" at {project_dir}" if project_dir else ""
+        raise ValueError(
+            f"project_id mismatch{loc}: casetrack.toml says "
+            f"{toml_project_id!r}, but casetrack.db's project_meta row says "
+            f"{meta['project_id']!r}. This usually means the DB was copied "
+            f"into a different project directory, or [project] project_id "
+            f"in casetrack.toml was edited after init. "
+            f"To recover: restore the original casetrack.toml, OR re-run "
+            f"`casetrack init --force` in this directory with the correct "
+            f"--project-id."
+        )
 
 
 # ── v0.3 SQLite engine ─────────────────────────────────────────────────────────
@@ -1097,7 +1406,36 @@ def cmd_init_project(args):
     project_dir.mkdir(parents=True, exist_ok=True)
 
     project_name = args.project_name or project_dir.resolve().name
-    toml_text = TEMPLATES[template](project_name)
+
+    # v0.6: derive/validate project_id (proposal 0005 Part B). Resolution
+    # order: explicit --project-id > slug derived from --project-name >
+    # slug derived from directory basename. Fail loudly if none of the
+    # three produce a valid DNS-label slug.
+    explicit_pid = getattr(args, "project_id", None)
+    if explicit_pid:
+        try:
+            validate_project_id(explicit_pid)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        project_id = explicit_pid
+    else:
+        project_id = (
+            suggest_project_id(project_name)
+            or suggest_project_id(project_dir.resolve().name)
+        )
+        if not project_id:
+            print(
+                "Error: could not derive a valid project_id from "
+                f"--project-name {project_name!r} or directory name "
+                f"{project_dir.resolve().name!r}. Pass --project-id explicitly "
+                "(format: lowercase alnum + hyphen, 3-64 chars; e.g. "
+                "'hgsoc-2026').",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    toml_text = TEMPLATES[template](project_name, project_id)
     toml_path.write_text(toml_text)
 
     try:
@@ -1129,8 +1467,26 @@ def cmd_init_project(args):
         apply_schema(conn, schema)
         with begin_immediate(conn):
             qc_ddl = _ensure_qc_schema(conn, kinds=_QC_DEFAULT_KINDS)
+            # v0.6 Part B: write the project_meta row in the same
+            # transaction as the QC schema so init is atomic.
+            write_project_meta(
+                conn, project_id, project_name, schema["project"]["schema_v"]
+            )
     finally:
         conn.close()
+
+    # v0.6 Part B: register in the user's local registry. Failure here is
+    # surfaced but doesn't roll back the project — the user can manually
+    # `casetrack projects register --project-dir <dir>` later.
+    try:
+        registry_register(project_id, project_dir, project_name)
+    except (OSError, ValueError) as e:
+        print(
+            f"Warning: project initialised but registry update failed: {e}\n"
+            f"  Re-run `casetrack projects register --project-dir "
+            f"{project_dir}` to retry.",
+            file=sys.stderr,
+        )
 
     # Append the [qc] TOML block so teams can extend kinds / scopes.
     _write_qc_toml_block(toml_path)
@@ -1165,6 +1521,7 @@ def cmd_init_project(args):
 
     lines = [
         f"Initialized casetrack project at {project_dir}/",
+        f"  - project_id:   {project_id!r}",
         f"  - {PROJECT_TOML_NAME}  ({template} template)",
         f"  - {PROJECT_DB_NAME}    (three levels: {', '.join(LEVEL_ORDER)})",
         f"  - {PROJECT_PROVENANCE_NAME}",
@@ -1172,6 +1529,10 @@ def cmd_init_project(args):
     ]
     if not bare:
         lines.append(f"  - scaffold: {len(scaffold_leaves)} leaf directories (.gitkeep in each)")
+    lines.append(
+        f"  - registered in {_registry_path()} (use `casetrack --project "
+        f"{project_id} ...` from anywhere)"
+    )
     print("\n".join(lines))
 
 
@@ -1764,6 +2125,168 @@ def _summarize_project(manifest_path: Path, key_col: str) -> dict:
 
 
 def cmd_projects(args):
+    """Dispatch `casetrack projects <action>` to the right handler.
+
+    Subactions: scan (v0.5 filesystem walk) | list / register / deregister
+    (v0.6 registry operations). Defaults to printing help when no
+    subaction is given.
+
+    Backward compat: a v0.5 `casetrack projects --root <path>` invocation
+    (no subaction, but with `--root` set) is silently routed to `scan`.
+    """
+    action = getattr(args, "projects_action", None)
+    if action is None and getattr(args, "root", None) is not None:
+        action = "scan"
+    if action == "scan":
+        return cmd_projects_scan(args)
+    if action == "list":
+        return cmd_projects_list(args)
+    if action == "register":
+        return cmd_projects_register_in_registry(args)
+    if action == "deregister":
+        return cmd_projects_deregister_from_registry(args)
+    print(
+        "Error: `casetrack projects` requires a subaction.\n"
+        "  casetrack projects list                       — list registered projects\n"
+        "  casetrack projects register --project-dir ... — add to registry\n"
+        "  casetrack projects deregister <project_id>    — remove from registry\n"
+        "  casetrack projects scan --root <path>         — walk a filesystem tree",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def cmd_projects_list(args):
+    """`casetrack projects list [--fmt table|tsv|json]` — read registry."""
+    fmt = getattr(args, "fmt", None) or "table"
+    reg = _registry_load()
+    entries = sorted(
+        (
+            {"project_id": pid, **info}
+            for pid, info in reg.get("projects", {}).items()
+        ),
+        key=lambda e: e["project_id"],
+    )
+
+    if fmt == "json":
+        print(json.dumps({
+            "registry": str(_registry_path()),
+            "schema_v": reg.get("schema_v"),
+            "projects": entries,
+        }, indent=2, default=str))
+        return
+
+    if fmt == "tsv":
+        print("project_id\tname\tpath\tlast_seen")
+        for e in entries:
+            print(f"{e['project_id']}\t{e.get('name','')}\t{e.get('path','')}\t{e.get('last_seen','')}")
+        return
+
+    # table
+    if not entries:
+        print(
+            f"No projects registered in {_registry_path()}.\n"
+            "  Run `casetrack init --project-dir <path>` to create one,\n"
+            "  or `casetrack projects register --project-dir <path>` to add an existing project."
+        )
+        return
+    pid_w = max(10, max(len(e["project_id"]) for e in entries))
+    name_w = max(8, min(40, max(len(e.get("name", "")) for e in entries)))
+    print(f"{'project_id':<{pid_w}}  {'name':<{name_w}}  last_seen          path")
+    print("─" * (pid_w + name_w + 60))
+    for e in entries:
+        name = e.get("name", "")[:name_w]
+        print(
+            f"{e['project_id']:<{pid_w}}  {name:<{name_w}}  "
+            f"{e.get('last_seen', ''):<19}  {e.get('path', '')}"
+        )
+    print(f"\n{len(entries)} project(s) in {_registry_path()}")
+
+
+def cmd_projects_register_in_registry(args):
+    """`casetrack projects register --project-dir <path>` — add to registry.
+
+    Reads project_id from the project's project_meta row (or TOML if no DB
+    yet). Refuses to register a project_id that's already mapped to a
+    different path; pass `casetrack projects deregister <id>` first.
+    """
+    project_dir = Path(args.project_dir).resolve()
+    if not project_dir.is_dir():
+        print(f"Error: project directory not found: {project_dir}", file=sys.stderr)
+        sys.exit(1)
+    toml_path = project_dir / PROJECT_TOML_NAME
+    if not toml_path.exists():
+        print(
+            f"Error: {PROJECT_TOML_NAME} not found in {project_dir}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        schema = load_schema(toml_path)
+    except SchemaError as e:
+        print(f"Error: invalid schema in {toml_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    project_id = schema.get("project", {}).get("project_id")
+    project_name = schema.get("project", {}).get("name") or project_dir.name
+
+    # Fall back to project_meta row if TOML lacks project_id (legacy or
+    # hand-edited).
+    if not project_id:
+        db_path = project_dir / PROJECT_DB_NAME
+        if db_path.exists():
+            conn = open_project_db(db_path)
+            try:
+                meta = read_project_meta(conn)
+                if meta:
+                    project_id = meta["project_id"]
+                    project_name = meta.get("name") or project_name
+            finally:
+                conn.close()
+
+    if not project_id:
+        print(
+            f"Error: {project_dir} has no project_id (in TOML or project_meta). "
+            f"Run `casetrack init --force --project-id <slug> --project-dir "
+            f"{project_dir}` to assign one.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        registry_register(project_id, project_dir, project_name)
+    except (OSError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(
+        f"Registered {project_id!r} → {project_dir} in {_registry_path()}"
+    )
+
+
+def cmd_projects_deregister_from_registry(args):
+    """`casetrack projects deregister <project_id>` — remove a registry entry."""
+    pid = args.project_id
+    try:
+        validate_project_id(pid)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        removed = registry_deregister(pid)
+    except (OSError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    if removed:
+        print(f"Deregistered {pid!r} from {_registry_path()}")
+    else:
+        print(
+            f"No entry for {pid!r} in {_registry_path()} — nothing to do.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def cmd_projects_scan(args):
     """Scan `--root` for projects (both v0.2 flat manifests and v0.3
     casetrack.toml projects) and summarize cross-project status."""
     root = Path(args.root)
@@ -2979,13 +3502,57 @@ def cmd_migrate(args):
 # ── v0.3 Project-mode helpers (shared across register/append/add-metadata) ─────
 
 
-def _resolve_project(project_dir: str | Path) -> tuple[Path, dict]:
-    """Validate a v0.3 project directory and load its schema.
+def _resolve_project(
+    project_dir: str | Path | None,
+    *,
+    project_id: str | None = None,
+) -> tuple[Path, dict]:
+    """Validate a v0.3 project and load its schema.
 
-    Returns (project_dir, schema). Exits with a clear error if the directory
-    or its casetrack.toml is missing — every project-mode command funnels
-    through this so the failure message is consistent.
+    Resolution order:
+      1. If `project_id` is given, look it up in the registry.
+      2. Else if `project_dir` is given, use it directly.
+      3. Else exit with a clear error.
+
+    When both are given, `project_id` wins; if `project_dir` doesn't match
+    the registry's recorded path, emit a warning (the registry's `last_seen`
+    is updated to the new path on success).
+
+    Always runs `check_project_identity_consistency` to catch TOML↔DB
+    `project_id` mismatches (a hard error) and bumps registry `last_seen`
+    on a successful resolve.
     """
+    if project_id is not None and not project_dir:
+        resolved = registry_resolve(project_id)
+        if resolved is None:
+            reg_path = _registry_path()
+            print(
+                f"Error: project_id {project_id!r} is not in the registry "
+                f"({reg_path}).\n"
+                f"  - Run `casetrack projects list` to see known projects.\n"
+                f"  - Or pass --project-dir <path> for a project that hasn't "
+                f"been registered yet (and re-run `casetrack projects "
+                f"register --project-dir <path>` to add it).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        project_dir = resolved
+    elif project_id is not None and project_dir:
+        resolved = registry_resolve(project_id)
+        if resolved is not None and resolved.resolve() != Path(project_dir).resolve():
+            print(
+                f"Warning: --project {project_id!r} maps to {resolved} in the "
+                f"registry, but --project-dir is {project_dir}. Using "
+                f"--project-dir; registry will be touched but path not changed.",
+                file=sys.stderr,
+            )
+    if not project_dir:
+        print(
+            "Error: pass either --project-dir <path> or --project <project_id>.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     project_dir = Path(project_dir)
     toml_path = project_dir / PROJECT_TOML_NAME
     db_path = project_dir / PROJECT_DB_NAME
@@ -3003,6 +3570,30 @@ def _resolve_project(project_dir: str | Path) -> tuple[Path, dict]:
     except SchemaError as e:
         print(f"Error: invalid schema in {toml_path}: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # v0.6 Part B: cross-check TOML's project_id against the DB's
+    # project_meta row. Hard error on mismatch — usually means the DB was
+    # copied into the wrong directory. Skipped silently for legacy projects
+    # that don't have a project_id in TOML or a project_meta row.
+    conn = open_project_db(db_path)
+    try:
+        check_project_identity_consistency(conn, schema, project_dir)
+    except ValueError as e:
+        conn.close()
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # Touch registry last_seen if this project is registered. Cheap and
+    # silent — failures here never block the command.
+    toml_pid = schema.get("project", {}).get("project_id")
+    if toml_pid:
+        registry_touch(toml_pid)
+
     return project_dir, schema
 
 
@@ -3106,7 +3697,7 @@ def cmd_register(args):
     Strict FK enforcement per proposal 0001 §19 Q2: unknown parents cause
     exit 2 unless the user opts in with --allow-new-parent --yes.
     """
-    project_dir, schema = _resolve_project(args.project_dir)
+    project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     level = args.level
 
     if level not in LEVEL_ORDER:
@@ -3350,7 +3941,7 @@ class _AppendOnCensored(Exception):
 
 def cmd_append_project(args):
     """Attach analysis results to rows at --level, extending the schema as needed."""
-    project_dir, schema = _resolve_project(args.project_dir)
+    project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     level = args.level or _default_analysis_level(schema)
     if level not in LEVEL_ORDER:
         print(
@@ -3693,7 +4284,7 @@ def cmd_schema_project(args):
             file=sys.stderr,
         )
         sys.exit(1)
-    project_dir, schema = _resolve_project(args.project_dir)
+    project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     toml_path = project_dir / PROJECT_TOML_NAME
 
     if action == "show":
@@ -4125,7 +4716,7 @@ def _print_id_format_report(violations: list[dict], fmt: str) -> None:
 
 
 def cmd_doctor_project(args):
-    project_dir, schema = _resolve_project(args.project_dir)
+    project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     db_path = project_dir / PROJECT_DB_NAME
 
     # v0.6: --id-format switches to hierarchy-ID scan mode (proposal 0005
@@ -4584,7 +5175,7 @@ def _recover_migrate(conn: sqlite3.Connection, project_dir: Path,
 
 
 def cmd_dashboard_project(args):
-    project_dir, schema = _resolve_project(args.project_dir)
+    project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     output_path = Path(args.output)
 
     conn = open_project_db(project_dir / PROJECT_DB_NAME)
@@ -4972,7 +5563,7 @@ def cmd_query_project(args):
         )
         sys.exit(1)
 
-    project_dir, _schema = _resolve_project(args.project_dir)
+    project_dir, _schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     db_path = project_dir / PROJECT_DB_NAME
     con = _prepare_v03_query_connection(db_path)
     try:
@@ -5038,7 +5629,7 @@ def _emit_query_rows(rows, cols, *, fmt: str, output: str | None) -> None:
 
 
 def cmd_export_project(args):
-    project_dir, _schema = _resolve_project(args.project_dir)
+    project_dir, _schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     output = Path(args.output)
 
     # --sql short-circuits shape / tables.
@@ -5233,7 +5824,7 @@ def _write_df(df: "pd.DataFrame", output: Path) -> None:
 
 
 def cmd_rerun_project(args):
-    project_dir, schema = _resolve_project(args.project_dir)
+    project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     if not args.list_only and not args.script:
         print("Error: --script is required unless --list-only is used.", file=sys.stderr)
         sys.exit(1)
@@ -5355,7 +5946,7 @@ class _MetadataRouting(Exception):
 
 
 def cmd_add_metadata_project(args):
-    project_dir, schema = _resolve_project(args.project_dir)
+    project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     level = args.level
     if level not in LEVEL_ORDER:
         print(
@@ -5597,7 +6188,7 @@ def _discover_done_columns(conn: sqlite3.Connection) -> dict:
 
 
 def cmd_status_project(args):
-    project_dir, schema = _resolve_project(args.project_dir)
+    project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     conn = open_project_db(project_dir / PROJECT_DB_NAME)
     try:
         # v0.4 QC filter: --usable mode short-circuits to the usable/excluded
@@ -6012,7 +6603,7 @@ def _collect_analysis_columns_from_provenance(prov_path: Path) -> dict:
 
 
 def cmd_validate_project(args):
-    project_dir, schema = _resolve_project(args.project_dir)
+    project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     conn = open_project_db(project_dir / PROJECT_DB_NAME)
     issues: list[str] = []
     try:
@@ -6135,7 +6726,7 @@ def cmd_validate_project(args):
 
 
 def cmd_log_project(args):
-    project_dir, _schema = _resolve_project(args.project_dir)
+    project_dir, _schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     prov_path = project_dir / PROJECT_PROVENANCE_NAME
     if not prov_path.exists():
         print(f"No provenance log at {prov_path}", file=sys.stderr)
@@ -6236,6 +6827,15 @@ Examples:
   casetrack export --manifest manifest.tsv --output manifest.xlsx
         """,
     )
+    # v0.6 Part B: global --project flag for registry-resolved project lookup.
+    # Goes BEFORE the subcommand: `casetrack --project hgsoc-2026 query "..."`.
+    # Per-command `--project-dir` still works; pass either, not both.
+    parser.add_argument(
+        "--project", default=None,
+        help="[v0.6] Resolve project by registered project_id (alternative "
+             "to --project-dir). See `casetrack projects list`.",
+    )
+
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # ── init ──
@@ -6262,6 +6862,12 @@ Examples:
     p_init.add_argument(
         "--project-name",
         help="[project mode] Project name written into casetrack.toml (default: directory basename)",
+    )
+    p_init.add_argument(
+        "--project-id", default=None,
+        help="[v0.6] DNS-label slug (^[a-z0-9][a-z0-9-]{2,63}$) used as the "
+             "machine-queryable identifier in the registry. Default: derived "
+             "from --project-name or directory basename.",
     )
     p_init.add_argument(
         "--force",
@@ -6435,17 +7041,71 @@ Examples:
     p_query.add_argument("--output", help="Write results to this file instead of stdout")
 
     # ── projects ──
+    # v0.6 Part B: nested subactions. `scan` preserves the v0.5 behavior;
+    # `list`/`register`/`deregister` operate on ~/.casetrack/registry.json.
+    # The scan args (--root et al) are also exposed on the parent parser so
+    # the v0.5 form `casetrack projects --root <path>` keeps working.
     p_projects = subparsers.add_parser(
-        "projects", help="Cross-project overview: scan a root for manifests"
+        "projects",
+        help="Manage the project registry (~/.casetrack/registry.json) or "
+             "scan a directory for manifests",
     )
-    p_projects.add_argument("--root", required=True, help="Root directory to scan")
+    p_projects.add_argument("--root", default=None,
+                            help="[v0.5 compat] Root directory to scan; "
+                                 "equivalent to `projects scan --root`")
     p_projects.add_argument("--pattern", default="manifest.tsv",
-                            help="Manifest filename pattern (default: manifest.tsv)")
+                            help="[scan] Manifest filename pattern (default: manifest.tsv)")
     p_projects.add_argument("--max-depth", type=int, default=4,
-                            help="Maximum directory depth to scan (default: 4)")
-    p_projects.add_argument("--key", default="sample_id", help="Key column name")
+                            help="[scan] Maximum directory depth to scan (default: 4)")
+    p_projects.add_argument("--key", default="sample_id",
+                            help="[scan] Key column name")
     p_projects.add_argument("--fmt", choices=["table", "tsv", "json"], default="table",
                             help="Output format")
+    projects_sub = p_projects.add_subparsers(
+        dest="projects_action", help="action (scan | list | register | deregister)"
+    )
+
+    # projects scan — explicit form of the legacy filesystem-walk behavior.
+    # Reuses the parent parser's flags so users can pass them in either spot.
+    p_proj_scan = projects_sub.add_parser(
+        "scan", help="Walk a directory tree and summarize discovered projects"
+    )
+    p_proj_scan.add_argument("--root", help="Root directory to scan")
+    p_proj_scan.add_argument("--pattern", default="manifest.tsv",
+                             help="Manifest filename pattern (default: manifest.tsv)")
+    p_proj_scan.add_argument("--max-depth", type=int, default=4,
+                             help="Maximum directory depth to scan (default: 4)")
+    p_proj_scan.add_argument("--key", default="sample_id", help="Key column name")
+    p_proj_scan.add_argument("--fmt", choices=["table", "tsv", "json"], default="table",
+                             help="Output format")
+
+    # projects list — read the registry (v0.6 Part B).
+    p_proj_list = projects_sub.add_parser(
+        "list",
+        help="List projects in ~/.casetrack/registry.json",
+    )
+    p_proj_list.add_argument("--fmt", choices=["table", "tsv", "json"], default="table",
+                             help="Output format (default: table)")
+
+    # projects register — manually add an existing project to the registry
+    # (e.g. after restoring from archive on a new machine).
+    p_proj_register = projects_sub.add_parser(
+        "register",
+        help="Add a project directory to ~/.casetrack/registry.json",
+    )
+    p_proj_register.add_argument(
+        "--project-dir", required=True, help="Path to the casetrack project directory"
+    )
+
+    # projects deregister — remove a registry entry without touching the
+    # project directory itself.
+    p_proj_dereg = projects_sub.add_parser(
+        "deregister",
+        help="Remove a project_id from the registry (does not touch the directory)",
+    )
+    p_proj_dereg.add_argument(
+        "project_id", help="The project_id slug to remove"
+    )
 
     # ── add-metadata ──
     p_meta = subparsers.add_parser(
@@ -6550,7 +7210,8 @@ Examples:
         "register",
         help="[v0.3] Insert a single row at --level (patient/specimen/assay)",
     )
-    p_register.add_argument("--project-dir", required=True, help="Casetrack project directory")
+    p_register.add_argument("--project-dir", default=None,
+                            help="Casetrack project directory (or use --project <id>)")
     p_register.add_argument(
         "--level",
         required=True,
@@ -6582,7 +7243,8 @@ Examples:
         "doctor",
         help="[v0.3] Stress-test SQLite concurrency; [v0.6] --id-format scans hierarchy IDs",
     )
-    p_doctor.add_argument("--project-dir", required=True, help="Casetrack project directory")
+    p_doctor.add_argument("--project-dir", default=None,
+                          help="Casetrack project directory (or use --project <id>)")
     p_doctor.add_argument("--workers", type=int, default=8,
                           help="Concurrent writer processes (default: 8)")
     p_doctor.add_argument("--writes", type=int, default=50,
@@ -6603,7 +7265,8 @@ Examples:
         "recover",
         help="[v0.3] Rebuild casetrack.db by replaying provenance.jsonl",
     )
-    p_recover.add_argument("--project-dir", required=True, help="Casetrack project directory")
+    p_recover.add_argument("--project-dir", default=None,
+                           help="Casetrack project directory (or use --project <id>)")
     p_recover.add_argument(
         "--from", dest="from_",
         help="Alternative provenance path (default: <project>/provenance.jsonl)",

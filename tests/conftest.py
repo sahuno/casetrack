@@ -20,6 +20,18 @@ if str(REPO_ROOT) not in sys.path:
 import casetrack  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolated_casetrack_registry(tmp_path_factory, monkeypatch):
+    """Auto-isolate the v0.6 registry per test so tests never touch
+    ~/.casetrack/registry.json. casetrack.cmd_init writes a registry entry
+    on every project init, and concurrent tests would clobber each other
+    via the shared default path. Routed via the CASETRACK_REGISTRY env var
+    that _registry_path() honors.
+    """
+    reg_dir = tmp_path_factory.mktemp("registry")
+    monkeypatch.setenv("CASETRACK_REGISTRY", str(reg_dir / "registry.json"))
+
+
 @pytest.fixture
 def tmp_project(tmp_path: Path) -> Path:
     """Empty project directory."""
