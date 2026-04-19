@@ -5,23 +5,32 @@
 Answers two questions about a multi-patient, multi-specimen, multi-assay
 cohort: "*is this analysis complete?*" and "*is this sample usable?*"
 
-Three storage layers, one CLI:
-- **v0.4 (current)**: the v0.3 project backend + a QC / censoring / consent
-  subsystem. Every read path (`status`, `rerun`, `export`, `query`,
-  `dashboard`) filters out QC-failed and consent-revoked entities by
-  default. SLURM summary TSVs can auto-flag via `qc_pass` /
-  `qc_fail_reason` / `qc_warn` columns. Paired-design readiness via
-  `casetrack cohort --pair-by`.
-- **v0.3 (project mode)**: a SQLite-backed project directory with
+Storage layers, one CLI:
+- **v0.6 (current, alpha)**: identity layer on top of v0.4. Every project
+  gets a `project_id` slug at init, persisted in TOML + `project_meta`
+  SQLite table + `~/.casetrack/registry.json`, so commands can address a
+  project by name (`casetrack --project hgsoc-2026 query "..."`) instead
+  of a fragile path. Hierarchy IDs (`patient_id`, `specimen_id`,
+  `assay_id`) are now validated against an ASCII regex at insert time —
+  typos in samplesheets fail loudly at `register`, not silently
+  downstream. Per-level escape hatches via `[levels.<level>] id_pattern`
+  for legacy LIMS IDs. See [proposal 0005](docs/proposals/0005-id-format-and-project-identity.md).
+- **v0.4**: QC / censoring / consent subsystem. Every read path
+  (`status`, `rerun`, `export`, `query`, `dashboard`) filters out
+  QC-failed and consent-revoked entities by default. SLURM summary TSVs
+  auto-flag via `qc_pass` / `qc_fail_reason` / `qc_warn` columns.
+  Paired-design readiness via `casetrack cohort --pair-by`.
+- **v0.3 (project mode)**: SQLite-backed project directory with
   normalized `patient → specimen → assay` tables, enforced foreign keys,
-  typed columns, and DuckDB-powered SQL queries. Survives DB corruption —
-  everything is regenerable from `casetrack.toml` + `provenance.jsonl`.
+  typed columns, and DuckDB-powered SQL queries. Survives DB corruption
+  — everything is regenerable from `casetrack.toml` + `provenance.jsonl`.
 - **v0.2 (flat mode — deprecated)**: one TSV manifest per project, one
   row per sample. Still works, loud deprecation warning, removed in **v1.0**.
 
 Upgrade paths:
 `v0.2 → v0.3` via `casetrack migrate` ([guide](docs/MIGRATION_v0.2_to_v0.3.md)).
 `v0.3 → v0.4` via `casetrack migrate-qc` ([guide](docs/MIGRATION_v0.3_to_v0.4.md)).
+`v0.4 → v0.6` is automatic for new projects (init writes `project_id`); legacy projects continue to work without one until v0.6 final ships `casetrack migrate-project-id`.
 
 ```
 cohort_v3/
@@ -63,6 +72,7 @@ Three recommended patterns by user shape:
 - [Quick start — v0.3 project mode (recommended)](#quick-start--v03-project-mode-recommended)
 - [Quick start — v0.2 flat mode (deprecated)](#quick-start--v02-flat-mode-deprecated)
 - [Commands](#commands)
+- [Project identity & registry (v0.6+)](#project-identity--registry-v06)
 - [The three-phase SLURM pattern](#the-three-phase-slurm-pattern)
 - [Concurrency & safety rails](#concurrency--safety-rails)
 - [Provenance](#provenance)
@@ -90,7 +100,7 @@ casetrack --help
 Python ≥ 3.10. Runtime deps: `pandas`, `duckdb`, `tomli` (backport on 3.10).
 Optional extras: `openpyxl` (xlsx), `pyarrow` (parquet).
 
-## Project layout (v0.4.2+)
+## Project layout (v0.6+)
 
 `casetrack init --project-dir <path>` scaffolds a full, publication-ready
 project tree by default. The enforced triad — `casetrack.toml` (schema),
@@ -121,41 +131,49 @@ if you already have a layout. Full design: `docs/proposals/0003-init-scaffold.md
 ## Quick start — v0.3 project mode (recommended)
 
 ```bash
-# 1. Create a project directory with the HGSOC schema template.
-casetrack init --project-dir cohort/ --from-template hgsoc
+# 1. Create a project. --project-id is optional (auto-derived from
+#    --project-name or directory basename). The slug is registered in
+#    ~/.casetrack/registry.json so you can later query by id from anywhere.
+casetrack init --project-dir cohort/ --from-template hgsoc \
+    --project-id hgsoc-2026 \
+    --project-name "HGSOC methylation cohort, spring 2026"
 
-# 2. Register a few rows (or load them in bulk via `add-metadata` / `migrate`).
-casetrack register --project-dir cohort/ --level patient  --id HGSOC002 \
+# 2. Register a few rows. IDs are validated against
+#    \A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z — typos with whitespace, shell
+#    metacharacters, or path separators fail loudly here, not three jobs in.
+casetrack register --project hgsoc-2026 --level patient  --id HGSOC002 \
     --meta 'age=55,sex=F,brca_status=brca1'
-casetrack register --project-dir cohort/ --level specimen --id HGSOC002-normal \
+casetrack register --project hgsoc-2026 --level specimen --id HGSOC002-normal \
     --parent HGSOC002 --meta 'tissue_site=normal'
-casetrack register --project-dir cohort/ --level assay    --id HGSOC002-normal-ONT-RNA \
+casetrack register --project hgsoc-2026 --level assay    --id HGSOC002-normal-ONT-RNA \
     --parent HGSOC002-normal --meta 'assay_type=ONT'
 
 # 3. At the end of a SLURM job, append the per-sample summary TSV.
 #    If the TSV has qc_pass=False, casetrack auto-emits a qc_events row
 #    in the same transaction — no extra CLI call needed (see §SLURM pattern).
-casetrack append --project-dir cohort/ --level assay \
+casetrack append --project hgsoc-2026 --level assay \
     --results summary.tsv --analysis modkit_methylation
 
 # 4. Flag a bad assay manually (library prep failed, contamination, etc.).
-casetrack censor --project-dir cohort/ \
+casetrack censor --project hgsoc-2026 \
     --level assay --id HGSOC002-normal-ONT-RNA \
     --kind library_prep_failed --reason "cDNA yield 8 ng, need >100"
 
 # 5. See what's complete AND usable. `--usable` adds the exclusion breakdown.
-casetrack status    --project-dir cohort/ --usable
-casetrack dashboard --project-dir cohort/ --output dashboard.html
+casetrack status    --project hgsoc-2026 --usable
+casetrack dashboard --project hgsoc-2026 --output dashboard.html
 
 # 6. Cohort readiness — paired designs surface broken pairs.
-casetrack cohort --project-dir cohort/ \
+casetrack cohort --project hgsoc-2026 \
     --assay-type ONT-RNA-Seq --pair-by tissue_site
 
 # 7. Query across the three levels with SQL. `_` is the raw join;
 #    `_active` applies the §4.4 cascade (QC + consent) automatically.
-casetrack query --project-dir cohort/ --fmt json \
+casetrack query --project hgsoc-2026 --fmt json \
     "SELECT patient_id, assay_id, mean_meth FROM _active WHERE mean_meth > 0.6"
 ```
+
+`--project hgsoc-2026` and `--project-dir cohort/` are interchangeable — pass either, not both. The registry is local to your account (`~/.casetrack/registry.json`); team-shared registries are deferred to a later proposal.
 
 ## Quick start — v0.2 flat mode (deprecated)
 
@@ -194,7 +212,7 @@ and exact SQL.
 |------------------|------------------------------------------------------------------------------|
 | `init`           | Create a flat manifest OR a v0.3 project directory                           |
 | `migrate`        | **v0.3** — convert a v0.2 flat manifest into a project directory             |
-| `register`       | **v0.3** — insert a single row at patient/specimen/assay with strict FK      |
+| `register`       | **v0.3** — insert a single row at patient/specimen/assay with strict FK. **v0.6**: rejects malformed IDs (whitespace, shell metas, path seps) at the source — see §Project identity. |
 | `append`         | Attach analysis results (flat: columns; v0.3: ALTER TABLE ADD COLUMN)        |
 | `add-metadata`   | Bulk UPDATE/INSERT metadata from a TSV (no `_done` timestamp)                |
 | `status`         | Completion summary (`--group-by {analysis,assay,specimen,patient}`)          |
@@ -203,10 +221,10 @@ and exact SQL.
 | `schema`         | Flat: column-to-analysis map. v0.3: `{show,dump,check,apply}`                |
 | `rerun`          | Emit or submit sbatch commands for rows missing an analysis                  |
 | `dashboard`      | Self-contained offline HTML dashboard (v0.3: nested patients → specimens → assays) |
-| `projects`       | Cross-project overview — detects both v0.2 manifests and v0.3 projects       |
+| `projects`       | Manage `~/.casetrack/registry.json` (`list`/`register`/`deregister`) or scan a tree (`scan --root <path>`). v0.5 form `projects --root` still works. |
 | `query`          | SQL over flat manifests or v0.3 projects (DuckDB-backed; v0.3 exposes `_`)   |
 | `export`         | Export to xlsx / csv / json / parquet / tsv (`--shape tables\|joined` in v0.3) |
-| `doctor`         | **v0.3** — concurrency stress test on the project's filesystem               |
+| `doctor`         | **v0.3** — concurrency stress test on the project's filesystem. **v0.6** `--id-format` scans hierarchy IDs against the schema's regex (table or TSV output, exit 1 on findings). |
 | `recover`        | **v0.3** — rebuild `casetrack.db` by replaying `provenance.jsonl`            |
 | `censor`         | **v0.4** — record a QC failure / consent revocation on an entity             |
 | `uncensor`       | **v0.4** — resolve an active qc_events row (consent reversal gated)          |
@@ -297,6 +315,61 @@ A single self-contained HTML file — no network, no CDN, no JavaScript librarie
 Summary metrics, per-analysis progress bars with expandable "missing samples" lists,
 a sample × analysis heatmap, and a provenance timeline with short git commit hashes.
 Safe to `scp` to a laptop.
+
+## Project identity & registry (v0.6+)
+
+Every project gets a **`project_id`** at init — a DNS-label slug like `hgsoc-2026` that's stable across mount points, rsyncs, and archive/restore cycles. It's persisted in three places, all cross-checked:
+
+1. `casetrack.toml` `[project] project_id` — the human-editable source.
+2. `project_meta` table inside `casetrack.db` — the DB self-describes.
+3. `~/.casetrack/registry.json` — your local lookup.
+
+The point: an LLM, a SLURM wrapper, or you-on-tuesday can address a project by id without remembering paths.
+
+```bash
+# Auto-derived slug from --project-name (or directory basename if --project-name
+# is unsuitable). Pass --project-id explicitly to override.
+casetrack init --project-dir cohort/ \
+    --project-name "HGSOC methylation cohort, spring 2026"
+# → registers project_id "hgsoc-methylation-cohort-spring-2026"
+
+# Address a registered project by id from anywhere — no path memorisation.
+casetrack --project hgsoc-2026 query "SELECT COUNT(*) FROM patients"
+casetrack --project hgsoc-2026 status --usable
+
+# List / register / deregister entries in your local registry.
+casetrack projects list                       # table | --fmt json | --fmt tsv
+casetrack projects register --project-dir /restored/from/archive/cohort
+casetrack projects deregister some-old-project
+
+# Legacy filesystem-walk overview (v0.5 behavior, still supported).
+casetrack projects scan --root ~/projects/    # or: casetrack projects --root ~/projects/
+```
+
+If TOML's `project_id` and the DB's `project_meta.project_id` disagree (you copied a `.db` into the wrong directory, or hand-edited TOML after init), the next command fails loudly with both values shown. Legacy v0.5 projects without `project_meta` continue to work — the consistency check skips silently until you re-init or, in v0.6 final, run `casetrack migrate-project-id`.
+
+### Hierarchy ID format (`patient_id`, `specimen_id`, `assay_id`)
+
+Validated at every INSERT path (`register`, `migrate`, `add-metadata --allow-new`) against:
+
+```
+\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z
+```
+
+ASCII alphanumeric start; then alphanumeric, underscore, hyphen, or dot; 1–64 chars. No whitespace, no shell metacharacters, no path separators. Plus a case-insensitive duplicate check within a level — `HG006` and `hg006` can't coexist by default. Read paths (`query`, `export`, `dashboard`, `recover`) tolerate pre-v0.6 malformed IDs unchanged.
+
+**Why?** Whitespace in a `patient_id` makes `casetrack query` fail with cryptic "no rule" errors; shell metacharacters in IDs are SQL-injection material if any wrapper builds a query via string concat; path separators silently break path-template joins. Failing loudly at `register` saves hours of downstream debugging.
+
+**Escape hatch** for cohorts with legacy LIMS IDs containing colons or other non-default characters:
+
+```toml
+[levels.patient]
+key                 = "patient_id"
+id_pattern          = "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$"   # allow colons, 80 chars
+allow_case_variants = true                                     # allow HG006 + hg006
+```
+
+Project-wide non-ASCII opt-in via `[project] allow_unicode_ids = true`. Bulk-audit existing IDs against the schema with `casetrack doctor --id-format --project hgsoc-2026` (or `--fmt tsv` for CI). Full design + escape hatches: [proposal 0005](docs/proposals/0005-id-format-and-project-identity.md).
 
 ## The three-phase SLURM pattern
 
