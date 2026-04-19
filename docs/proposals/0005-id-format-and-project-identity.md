@@ -3,11 +3,20 @@
 | | |
 |---|---|
 | **Author** | Samuel Ahuno ([ekwame001@gmail.com](mailto:ekwame001@gmail.com)) |
-| **Status** | Draft |
+| **Status** | Part A shipped 2026-04-19 (v0.6.0-part-a); Part B still draft |
 | **Date** | 2026-04-19 |
 | **Target release** | v0.6.0 |
 | **Breaking** | Yes — new required field (`project_id`) + stricter validation on patient/specimen/assay IDs. One-shot migration path. |
 | **Depends on** | Proposal 0001 (normalized backend, shipped v0.3.0); Proposal 0004 (Nextflow integration, v0.4.0) |
+
+## Shipped progress snapshot (2026-04-19)
+
+| Part | Status | Notes |
+|---|---|---|
+| **Part A — hierarchy ID format enforcement** | ✅ shipped | Validators wired into `cmd_register`, `_insert_rows_by_level` (migrate), `cmd_add_metadata_project --allow-new`. Recover paths tolerant of legacy IDs by design. 37 new tests. casetrack commit `1849cc6`. |
+| **Part A — Nextflow integration surface** | ✅ shipped | Part A surfaces through `casetrack register` called from init scripts. Negative smoke test (`test/run_test_malformed.sh`) + tutorial notes shipped in `casetrack-nf-subworkflows` commit `9f958a1`. |
+| **Part A — `casetrack doctor --id-format`** | ⏳ pending | Scan-only; non-blocking for enforcement. Tracked in §7. |
+| **Part B — project identity (`project_id`, `project_meta`, registry)** | ⏳ draft | No code yet. §5 + §6.1 + §6.3 untouched. |
 
 ## 0. Accepted decisions
 
@@ -52,11 +61,11 @@ Fix: introduce `project_id` as a machine-addressable slug, persist it inside the
 
 ## 2. Goals
 
-1. Reject malformed hierarchy IDs at `append` / `register` / `init` time with a clear error naming the offending value and the rule it violated.
-2. Give every casetrack project a globally-meaningful-within-a-registry identifier that does not depend on filesystem location.
-3. Make every `casetrack.db` self-describing — hand an agent a path to the DB alone, it can answer "what project is this" without reading the TOML.
-4. Give AI agents a closed-world project lookup: `list_projects()` → `query(project_id, sql)`. No free-text path input.
-5. Keep the escape hatch: existing projects with non-conforming IDs (real LIMS IDs with colons, cohorts imported from legacy systems) can opt out via TOML config.
+1. ✅ **Shipped.** Reject malformed hierarchy IDs at `register` / `migrate` / `add-metadata --allow-new` time with a clear error naming the offending value and the rule it violated. (`append` doesn't create IDs — it requires them to exist — so the effective INSERT surface is covered.)
+2. ⏳ **Pending.** Give every casetrack project a globally-meaningful-within-a-registry identifier that does not depend on filesystem location.
+3. ⏳ **Pending.** Make every `casetrack.db` self-describing — hand an agent a path to the DB alone, it can answer "what project is this" without reading the TOML.
+4. ⏳ **Pending.** Give AI agents a closed-world project lookup: `list_projects()` → `query(project_id, sql)`. No free-text path input.
+5. ✅ **Shipped.** Keep the escape hatch: existing projects with non-conforming IDs (real LIMS IDs with colons, cohorts imported from legacy systems) can opt out via `[levels.<level>] id_pattern` / `allow_case_variants` / `[project] allow_unicode_ids` in TOML.
 
 ## 3. Non-goals
 
@@ -66,14 +75,14 @@ Fix: introduce `project_id` as a machine-addressable slug, persist it inside the
 - Renaming support for `project_id` — explicitly immutable (§0 #6).
 - Validating the *content* of IDs for biological coherence (e.g. "this patient_id looks like a sample_id"). Out of scope.
 
-## 4. Design — Part A: hierarchy ID format
+## 4. Design — Part A: hierarchy ID format ✅ shipped v0.6.0-part-a
 
 ### 4.1 The rule
 
-One regex applies to all three levels:
+One regex applies to all three levels (the actual shipped code uses `\A`/`\Z` instead of `^`/`$` because Python's `$` matches before a trailing `\n` by default — same meaning, stricter anchor):
 
 ```python
-ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 ```
 
 Plus two semantic checks:
@@ -131,7 +140,7 @@ The override is validated at `init` / schema-reload time (it must itself be a va
 - When the ID gets joined into a path like `results/modkit_pileup/20260419_hg38_v1/P01/SPEC_A/ASSAY_001/summary.tsv`, the three IDs contribute ~120 chars in the worst case. 64 per ID leaves ~63 chars of headroom for `{tool}/{run_tag}/` + `summary.tsv`.
 - 64 is the git-short-SHA length users are already used to seeing.
 
-## 5. Design — Part B: project identity
+## 5. Design — Part B: project identity ⏳ draft — no code yet
 
 ### 5.1 Two fields, two purposes
 
@@ -230,7 +239,7 @@ casetrack_query(project_id: str, sql: str) -> rows
 
 ## 6. Schema additions
 
-### 6.1 New table: `project_meta`
+### 6.1 New table: `project_meta` ⏳ Part B — pending
 
 ```sql
 CREATE TABLE project_meta (
@@ -249,27 +258,30 @@ The `CHECK` constraint is a defense-in-depth echo of the Python-side regex — e
 
 ### 6.2 TOML additions
 
+Part A ✅ shipped — `[project] allow_unicode_ids`, `[levels.<level>] id_pattern`, `[levels.<level>] allow_case_variants` are live and validated at `load_schema()` time:
+
 ```toml
 [project]
-project_id = "hgsoc-methylation-2026"    # NEW: required, immutable
+# Part A — shipped:
+allow_unicode_ids = false              # default false (ASCII-only)
+
+# Part B — pending:
+project_id = "hgsoc-methylation-2026"  # NEW: required, immutable
 name       = "HGSOC methylation cohort"   # existing: free-form
 schema_v   = 1
 created    = "..."
-
-# Optional — opt out of ASCII-only hierarchy IDs.
-allow_unicode_ids = false   # default false
 ```
 
-Per-level (optional):
+Per-level (Part A ✅ shipped):
 
 ```toml
 [levels.patient]
-key         = "patient_id"
-id_pattern  = "..."                    # NEW: optional regex override, must anchor ^/$
-allow_case_variants = false            # NEW: default false
+key                 = "patient_id"
+id_pattern          = "..."            # optional regex override, must anchor ^/$
+allow_case_variants = false            # default false
 ```
 
-### 6.3 Registry file
+### 6.3 Registry file ⏳ Part B — pending
 
 `~/.casetrack/registry.json` — created on first `casetrack init` on a given user account.
 
@@ -294,12 +306,12 @@ Provenance entry written.
 - Idempotent: re-running on a project that already has `project_id` no-ops with a message.
 - Batch mode: `casetrack migrate-project-id --scan /data1/greenbab/...` walks a root, finds all `casetrack.db` files, migrates each (with `--yes` to skip interactive confirmation).
 
-For hierarchy IDs, `casetrack doctor --id-format` scans all three tables, reports non-conforming IDs, and exits with a suggested rename map. No auto-rename — the user must produce a migration TSV mapping old → new IDs, because a patient/specimen/assay rename has FK cascade implications that shouldn't be automatic.
+For hierarchy IDs, `casetrack doctor --id-format` (⏳ pending) scans all three tables, reports non-conforming IDs, and exits with a suggested rename map. No auto-rename — the user must produce a migration TSV mapping old → new IDs, because a patient/specimen/assay rename has FK cascade implications that shouldn't be automatic.
 
 ### 7.1 Backward compatibility with v0.5 and earlier projects
 
-- Projects without a `project_meta` table are detected at command start. First command triggers an interactive prompt to run `migrate-project-id`, or a `--skip-project-id-check` flag for automation scripts that need one last run before migration.
-- Hierarchy IDs that already exist and violate the new regex: commands continue to work (read-only paths), but `append` on new rows is rejected until the offending existing row is renamed or `id_pattern` is loosened in TOML. Rationale: strict-on-new, tolerant-of-existing, gives users time to migrate.
+- Projects without a `project_meta` table are detected at command start. First command triggers an interactive prompt to run `migrate-project-id`, or a `--skip-project-id-check` flag for automation scripts that need one last run before migration. ⏳ Part B — pending.
+- ✅ **Shipped.** Hierarchy IDs that already exist and violate the new regex: commands continue to work on read paths (query, export, dashboard, recover); INSERT paths (register, migrate, add-metadata --allow-new) reject malformed values on new rows until the offending existing row is renamed or `id_pattern` is loosened in TOML. Rationale: strict-on-new, tolerant-of-existing.
 
 ## 8. Open questions
 
@@ -322,9 +334,9 @@ Later-iteration proposal (punted): UUID backing. Schema becomes `project_id` (hu
 
 Every `provenance.jsonl` entry should include `project_id` so archived logs are self-describing even when separated from the DB. This is effectively a schema bump on provenance. Minor — just agreeing to the field before implementation.
 
-### Q4 — Interaction with `casetrack register`
+### Q4 — Interaction with `casetrack register` ✅ resolved
 
-The v0.4 `casetrack register` command pre-creates hierarchy rows. With strict ID validation, register will reject malformed IDs earlier than append does. Probably good. Need to confirm the error message points at register's CLI flag (`--patient-id`) not append's TSV.
+Part A shipped: `cmd_register` validates `--id` and `--parent` before opening the DB, surfacing errors like `Error: patient_id 'HG 006' is not a valid identifier. Must match '\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z' ...` Verified end-to-end through the Nextflow integration (`casetrack-nf-subworkflows/test/run_test_malformed.sh`, commit `9f958a1`).
 
 ### Q5 — What happens to `[project] name` mutability
 
@@ -336,10 +348,14 @@ If a project opts in to `allow_unicode_ids`, the per-assay summary TSVs must be 
 
 ## 9. Rollout plan
 
-1. **v0.6.0-alpha**: ship the validators + `project_meta` table + `--project <id>` resolver. No enforcement — validators warn, don't reject. Ship the registry read path + `casetrack projects list`.
-2. **v0.6.0-beta** (one week later): flip to enforcement for new projects only (`casetrack init` refuses without `project_id`; append refuses malformed hierarchy IDs on new rows). Existing projects continue to work read-only.
-3. **v0.6.0 final** (two weeks after beta): `migrate-project-id` command ships as a hard requirement — commands on un-migrated v0.5 projects fail with a clear migration instruction. Dashboard, query, export all require the registry entry to exist.
-4. **v0.7.x**: revisit team-shared registry (Q1) and UUID backing (Q2) as separate proposals.
+1. ✅ **v0.6.0-part-a (shipped 2026-04-19)**: hierarchy ID format enforcement landed in `casetrack.py` commit `1849cc6` + tests `test_id_format.py` (37 tests) + Nextflow integration tests in `casetrack-nf-subworkflows` commit `9f958a1`. **Deviation from original plan**: shipped as enforcement-by-default, not warn-mode alpha, because the validator errors are actionable and the escape hatches (`id_pattern`, `allow_case_variants`, `allow_unicode_ids`) cover every legitimate legacy case.
+2. ⏳ **v0.6.0-part-b (pending)**: `project_id` + `project_meta` table + `--project <id>` resolver + registry read path + `casetrack projects list` / `register` / `deregister`. No enforcement — new projects get `project_id`, old ones continue to work.
+3. ⏳ **v0.6.0 final (pending)**: `migrate-project-id` command ships as a hard requirement — commands on un-migrated projects fail with a clear migration instruction. Dashboard, query, export all require the registry entry to exist.
+4. ⏳ **v0.7.x**: revisit team-shared registry (Q1) and UUID backing (Q2) as separate proposals.
+
+### Remaining Part A items
+
+- `casetrack doctor --id-format` — scan existing tables, report non-conforming IDs with a suggested rename map (§7). Scan-only; does not auto-rename.
 
 ## 10. References
 
