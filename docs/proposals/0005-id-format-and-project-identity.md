@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Author** | Samuel Ahuno ([ekwame001@gmail.com](mailto:ekwame001@gmail.com)) |
-| **Status** | Part A complete (shipped 2026-04-19, v0.6.0-part-a); Part B still draft |
+| **Status** | Part A complete + Part B alpha shipped 2026-04-19 (v0.6.0a1); Part B final still pending |
 | **Date** | 2026-04-19 |
 | **Target release** | v0.6.0 |
 | **Breaking** | Yes — new required field (`project_id`) + stricter validation on patient/specimen/assay IDs. One-shot migration path. |
@@ -16,7 +16,9 @@
 | **Part A — hierarchy ID format enforcement** | ✅ shipped | Validators wired into `cmd_register`, `_insert_rows_by_level` (migrate), `cmd_add_metadata_project --allow-new`. Recover paths tolerant of legacy IDs by design. 37 new tests. casetrack commit `1849cc6`. |
 | **Part A — Nextflow integration surface** | ✅ shipped | Part A surfaces through `casetrack register` called from init scripts. Negative smoke test (`test/run_test_malformed.sh`) + tutorial notes shipped in `casetrack-nf-subworkflows` commit `9f958a1`. |
 | **Part A — `casetrack doctor --id-format`** | ✅ shipped | Scan-only health check + rename suggestions; `--fmt table\|tsv`. casetrack commit `9e4369e`. |
-| **Part B — project identity (`project_id`, `project_meta`, registry)** | ⏳ draft | No code yet. §5 + §6.1 + §6.3 untouched. |
+| **Part B alpha — project identity (`project_id`, `project_meta`, registry)** | ✅ shipped | `_PROJECT_ID_PATTERN`, `project_meta` table, `~/.casetrack/registry.json` (single-user), `casetrack init --project-id`, `casetrack --project <id>`, `casetrack projects {list,register,deregister,scan}`. casetrack commit `3b3f5f1`. 51 new tests. Legacy v0.5 projects continue to work — no enforcement. |
+| **Part B final — `migrate-project-id` + hard requirement** | ⏳ pending | Interactive migration command for legacy projects + hard error on un-migrated projects at command start (§7, §9 step 3). |
+| **Part B — MCP wrapper for AI agents** | ⏳ pending | `casetrack_list_projects()` + `casetrack_query(project_id, sql)` per §5.6 — out of code scope but documented. |
 
 ## 0. Accepted decisions
 
@@ -62,9 +64,9 @@ Fix: introduce `project_id` as a machine-addressable slug, persist it inside the
 ## 2. Goals
 
 1. ✅ **Shipped.** Reject malformed hierarchy IDs at `register` / `migrate` / `add-metadata --allow-new` time with a clear error naming the offending value and the rule it violated. (`append` doesn't create IDs — it requires them to exist — so the effective INSERT surface is covered.)
-2. ⏳ **Pending.** Give every casetrack project a globally-meaningful-within-a-registry identifier that does not depend on filesystem location.
-3. ⏳ **Pending.** Make every `casetrack.db` self-describing — hand an agent a path to the DB alone, it can answer "what project is this" without reading the TOML.
-4. ⏳ **Pending.** Give AI agents a closed-world project lookup: `list_projects()` → `query(project_id, sql)`. No free-text path input.
+2. ✅ **Shipped (Part B alpha).** Give every casetrack project a globally-meaningful-within-a-registry identifier that does not depend on filesystem location. New projects get a `project_id` at init; `casetrack --project <id>` resolves via `~/.casetrack/registry.json`.
+3. ✅ **Shipped (Part B alpha).** Make every `casetrack.db` self-describing — `SELECT project_id FROM project_meta` answers "what project is this" without reading the TOML. Cross-checked against the TOML on every command.
+4. ⏳ **Pending (MCP wrapper).** Give AI agents a closed-world project lookup: `list_projects()` → `query(project_id, sql)`. The CLI primitives (`casetrack projects list --fmt json`, `casetrack --project <id> query "..."`) are now in place; the MCP wrapper that exposes them as tool calls is out of code scope.
 5. ✅ **Shipped.** Keep the escape hatch: existing projects with non-conforming IDs (real LIMS IDs with colons, cohorts imported from legacy systems) can opt out via `[levels.<level>] id_pattern` / `allow_case_variants` / `[project] allow_unicode_ids` in TOML.
 
 ## 3. Non-goals
@@ -140,7 +142,7 @@ The override is validated at `init` / schema-reload time (it must itself be a va
 - When the ID gets joined into a path like `results/modkit_pileup/20260419_hg38_v1/P01/SPEC_A/ASSAY_001/summary.tsv`, the three IDs contribute ~120 chars in the worst case. 64 per ID leaves ~63 chars of headroom for `{tool}/{run_tag}/` + `summary.tsv`.
 - 64 is the git-short-SHA length users are already used to seeing.
 
-## 5. Design — Part B: project identity ⏳ draft — no code yet
+## 5. Design — Part B: project identity ✅ alpha shipped v0.6.0a1
 
 ### 5.1 Two fields, two purposes
 
@@ -239,7 +241,7 @@ casetrack_query(project_id: str, sql: str) -> rows
 
 ## 6. Schema additions
 
-### 6.1 New table: `project_meta` ⏳ Part B — pending
+### 6.1 New table: `project_meta` ✅ shipped v0.6.0a1
 
 ```sql
 CREATE TABLE project_meta (
@@ -258,15 +260,15 @@ The `CHECK` constraint is a defense-in-depth echo of the Python-side regex — e
 
 ### 6.2 TOML additions
 
-Part A ✅ shipped — `[project] allow_unicode_ids`, `[levels.<level>] id_pattern`, `[levels.<level>] allow_case_variants` are live and validated at `load_schema()` time:
+Part A ✅ shipped — `[project] allow_unicode_ids`, `[levels.<level>] id_pattern`, `[levels.<level>] allow_case_variants` are live and validated at `load_schema()` time. Part B alpha ✅ shipped — `[project] project_id` is now written by `casetrack init` and validated at `load_schema()` time:
 
 ```toml
 [project]
-# Part A — shipped:
-allow_unicode_ids = false              # default false (ASCII-only)
-
-# Part B — pending:
-project_id = "hgsoc-methylation-2026"  # NEW: required, immutable
+project_id = "hgsoc-methylation-2026"  # ✅ Part B alpha — auto-derived or
+                                        #   passed via --project-id at init.
+                                        #   Optional in TOML for legacy
+                                        #   projects until v0.6.0 final.
+allow_unicode_ids = false              # ✅ Part A — default false (ASCII-only)
 name       = "HGSOC methylation cohort"   # existing: free-form
 schema_v   = 1
 created    = "..."
@@ -281,9 +283,9 @@ id_pattern          = "..."            # optional regex override, must anchor ^/
 allow_case_variants = false            # default false
 ```
 
-### 6.3 Registry file ⏳ Part B — pending
+### 6.3 Registry file ✅ shipped v0.6.0a1
 
-`~/.casetrack/registry.json` — created on first `casetrack init` on a given user account.
+`~/.casetrack/registry.json` — created on first `casetrack init` on a given user account. fcntl-locked atomic writes via `_registry_locked()` context manager. Path overridable via `CASETRACK_REGISTRY` env var (used by tests + power users with non-default home layouts).
 
 ## 7. Migration path
 
@@ -310,7 +312,7 @@ For hierarchy IDs, `casetrack doctor --id-format` ✅ shipped — scans all thre
 
 ### 7.1 Backward compatibility with v0.5 and earlier projects
 
-- Projects without a `project_meta` table are detected at command start. First command triggers an interactive prompt to run `migrate-project-id`, or a `--skip-project-id-check` flag for automation scripts that need one last run before migration. ⏳ Part B — pending.
+- ✅ **Shipped (alpha) — tolerant.** Projects without a `project_meta` table or without `[project] project_id` in TOML continue to work normally. The cross-check (`check_project_identity_consistency`) silently skips when either side is absent. ⏳ Part B final will tighten this to require migration via `casetrack migrate-project-id`.
 - ✅ **Shipped.** Hierarchy IDs that already exist and violate the new regex: commands continue to work on read paths (query, export, dashboard, recover); INSERT paths (register, migrate, add-metadata --allow-new) reject malformed values on new rows until the offending existing row is renamed or `id_pattern` is loosened in TOML. Rationale: strict-on-new, tolerant-of-existing.
 
 ## 8. Open questions
@@ -348,14 +350,20 @@ If a project opts in to `allow_unicode_ids`, the per-assay summary TSVs must be 
 
 ## 9. Rollout plan
 
-1. ✅ **v0.6.0-part-a (shipped 2026-04-19)**: hierarchy ID format enforcement landed in `casetrack.py` commit `1849cc6` + tests `test_id_format.py` (37 tests) + Nextflow integration tests in `casetrack-nf-subworkflows` commit `9f958a1`. **Deviation from original plan**: shipped as enforcement-by-default, not warn-mode alpha, because the validator errors are actionable and the escape hatches (`id_pattern`, `allow_case_variants`, `allow_unicode_ids`) cover every legitimate legacy case.
-2. ⏳ **v0.6.0-part-b (pending)**: `project_id` + `project_meta` table + `--project <id>` resolver + registry read path + `casetrack projects list` / `register` / `deregister`. No enforcement — new projects get `project_id`, old ones continue to work.
+1. ✅ **v0.6.0-part-a (shipped 2026-04-19)**: hierarchy ID format enforcement landed in `casetrack.py` commit `1849cc6` + tests `test_id_format.py` (37 tests) + Nextflow integration tests in `casetrack-nf-subworkflows` commit `9f958a1` + `casetrack doctor --id-format` scanner in commit `9e4369e`. **Deviation from original plan**: shipped as enforcement-by-default, not warn-mode alpha, because the validator errors are actionable and the escape hatches (`id_pattern`, `allow_case_variants`, `allow_unicode_ids`) cover every legitimate legacy case.
+2. ✅ **v0.6.0-part-b alpha (shipped 2026-04-19)**: `project_id` + `project_meta` table + `--project <id>` resolver + registry read+write path + `casetrack projects list` / `register` / `deregister` / `scan` shipped in commit `3b3f5f1` with 51 new tests. No enforcement — new projects get `project_id`, legacy v0.5 projects continue to work because cross-check skips when either TOML or DB lacks the field.
 3. ⏳ **v0.6.0 final (pending)**: `migrate-project-id` command ships as a hard requirement — commands on un-migrated projects fail with a clear migration instruction. Dashboard, query, export all require the registry entry to exist.
 4. ⏳ **v0.7.x**: revisit team-shared registry (Q1) and UUID backing (Q2) as separate proposals.
 
 ### Remaining Part A items
 
-✅ All Part A items shipped. `casetrack doctor --id-format` is the final piece (commit `9e4369e`, 25 new tests, 628 total passing). Part A is complete.
+✅ All Part A items shipped. Part A is complete.
+
+### Remaining Part B items
+
+- ⏳ `casetrack migrate-project-id` interactive command for legacy v0.5 projects (slug suggestion + idempotent + batch `--scan` mode).
+- ⏳ Hard-error gate on un-migrated projects (rollout step 3 above).
+- ⏳ MCP wrapper exposing `list_projects()` + `query(project_id, sql)` to AI agents (§5.6).
 
 ## 10. References
 
