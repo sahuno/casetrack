@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Author** | Samuel Ahuno ([ekwame001@gmail.com](mailto:ekwame001@gmail.com)) |
-| **Status** | Part A complete + Part B alpha shipped 2026-04-19 (v0.6.0a1); Part B final still pending |
+| **Status** | Part A complete + Part B alpha + beta shipped 2026-04-19 (v0.6.0a1 + b1); hard-requirement gate still pending |
 | **Date** | 2026-04-19 |
 | **Target release** | v0.6.0 |
 | **Breaking** | Yes — new required field (`project_id`) + stricter validation on patient/specimen/assay IDs. One-shot migration path. |
@@ -17,7 +17,8 @@
 | **Part A — Nextflow integration surface** | ✅ shipped | Part A surfaces through `casetrack register` called from init scripts. Negative smoke test (`test/run_test_malformed.sh`) + tutorial notes shipped in `casetrack-nf-subworkflows` commit `9f958a1`. |
 | **Part A — `casetrack doctor --id-format`** | ✅ shipped | Scan-only health check + rename suggestions; `--fmt table\|tsv`. casetrack commit `9e4369e`. |
 | **Part B alpha — project identity (`project_id`, `project_meta`, registry)** | ✅ shipped | `_PROJECT_ID_PATTERN`, `project_meta` table, `~/.casetrack/registry.json` (single-user), `casetrack init --project-id`, `casetrack --project <id>`, `casetrack projects {list,register,deregister,scan}`. casetrack commit `3b3f5f1`. 51 new tests. Legacy v0.5 projects continue to work — no enforcement. |
-| **Part B final — `migrate-project-id` + hard requirement** | ⏳ pending | Interactive migration command for legacy projects + hard error on un-migrated projects at command start (§7, §9 step 3). |
+| **Part B beta — `casetrack migrate-project-id`** | ✅ shipped | Interactive single-project + `--scan` batch mode. Idempotent; refuses slug conflicts; writes provenance entry per migration. casetrack commit `3a678fa`. 15 new tests. |
+| **Part B final — hard requirement gate** | ⏳ pending | Hard error on un-migrated projects at command start. Deferred so users can migrate at their own pace before the gate lands (§9 step 3). |
 | **Part B — MCP wrapper for AI agents** | ⏳ pending | `casetrack_list_projects()` + `casetrack_query(project_id, sql)` per §5.6 — out of code scope but documented. |
 
 ## 0. Accepted decisions
@@ -289,30 +290,35 @@ allow_case_variants = false            # default false
 
 ## 7. Migration path
 
-v0.6.0 ships with a `casetrack migrate-project-id` command:
+✅ **Shipped (Part B beta) — `casetrack migrate-project-id`** (commit `3a678fa`):
 
 ```bash
 $ casetrack migrate-project-id --project-dir /data/hgsoc_2026
-Current project name: "HGSOC methylation cohort, spring 2026"
-Suggested project_id: hgsoc-methylation-cohort-spring-2026
-Enter project_id (or press Enter to accept suggestion): hgsoc-2026
-Validating... ok
-Writing project_id to casetrack.toml...       ok
-Writing project_meta row to casetrack.db...    ok
-Registering in ~/.casetrack/registry.json...   ok
-Provenance entry written.
+
+[/data/hgsoc_2026]
+  Current project name: 'HGSOC methylation cohort, spring 2026'
+  Suggested project_id: hgsoc-methylation-cohort-spring-2026
+  Enter project_id (Enter to accept, ^C to abort): hgsoc-2026
+Migrated  /data/hgsoc_2026  → project_id='hgsoc-2026' (updated: toml, project_meta, registry)
+
+Done: 1 migrated, 0 no-op, 0 skipped.
 ```
 
-- Slug suggestion: lowercase the `name`, strip punctuation, collapse whitespace to hyphens, truncate to 64 chars.
-- User can override the suggestion with any valid slug.
-- Idempotent: re-running on a project that already has `project_id` no-ops with a message.
-- Batch mode: `casetrack migrate-project-id --scan /data1/greenbab/...` walks a root, finds all `casetrack.db` files, migrates each (with `--yes` to skip interactive confirmation).
+- Slug suggestion via `suggest_project_id()`: lowercase the `name`, collapse runs of non-alnum to hyphens, strip leading/trailing hyphens, truncate to 64 chars.
+- User can override the suggestion with any valid slug at the prompt, or pass `--project-id <slug>` to skip the prompt.
+- `--yes` accepts the auto-suggestion non-interactively (required for `--scan`, recommended for automation).
+- Idempotent: a project already wired through TOML + `project_meta` + registry is a no-op.
+- Refuses to overwrite drift (TOML `project_id` ≠ DB `project_meta.project_id`) — the user must resolve manually before migration can proceed.
+- Refuses to claim a slug that's already in the registry pointing at a different directory (chosen v0.6 design call: keep the user in control rather than auto-suffixing). The error tells them to either pass `--project-id <other>` or `casetrack projects deregister <slug>` first.
+- Batch mode: `casetrack migrate-project-id --scan /data1/greenbab/... --yes` walks the tree (uses `_find_v03_projects`), migrates every casetrack project missing a `project_meta` row.
+- Each successful migration writes a `migrate_project_id` entry to `provenance.jsonl` with the list of artifacts touched (`["toml", "project_meta", "registry"]`).
+- Exit codes: 0 if all targets either migrated or no-op'd, 1 if any were skipped (so CI can catch silent failures).
 
 For hierarchy IDs, `casetrack doctor --id-format` ✅ shipped — scans all three tables, reports non-conforming IDs, and exits non-zero if any are found. Each violation includes a `_suggest_clean_id()` heuristic rename when the cleaned slug passes the default regex; otherwise the report flags "no safe suggestion — manual rename needed." No auto-rename — patient/specimen/assay renames have FK cascade implications that shouldn't be automatic. Output: `--fmt table` (default, human-readable) or `--fmt tsv` (machine-readable for CI).
 
 ### 7.1 Backward compatibility with v0.5 and earlier projects
 
-- ✅ **Shipped (alpha) — tolerant.** Projects without a `project_meta` table or without `[project] project_id` in TOML continue to work normally. The cross-check (`check_project_identity_consistency`) silently skips when either side is absent. ⏳ Part B final will tighten this to require migration via `casetrack migrate-project-id`.
+- ✅ **Shipped (alpha) — tolerant.** Projects without a `project_meta` table or without `[project] project_id` in TOML continue to work normally. The cross-check (`check_project_identity_consistency`) silently skips when either side is absent. ✅ **Beta** added the `casetrack migrate-project-id` command to bring legacy projects into the new scheme. ⏳ Part B final will tighten the runtime to require a `project_meta` row.
 - ✅ **Shipped.** Hierarchy IDs that already exist and violate the new regex: commands continue to work on read paths (query, export, dashboard, recover); INSERT paths (register, migrate, add-metadata --allow-new) reject malformed values on new rows until the offending existing row is renamed or `id_pattern` is loosened in TOML. Rationale: strict-on-new, tolerant-of-existing.
 
 ## 8. Open questions
@@ -352,8 +358,9 @@ If a project opts in to `allow_unicode_ids`, the per-assay summary TSVs must be 
 
 1. ✅ **v0.6.0-part-a (shipped 2026-04-19)**: hierarchy ID format enforcement landed in `casetrack.py` commit `1849cc6` + tests `test_id_format.py` (37 tests) + Nextflow integration tests in `casetrack-nf-subworkflows` commit `9f958a1` + `casetrack doctor --id-format` scanner in commit `9e4369e`. **Deviation from original plan**: shipped as enforcement-by-default, not warn-mode alpha, because the validator errors are actionable and the escape hatches (`id_pattern`, `allow_case_variants`, `allow_unicode_ids`) cover every legitimate legacy case.
 2. ✅ **v0.6.0-part-b alpha (shipped 2026-04-19)**: `project_id` + `project_meta` table + `--project <id>` resolver + registry read+write path + `casetrack projects list` / `register` / `deregister` / `scan` shipped in commit `3b3f5f1` with 51 new tests. No enforcement — new projects get `project_id`, legacy v0.5 projects continue to work because cross-check skips when either TOML or DB lacks the field.
-3. ⏳ **v0.6.0 final (pending)**: `migrate-project-id` command ships as a hard requirement — commands on un-migrated projects fail with a clear migration instruction. Dashboard, query, export all require the registry entry to exist.
-4. ⏳ **v0.7.x**: revisit team-shared registry (Q1) and UUID backing (Q2) as separate proposals.
+3. ✅ **v0.6.0-part-b beta (shipped 2026-04-19)**: `casetrack migrate-project-id` interactive single-project + `--scan` batch mode shipped in commit `3a678fa` with 15 new tests. Idempotent; refuses drift + slug conflicts; provenance entry per migration. Hard-requirement gate intentionally deferred to step 4.
+4. ⏳ **v0.6.0 final (pending)**: hard error on un-migrated projects at command start. Dashboard, query, export all require the registry entry to exist. Deferred so users can adopt `migrate-project-id` at their own pace before the gate lands.
+5. ⏳ **v0.7.x**: revisit team-shared registry (Q1) and UUID backing (Q2) as separate proposals.
 
 ### Remaining Part A items
 
@@ -361,8 +368,7 @@ If a project opts in to `allow_unicode_ids`, the per-assay summary TSVs must be 
 
 ### Remaining Part B items
 
-- ⏳ `casetrack migrate-project-id` interactive command for legacy v0.5 projects (slug suggestion + idempotent + batch `--scan` mode).
-- ⏳ Hard-error gate on un-migrated projects (rollout step 3 above).
+- ⏳ Hard-error gate on un-migrated projects (rollout step 4 above).
 - ⏳ MCP wrapper exposing `list_projects()` + `query(project_id, sql)` to AI agents (§5.6).
 
 ## 10. References

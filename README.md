@@ -346,7 +346,32 @@ casetrack projects deregister some-old-project
 casetrack projects scan --root ~/projects/    # or: casetrack projects --root ~/projects/
 ```
 
-If TOML's `project_id` and the DB's `project_meta.project_id` disagree (you copied a `.db` into the wrong directory, or hand-edited TOML after init), the next command fails loudly with both values shown. Legacy v0.5 projects without `project_meta` continue to work — the consistency check skips silently until you re-init or, in v0.6 final, run `casetrack migrate-project-id`.
+If TOML's `project_id` and the DB's `project_meta.project_id` disagree (you copied a `.db` into the wrong directory, or hand-edited TOML after init), the next command fails loudly with both values shown. Legacy v0.5 projects without `project_meta` continue to work — the consistency check skips silently until you migrate.
+
+### Migrating legacy projects
+
+`casetrack migrate-project-id` brings v0.5 (or pre-v0.6) projects into the identity scheme without forcing a re-init. Idempotent; safe to run as often as you like.
+
+```bash
+# Single project — interactive (Enter accepts the suggested slug).
+casetrack migrate-project-id --project-dir /data/old_cohort/
+
+# Same, non-interactive — accept the auto-suggestion.
+casetrack migrate-project-id --project-dir /data/old_cohort/ --yes
+
+# Force a specific slug instead of the suggestion.
+casetrack migrate-project-id --project-dir /data/old_cohort/ \
+    --project-id hgsoc-pilot-2024 --yes
+
+# Batch: walk a tree, migrate every casetrack project that's still on v0.5.
+casetrack migrate-project-id --scan ~/projects/ --yes
+```
+
+The migrate command derives a slug from `[project] name` (lowercase, hyphens), writes the `project_id` into TOML, creates the `project_meta` row, and registers in `~/.casetrack/registry.json`. It refuses to act when:
+- TOML and DB already disagree on `project_id` (drift — resolve manually first)
+- The chosen slug is already registered to a different directory (pass `--project-id <other>` or `casetrack projects deregister <slug>` first)
+
+Each migration writes a `migrate_project_id` entry to `provenance.jsonl` with the list of artifacts it touched (`["toml", "project_meta", "registry"]`).
 
 ### Hierarchy ID format (`patient_id`, `specimen_id`, `assay_id`)
 
