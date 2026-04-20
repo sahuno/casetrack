@@ -3346,6 +3346,248 @@ def _write_migration_reports(
     md_path.write_text("\n".join(md_lines) + "\n")
 
 
+def _insert_project_id_into_toml(toml_path: Path, project_id: str) -> None:
+    """In-place insert `project_id = "..."` directly under `[project]`.
+
+    Mirrors the line-insert idiom used by `_write_qc_toml_block` and the
+    test harness's `_set_toml_line` so we don't need a full TOML rewriter.
+    """
+    text = toml_path.read_text()
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "[project]":
+            # Skip past any existing project_id line first (idempotent).
+            j = i + 1
+            while j < len(lines) and lines[j].strip().startswith("project_id"):
+                lines.pop(j)
+            lines.insert(i + 1, f'project_id = "{project_id}"')
+            toml_path.write_text("\n".join(lines) + "\n")
+            return
+    raise ValueError(f"{toml_path}: no [project] section to insert project_id into")
+
+
+def _migrate_one_project(
+    project_dir: Path,
+    *,
+    explicit_project_id: str | None = None,
+    yes: bool = False,
+    interactive: bool = True,
+) -> dict:
+    """Migrate a single project to the v0.6 identity scheme. Returns a result
+    dict {project_dir, project_id, action} where action is one of
+    'noop' | 'migrated' | 'skipped' (with reason in 'reason').
+
+    Idempotent: if TOML and project_meta both already have a matching
+    project_id and the registry is up to date, this is a no-op.
+    """
+    toml_path = project_dir / PROJECT_TOML_NAME
+    db_path = project_dir / PROJECT_DB_NAME
+    if not toml_path.exists():
+        return {"project_dir": project_dir, "action": "skipped",
+                "reason": "no casetrack.toml"}
+    if not db_path.exists():
+        return {"project_dir": project_dir, "action": "skipped",
+                "reason": "no casetrack.db"}
+
+    try:
+        schema = load_schema(toml_path)
+    except SchemaError as e:
+        return {"project_dir": project_dir, "action": "skipped",
+                "reason": f"invalid schema: {e}"}
+    project_name = schema.get("project", {}).get("name") or project_dir.name
+    toml_pid = schema.get("project", {}).get("project_id")
+
+    conn = open_project_db(db_path)
+    try:
+        meta = read_project_meta(conn)
+    finally:
+        conn.close()
+    db_pid = meta["project_id"] if meta else None
+
+    # Detect drift before touching anything.
+    if toml_pid and db_pid and toml_pid != db_pid:
+        return {"project_dir": project_dir, "action": "skipped",
+                "reason": (f"TOML project_id {toml_pid!r} disagrees with DB "
+                           f"project_meta {db_pid!r}; resolve manually before migrating")}
+
+    # Decide the target project_id.
+    target = explicit_project_id or toml_pid or db_pid
+    if not target:
+        # Need to derive a slug. suggest_project_id falls back through name → dir.
+        suggestion = (
+            suggest_project_id(project_name)
+            or suggest_project_id(project_dir.resolve().name)
+        )
+        if interactive and not yes:
+            prompt = (
+                f"\n[{project_dir}]\n"
+                f"  Current project name: {project_name!r}\n"
+                f"  Suggested project_id: {suggestion or '(none — name not slugifiable)'}\n"
+                f"  Enter project_id (Enter to accept, ^C to abort): "
+            )
+            try:
+                user_input = input(prompt).strip()
+            except (EOFError, KeyboardInterrupt):
+                return {"project_dir": project_dir, "action": "skipped",
+                        "reason": "user aborted"}
+            target = user_input or suggestion
+        else:
+            target = suggestion
+        if not target:
+            return {"project_dir": project_dir, "action": "skipped",
+                    "reason": "could not derive project_id; pass --project-id explicitly"}
+
+    try:
+        validate_project_id(target)
+    except ValueError as e:
+        return {"project_dir": project_dir, "action": "skipped", "reason": str(e)}
+
+    # Refuse if the slug is already taken in the registry by a different project
+    # (chosen call #2 from design-review: keep user in control, no auto-suffix).
+    existing_path = registry_resolve(target)
+    if existing_path is not None and existing_path.resolve() != project_dir.resolve():
+        return {
+            "project_dir": project_dir, "action": "skipped",
+            "reason": (
+                f"project_id {target!r} is already registered to "
+                f"{existing_path}. Pass --project-id <other-slug> for this "
+                f"project, or `casetrack projects deregister {target}` first "
+                f"if you really want to retarget."
+            ),
+        }
+
+    # ── do the writes ────────────────────────────────────────────────────────
+    actions_taken: list[str] = []
+
+    # 1. TOML — only rewrite if missing or different.
+    if toml_pid != target:
+        _insert_project_id_into_toml(toml_path, target)
+        actions_taken.append("toml")
+
+    # 2. project_meta row — write iff missing.
+    if db_pid is None:
+        conn = open_project_db(db_path)
+        try:
+            with begin_immediate(conn):
+                write_project_meta(
+                    conn, target, project_name,
+                    int(schema.get("project", {}).get("schema_v", 1)),
+                )
+        finally:
+            conn.close()
+        actions_taken.append("project_meta")
+
+    # 3. registry — register if missing.
+    if existing_path is None:
+        try:
+            registry_register(target, project_dir, project_name)
+            actions_taken.append("registry")
+        except (OSError, ValueError) as e:
+            return {"project_dir": project_dir, "action": "skipped",
+                    "reason": f"registry write failed: {e}"}
+
+    if not actions_taken:
+        return {"project_dir": project_dir, "action": "noop",
+                "project_id": target, "reason": "already migrated"}
+
+    # Provenance entry — always log the migration so future audits see it.
+    try:
+        log_project_provenance(project_dir, {
+            "action": "migrate_project_id",
+            "project_id": target,
+            "applied_to": actions_taken,
+            "transaction_id": _new_transaction_id(),
+            "schema_v_before": schema["project"]["schema_v"],
+            "schema_v_after": schema["project"]["schema_v"],
+        })
+    except Exception:
+        pass  # provenance failures shouldn't block the migration itself
+
+    return {"project_dir": project_dir, "action": "migrated",
+            "project_id": target, "applied_to": actions_taken}
+
+
+def cmd_migrate_project_id(args):
+    """`casetrack migrate-project-id` — bring legacy projects into the v0.6
+    identity scheme (proposal 0005 §7).
+
+    Two modes:
+      --project-dir <path>     interactive single-project (default)
+      --scan <root>            batch: walk the tree, migrate every casetrack
+                               project missing a project_meta row
+
+    Idempotent: re-running on an already-migrated project is a no-op.
+    """
+    scan_root = getattr(args, "scan", None)
+    project_dir = getattr(args, "project_dir", None)
+    if scan_root and project_dir:
+        print(
+            "Error: --scan and --project-dir are mutually exclusive.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not scan_root and not project_dir:
+        print(
+            "Error: pass either --project-dir <path> or --scan <root>.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    explicit_id = getattr(args, "project_id", None)
+    yes = bool(getattr(args, "yes", False))
+
+    if scan_root:
+        root = Path(scan_root)
+        if not root.is_dir():
+            print(f"Error: --scan root not found or not a directory: {root}",
+                  file=sys.stderr)
+            sys.exit(1)
+        if explicit_id:
+            print(
+                "Error: --project-id is incompatible with --scan (each "
+                "project needs its own slug). Re-run per-project for "
+                "explicit overrides.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        toml_paths = _find_v03_projects(root, max_depth=8)
+        if not toml_paths:
+            print(f"No casetrack projects found under {root}.")
+            return
+        results = []
+        for toml in toml_paths:
+            results.append(_migrate_one_project(
+                toml.parent, explicit_project_id=None,
+                yes=yes, interactive=not yes,
+            ))
+    else:
+        results = [_migrate_one_project(
+            Path(project_dir), explicit_project_id=explicit_id,
+            yes=yes, interactive=not yes,
+        )]
+
+    # ── report ───────────────────────────────────────────────────────────────
+    migrated = [r for r in results if r["action"] == "migrated"]
+    noops    = [r for r in results if r["action"] == "noop"]
+    skipped  = [r for r in results if r["action"] == "skipped"]
+
+    for r in migrated:
+        print(f"Migrated  {r['project_dir']}  → project_id={r['project_id']!r} "
+              f"(updated: {', '.join(r['applied_to'])})")
+    for r in noops:
+        print(f"No-op     {r['project_dir']}  → project_id={r['project_id']!r} "
+              f"(already migrated)")
+    for r in skipped:
+        print(f"Skipped   {r['project_dir']}  — {r['reason']}", file=sys.stderr)
+
+    print(
+        f"\nDone: {len(migrated)} migrated, {len(noops)} no-op, "
+        f"{len(skipped)} skipped."
+    )
+    # Non-zero exit if anything was skipped so CI can catch silent failures.
+    sys.exit(1 if skipped else 0)
+
+
 def cmd_migrate(args):
     """Convert a v0.2 flat manifest into a v0.3 casetrack project."""
     source_path = Path(args.flat)
@@ -7303,6 +7545,33 @@ Examples:
         help="Overwrite an existing casetrack.db in --out-dir",
     )
 
+    # ── migrate-project-id (v0.6 Part B beta — proposal 0005 §7) ──
+    p_mpid = subparsers.add_parser(
+        "migrate-project-id",
+        help="[v0.6] Bring legacy projects into the v0.6 identity scheme: "
+             "derive a project_id slug, write the project_meta row, register "
+             "in ~/.casetrack/registry.json. Idempotent.",
+    )
+    g_mpid_target = p_mpid.add_mutually_exclusive_group()
+    g_mpid_target.add_argument(
+        "--project-dir", help="Single-project mode: migrate this directory."
+    )
+    g_mpid_target.add_argument(
+        "--scan", help="Batch mode: walk this root and migrate every "
+                       "casetrack project found.",
+    )
+    p_mpid.add_argument(
+        "--project-id",
+        help="Explicit slug (single-project mode only). Default: derived from "
+             "[project] name or directory basename.",
+    )
+    p_mpid.add_argument(
+        "--yes", action="store_true",
+        help="Non-interactive mode — accept the auto-derived suggestion "
+             "without prompting. Required for --scan; recommended for "
+             "automation.",
+    )
+
     # ── v0.4 QC subcommands (censor, uncensor, qc-history, migrate-qc) ──
     from casetrack_qc.cli import build_qc_subparsers as _build_qc_subparsers
     _build_qc_subparsers(subparsers)
@@ -7327,6 +7596,7 @@ Examples:
         "query": cmd_query,
         "export": cmd_export,
         "migrate": cmd_migrate,
+        "migrate-project-id": cmd_migrate_project_id,
         "register": cmd_register,
         "doctor": cmd_doctor_project,
         "recover": cmd_recover_project,
