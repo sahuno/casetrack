@@ -2199,10 +2199,14 @@ def cmd_projects(args):
 
 
 def cmd_projects_list(args):
-    """`casetrack projects list [--fmt table|tsv|json]` — read registry."""
+    """`casetrack projects list [--fmt table|tsv|json] [--status ...]` — read registry."""
     fmt = getattr(args, "fmt", None) or "table"
+    status_filter_raw = getattr(args, "status", "active") or "active"
+
+    from casetrack_lifecycle.schema import get_status as _get_lifecycle_status
+
     reg = _registry_load()
-    entries = sorted(
+    all_entries = sorted(
         (
             {"project_id": pid, **info}
             for pid, info in reg.get("projects", {}).items()
@@ -2210,39 +2214,73 @@ def cmd_projects_list(args):
         key=lambda e: e["project_id"],
     )
 
+    # Enrich each entry with its lifecycle status from the project DB.
+    for e in all_entries:
+        path = e.get("path")
+        db_path = Path(path) / PROJECT_DB_NAME if path else None
+        if db_path and db_path.exists():
+            try:
+                _conn = open_project_db(db_path)
+                e["status"] = _get_lifecycle_status(_conn)
+                _conn.close()
+            except Exception:
+                e["status"] = "active"
+        else:
+            e["status"] = "active"
+
+    # Apply status filter.
+    if status_filter_raw == "all":
+        entries = all_entries
+    else:
+        wanted = {s.strip() for s in status_filter_raw.split(",")}
+        entries = [e for e in all_entries if e.get("status", "active") in wanted]
+
     if fmt == "json":
         print(json.dumps({
             "registry": str(_registry_path()),
             "schema_v": reg.get("schema_v"),
+            "status_filter": status_filter_raw,
             "projects": entries,
         }, indent=2, default=str))
         return
 
     if fmt == "tsv":
-        print("project_id\tname\tpath\tlast_seen")
+        print("project_id\tname\tstatus\tpath\tlast_seen")
         for e in entries:
-            print(f"{e['project_id']}\t{e.get('name','')}\t{e.get('path','')}\t{e.get('last_seen','')}")
+            print(
+                f"{e['project_id']}\t{e.get('name','')}\t{e.get('status','active')}\t"
+                f"{e.get('path','')}\t{e.get('last_seen','')}"
+            )
         return
 
     # table
-    if not entries:
+    if not all_entries:
         print(
             f"No projects registered in {_registry_path()}.\n"
             "  Run `casetrack init --project-dir <path>` to create one,\n"
             "  or `casetrack projects register --project-dir <path>` to add an existing project."
         )
         return
-    pid_w = max(10, max(len(e["project_id"]) for e in entries))
-    name_w = max(8, min(40, max(len(e.get("name", "")) for e in entries)))
-    print(f"{'project_id':<{pid_w}}  {'name':<{name_w}}  last_seen          path")
-    print("─" * (pid_w + name_w + 60))
+    if not entries:
+        print(
+            f"No projects with status={status_filter_raw!r}. "
+            f"Use --status all to see all {len(all_entries)} project(s)."
+        )
+        return
+    pid_w   = max(10, max(len(e["project_id"]) for e in entries))
+    name_w  = max(8, min(40, max(len(e.get("name", "")) for e in entries)))
+    stat_w  = 8
+    print(f"{'project_id':<{pid_w}}  {'name':<{name_w}}  {'status':<{stat_w}}  last_seen          path")
+    print("─" * (pid_w + name_w + stat_w + 65))
     for e in entries:
         name = e.get("name", "")[:name_w]
         print(
             f"{e['project_id']:<{pid_w}}  {name:<{name_w}}  "
+            f"{e.get('status','active'):<{stat_w}}  "
             f"{e.get('last_seen', ''):<19}  {e.get('path', '')}"
         )
-    print(f"\n{len(entries)} project(s) in {_registry_path()}")
+    status_note = "" if status_filter_raw == "all" else f" (status={status_filter_raw!r})"
+    print(f"\n{len(entries)} project(s){status_note} in {_registry_path()}")
 
 
 def cmd_projects_register_in_registry(args):
@@ -3994,6 +4032,12 @@ def cmd_register(args):
     exit 2 unless the user opts in with --allow-new-parent --yes.
     """
     project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
+    from casetrack_lifecycle.gate import assert_not_archived as _assert_not_archived
+    _assert_not_archived(
+        project_dir,
+        force_archived=getattr(args, "force_archived", False),
+        yes=getattr(args, "yes", False),
+    )
     level = args.level
 
     if level not in LEVEL_ORDER:
@@ -4238,6 +4282,12 @@ class _AppendOnCensored(Exception):
 def cmd_append_project(args):
     """Attach analysis results to rows at --level, extending the schema as needed."""
     project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
+    from casetrack_lifecycle.gate import assert_not_archived as _assert_not_archived
+    _assert_not_archived(
+        project_dir,
+        force_archived=getattr(args, "force_archived", False),
+        yes=getattr(args, "yes", False),
+    )
     level = args.level or _default_analysis_level(schema)
     if level not in LEVEL_ORDER:
         print(
@@ -6243,6 +6293,12 @@ class _MetadataRouting(Exception):
 
 def cmd_add_metadata_project(args):
     project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
+    from casetrack_lifecycle.gate import assert_not_archived as _assert_not_archived
+    _assert_not_archived(
+        project_dir,
+        force_archived=getattr(args, "force_archived", False),
+        yes=getattr(args, "yes", False),
+    )
     level = args.level
     if level not in LEVEL_ORDER:
         print(
@@ -7226,6 +7282,11 @@ Examples:
         help="[v0.4] Allow append on censored entities (requires --yes)",
     )
     p_append.add_argument(
+        "--force-archived",
+        action="store_true",
+        help="[v0.7] Allow mutations on an archived project (requires --yes)",
+    )
+    p_append.add_argument(
         "--infer-from-path",
         nargs="?",
         const="",
@@ -7382,6 +7443,12 @@ Examples:
     )
     p_proj_list.add_argument("--fmt", choices=["table", "tsv", "json"], default="table",
                              help="Output format (default: table)")
+    p_proj_list.add_argument(
+        "--status",
+        default="active",
+        help="Filter by lifecycle status: active (default), complete, archived, all, "
+             "or comma-separated combination e.g. active,complete",
+    )
 
     # projects register — manually add an existing project to the registry
     # (e.g. after restoring from archive on a new machine).
@@ -7428,6 +7495,11 @@ Examples:
                         help="Allow new keys not already in manifest/table (requires --yes)")
     p_meta.add_argument("--yes", action="store_true",
                         help="Confirm --allow-new additions non-interactively")
+    p_meta.add_argument(
+        "--force-archived",
+        action="store_true",
+        help="[v0.7] Allow mutations on an archived project (requires --yes)",
+    )
 
     # ── dashboard ──
     p_dash = subparsers.add_parser(
@@ -7533,6 +7605,11 @@ Examples:
         action="store_true",
         help="Confirm --allow-new-parent creation non-interactively",
     )
+    p_register.add_argument(
+        "--force-archived",
+        action="store_true",
+        help="[v0.7] Allow mutations on an archived project (requires --yes)",
+    )
 
     # ── doctor ──
     p_doctor = subparsers.add_parser(
@@ -7634,6 +7711,10 @@ Examples:
     from casetrack_lineage.cli import build_lineage_subparsers as _build_lineage_subparsers
     _build_lineage_subparsers(subparsers)
 
+    # ── v0.7 lifecycle subcommands (project set-status, project status, migrate-status) ──
+    from casetrack_lifecycle.cli import build_lifecycle_subparsers as _build_lifecycle_subparsers
+    _build_lifecycle_subparsers(subparsers)
+
     args = parser.parse_args()
 
     if not args.command:
@@ -7667,6 +7748,10 @@ Examples:
     # v0.6 lineage dispatch merges in without touching existing entries.
     from casetrack_lineage.cli import lineage_command_dispatch as _lineage_command_dispatch
     commands.update(_lineage_command_dispatch())
+
+    # v0.7 lifecycle dispatch merges in without touching existing entries.
+    from casetrack_lifecycle.cli import lifecycle_command_dispatch as _lifecycle_command_dispatch
+    commands.update(_lifecycle_command_dispatch())
 
     commands[args.command](args)
 

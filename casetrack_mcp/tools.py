@@ -27,7 +27,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any  # noqa: F401 — kept for downstream callers
 
 import casetrack
 
@@ -53,17 +53,27 @@ def _read_registry() -> dict:
     return casetrack._registry_load()
 
 
-def list_projects_tool() -> dict:
+def list_projects_tool(status: str = "active") -> dict:
     """Return a machine-readable summary of the local registry.
+
+    Parameters
+    ----------
+    status:
+        Lifecycle filter. ``"active"`` (default) returns only active
+        projects. ``"all"`` returns every project. ``"complete"`` or
+        ``"archived"`` return those subsets. Comma-separated values are
+        supported (e.g. ``"active,complete"``).
 
     Shape:
         {
             "registry": "/home/user/.casetrack/registry.json",
             "schema_v": 1,
+            "status_filter": "active",
             "projects": [
                 {
                     "project_id": "hgsoc-2026",
                     "name": "HGSOC methylation cohort",
+                    "status": "active",
                     "path": "/data/...",
                     "created": "...",
                     "last_seen": "...",
@@ -75,17 +85,42 @@ def list_projects_tool() -> dict:
     Designed to be small, flat, and JSON-serializable so an LLM can
     pick a project_id from the list and pass it back to query_tool.
     """
+    from casetrack_lifecycle.schema import get_status as _get_lifecycle_status
+
     reg = _read_registry()
-    entries = sorted(
+    all_entries = sorted(
         (
             {"project_id": pid, **info}
             for pid, info in reg.get("projects", {}).items()
         ),
         key=lambda e: e["project_id"],
     )
+
+    # Enrich with lifecycle status.
+    for e in all_entries:
+        path = e.get("path")
+        db_path = Path(path) / casetrack.PROJECT_DB_NAME if path else None
+        if db_path and db_path.exists():
+            try:
+                conn = casetrack.open_project_db(db_path)
+                e["status"] = _get_lifecycle_status(conn)
+                conn.close()
+            except Exception:
+                e["status"] = "active"
+        else:
+            e["status"] = "active"
+
+    # Apply status filter.
+    if status == "all":
+        entries = all_entries
+    else:
+        wanted = {s.strip() for s in status.split(",")}
+        entries = [e for e in all_entries if e.get("status", "active") in wanted]
+
     return {
         "registry": str(casetrack._registry_path()),
         "schema_v": reg.get("schema_v"),
+        "status_filter": status,
         "projects": entries,
     }
 
