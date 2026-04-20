@@ -40,6 +40,12 @@ def build_qc_subparsers(subparsers) -> None:
         "--from", dest="from_file",
         help="Bulk import from a TSV (columns: level, entity_id, kind, reason)",
     )
+    p_censor.add_argument(
+        "--batch",
+        help="[v0.6] Batch ID: censor all assays in this batch and cascade "
+             "downstream (proposal 0006 §3). When set, --level/--id/--kind are "
+             "ignored; --reason is used as the censor reason.",
+    )
 
     # ── uncensor ──
     p_uncensor = subparsers.add_parser(
@@ -60,6 +66,12 @@ def build_qc_subparsers(subparsers) -> None:
     p_uncensor.add_argument(
         "--yes", action="store_true",
         help="Confirm --ethics-override non-interactively",
+    )
+    p_uncensor.add_argument(
+        "--batch",
+        help="[v0.6] Batch ID: reverse the batch censor for all assays in this "
+             "batch (proposal 0006 §3). When set, --event-id/--level/--id are "
+             "ignored.",
     )
 
     # ── qc-history ──

@@ -83,10 +83,17 @@ def cmd_censor(args) -> None:
     """Manual censoring entry point.
 
     Modes:
+    - Batch censor:  ``--batch BATCH_ID [--reason ...]`` (proposal 0006 §3)
     - Single event:  ``--level --id --kind --reason [--withdrawal-date]``
     - Bulk import:   ``--from FILE`` (TSV with columns
                      ``level, entity_id, kind, reason``).
     """
+    # Route batch-level censor to the lineage subsystem (proposal 0006 §3).
+    if getattr(args, "batch", None):
+        from casetrack_lineage.batch_censor import cmd_censor_batch
+        cmd_censor_batch(args)
+        return
+
     project_dir, _ = casetrack._resolve_project(args.project_dir)
     db_path = project_dir / casetrack.PROJECT_DB_NAME
     conn = casetrack.open_project_db(db_path)
@@ -299,7 +306,17 @@ def _cmd_censor_bulk(conn, project_dir, qc_cfg, args) -> None:
 
 
 def cmd_uncensor(args) -> None:
-    """Resolve an active qc_events row. Consent reversal gated by ``--ethics-override --yes``."""
+    """Resolve an active qc_events row. Consent reversal gated by ``--ethics-override --yes``.
+
+    When ``--batch BATCH_ID`` is passed, routes to
+    ``casetrack_lineage.batch_censor.cmd_uncensor_batch`` (proposal 0006 §3).
+    """
+    # Route batch-level uncensor to the lineage subsystem (proposal 0006 §3).
+    if getattr(args, "batch", None):
+        from casetrack_lineage.batch_censor import cmd_uncensor_batch
+        cmd_uncensor_batch(args)
+        return
+
     project_dir, _ = casetrack._resolve_project(args.project_dir)
     db_path = project_dir / casetrack.PROJECT_DB_NAME
     conn = casetrack.open_project_db(db_path)

@@ -9,7 +9,7 @@ setup(
     author="Samuel Ahuno",
     author_email="sahuno@mskcc.org",
     py_modules=["casetrack"],
-    packages=["casetrack_qc", "casetrack_mcp"],
+    packages=["casetrack_qc", "casetrack_mcp", "casetrack_lineage"],
     install_requires=[
         "pandas>=1.5.0",
         "duckdb>=0.9",

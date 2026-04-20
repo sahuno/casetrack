@@ -7630,6 +7630,10 @@ Examples:
     from casetrack_qc.cli import build_qc_subparsers as _build_qc_subparsers
     _build_qc_subparsers(subparsers)
 
+    # ── v0.6 lineage subcommands (migrate-lineage, add-batch, link-sources) ──
+    from casetrack_lineage.cli import build_lineage_subparsers as _build_lineage_subparsers
+    _build_lineage_subparsers(subparsers)
+
     args = parser.parse_args()
 
     if not args.command:
@@ -7659,6 +7663,10 @@ Examples:
     # v0.4 QC dispatch merges in without touching existing entries.
     from casetrack_qc.cli import qc_command_dispatch as _qc_command_dispatch
     commands.update(_qc_command_dispatch())
+
+    # v0.6 lineage dispatch merges in without touching existing entries.
+    from casetrack_lineage.cli import lineage_command_dispatch as _lineage_command_dispatch
+    commands.update(_lineage_command_dispatch())
 
     commands[args.command](args)
 
