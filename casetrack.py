@@ -6101,6 +6101,11 @@ def cmd_export_project(args):
         prefix_base = None
         ext = ".tsv"
 
+    include_lineage = getattr(args, "include_lineage", False)
+    # Auto-enable lineage export for XLSX — multi-sheet is the natural fit.
+    if ext == ".xlsx" and not args.sql and shape != "joined":
+        include_lineage = True
+
     conn = open_project_db(project_dir / PROJECT_DB_NAME)
     try:
         written = []
@@ -6129,8 +6134,49 @@ def cmd_export_project(args):
                 out_path = output / f"{table}{ext}"
             _write_df(df, out_path)
             written.append((table, out_path, len(df)))
+
+        # v0.6 lineage tables — assay_sources + batches.
+        if include_lineage:
+            existing_tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            for extra_table in ("batches", "assay_sources"):
+                if extra_table not in existing_tables:
+                    continue
+                df_extra = pd.read_sql_query(f"SELECT * FROM {extra_table}", conn)
+                if prefix_mode:
+                    out_path = Path(f"{prefix_base}.{extra_table}{ext}")
+                else:
+                    out_path = output / f"{extra_table}{ext}"
+                _write_df(df_extra, out_path)
+                written.append((extra_table, out_path, len(df_extra)))
     finally:
         conn.close()
+
+    # For XLSX: rewrite all sheets into a single workbook if multiple files
+    # were written to the same .xlsx path (prefix_mode + XLSX).
+    if prefix_mode and ext == ".xlsx" and len(written) > 1:
+        xlsx_path = output  # the user-supplied path, e.g. export.xlsx
+        try:
+            import openpyxl  # noqa: F401
+            with pd.ExcelWriter(xlsx_path, engine="openpyxl") as ew:
+                for table, tpath, _ in written:
+                    df_sheet = pd.read_csv(str(tpath).replace(".xlsx", ".tsv"),
+                                           sep="\t") if not tpath.exists() else \
+                               pd.read_excel(tpath)
+                    df_sheet.to_excel(ew, sheet_name=table[:31], index=False)
+            # Remove individual per-table xlsx files — single workbook is canonical.
+            for table, tpath, _ in written:
+                if tpath != xlsx_path and tpath.exists():
+                    tpath.unlink()
+            print(f"Exported {len(written)} sheet(s) to {xlsx_path}:")
+            for table, _, n in written:
+                print(f"  {table}: {n} rows")
+            return
+        except ImportError:
+            print("Error: openpyxl required for .xlsx; pip install 'casetrack[excel]'",
+                  file=sys.stderr)
+            sys.exit(1)
 
     for table, path, n in written:
         print(f"  {table}: {n} rows → {path}")
@@ -6167,6 +6213,38 @@ def _write_df(df: "pd.DataFrame", output: Path) -> None:
 
 
 # ── v0.3 rerun (assays missing an analysis) ───────────────────────────────────
+
+
+def _source_assays_for_keys(
+    conn: sqlite3.Connection,
+    keys: list[str],
+    level: str,
+) -> list[str]:
+    """Return deduplicated source_assay_ids from assay_sources for the given keys.
+
+    Handles both lineage modes:
+      - Mode B: keys are specimen IDs  (consumer_specimen_id column)
+      - Mode A: keys are assay IDs     (merged_assay_id column)
+    Assay-level keys are tried against both columns.
+    """
+    if not keys:
+        return []
+    placeholders = ", ".join("?" * len(keys))
+    if level == "specimen":
+        rows = conn.execute(
+            f"SELECT DISTINCT source_assay_id FROM assay_sources "
+            f"WHERE consumer_specimen_id IN ({placeholders})",
+            keys,
+        ).fetchall()
+    elif level == "assay":
+        rows = conn.execute(
+            f"SELECT DISTINCT source_assay_id FROM assay_sources "
+            f"WHERE merged_assay_id IN ({placeholders})",
+            keys,
+        ).fetchall()
+    else:
+        rows = []
+    return [r[0] for r in rows]
 
 
 def cmd_rerun_project(args):
@@ -6230,19 +6308,41 @@ def cmd_rerun_project(args):
     finally:
         conn.close()
 
-    if not missing_keys:
+    # v0.6: --include-sources — also collect source assays from assay_sources.
+    source_keys: list[str] = []
+    if getattr(args, "include_sources", False) and missing_keys:
+        conn2 = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            tables_in_db = {r[0] for r in conn2.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            if "assay_sources" in tables_in_db:
+                source_keys = _source_assays_for_keys(conn2, missing_keys, level)
+        finally:
+            conn2.close()
+
+    if not missing_keys and not source_keys:
         print(f"No {level}s missing analysis {args.analysis!r}.")
         return
 
     if args.list_only:
         for k in missing_keys:
             print(k)
+        if source_keys:
+            print(f"\n# source assays ({len(source_keys)}):")
+            for k in source_keys:
+                print(k)
         return
 
     extra = f" {args.extra}" if args.extra else ""
     submitted = 0
     failed = 0
-    for k in missing_keys:
+    all_jobs = list(missing_keys)
+    if source_keys:
+        print(f"# {len(source_keys)} source assay(s) added via --include-sources",
+              file=sys.stderr)
+        all_jobs += source_keys
+    for k in all_jobs:
         cmd = f"sbatch --export=ALL,{key_col.upper()}={k},PROJECT_DIR={project_dir} {args.script}{extra}"
         if args.submit:
             rc = subprocess_run(cmd)
@@ -6539,6 +6639,69 @@ def _discover_done_columns(conn: sqlite3.Connection) -> dict:
     return out
 
 
+def _emit_lineage_section(conn: sqlite3.Connection) -> None:
+    """Print a lineage summary table if assay_sources exists and has rows."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    if "assay_sources" not in tables:
+        print("\n[lineage] assay_sources table not found — run `casetrack migrate-lineage` first.")
+        return
+    (n_rows,) = conn.execute("SELECT COUNT(*) FROM assay_sources").fetchone()
+    if n_rows == 0:
+        print("\n[lineage] No source links recorded yet. Use `casetrack link-sources` to add them.")
+        return
+
+    print(f"\n── Assay lineage ({n_rows} link(s)) " + "─" * 40)
+
+    # Mode B: assay → specimen
+    mode_b = conn.execute(
+        "SELECT consumer_specimen_id, source_assay_id "
+        "FROM assay_sources WHERE consumer_specimen_id IS NOT NULL "
+        "ORDER BY consumer_specimen_id, source_assay_id"
+    ).fetchall()
+    if mode_b:
+        print("\n  Mode B — run assay → specimen (implicit merge):")
+        current = None
+        for spec, src in mode_b:
+            if spec != current:
+                print(f"    {spec}")
+                current = spec
+            print(f"      └─ {src}")
+
+    # Mode A: assay → merged assay
+    mode_a = conn.execute(
+        "SELECT merged_assay_id, source_assay_id "
+        "FROM assay_sources WHERE merged_assay_id IS NOT NULL "
+        "ORDER BY merged_assay_id, source_assay_id"
+    ).fetchall()
+    if mode_a:
+        print("\n  Mode A — run assay → merged assay (explicit merge):")
+        current = None
+        for merged, src in mode_a:
+            if merged != current:
+                print(f"    {merged}")
+                current = merged
+            print(f"      └─ {src}")
+
+    # Batch summary if batches table exists and has rows
+    if "batches" in tables:
+        (n_batches,) = conn.execute("SELECT COUNT(*) FROM batches").fetchone()
+        if n_batches:
+            print(f"\n  Batches: {n_batches} registered")
+            rows = conn.execute(
+                "SELECT b.batch_id, b.prep_date, COUNT(a.assay_id) AS n_assays "
+                "FROM batches b "
+                "LEFT JOIN assays a ON a.batch_id = b.batch_id "
+                "GROUP BY b.batch_id ORDER BY b.batch_id"
+            ).fetchall()
+            bid_w = max(8, max(len(r[0]) for r in rows))
+            print(f"    {'batch_id':<{bid_w}}  prep_date   n_assays")
+            print("    " + "─" * (bid_w + 24))
+            for bid, prep, n in rows:
+                print(f"    {bid:<{bid_w}}  {prep or '—':<10}  {n}")
+
+
 def cmd_status_project(args):
     project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     conn = open_project_db(project_dir / PROJECT_DB_NAME)
@@ -6592,6 +6755,13 @@ def cmd_status_project(args):
 
     _emit_status(report, fmt=args.fmt, project_dir=project_dir, group_by=group_by,
                  counts=counts_by_level)
+
+    if getattr(args, "show_lineage", False):
+        conn3 = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            _emit_lineage_section(conn3)
+        finally:
+            conn3.close()
 
 
 def _status_counts_by_level(
@@ -7059,6 +7229,53 @@ def cmd_validate_project(args):
                             f"materialized={materialized!r} vs "
                             f"expected-from-events={expected!r}"
                         )
+
+        # 5. v0.6 lineage invariants (if assay_sources / batches tables exist).
+        existing_tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "assay_sources" in existing_tables:
+            # 5a. All source_assay_id values must reference existing assays.
+            orphan_sources = conn.execute(
+                "SELECT source_assay_id FROM assay_sources "
+                "WHERE source_assay_id NOT IN (SELECT assay_id FROM assays)"
+            ).fetchall()
+            for (oid,) in orphan_sources:
+                issues.append(
+                    f"assay_sources: source_assay_id {oid!r} not in assays table"
+                )
+            # 5b. All merged_assay_id values must reference existing assays.
+            orphan_merged = conn.execute(
+                "SELECT merged_assay_id FROM assay_sources "
+                "WHERE merged_assay_id IS NOT NULL "
+                "AND merged_assay_id NOT IN (SELECT assay_id FROM assays)"
+            ).fetchall()
+            for (oid,) in orphan_merged:
+                issues.append(
+                    f"assay_sources: merged_assay_id {oid!r} not in assays table"
+                )
+            # 5c. All consumer_specimen_id values must reference existing specimens.
+            orphan_spec = conn.execute(
+                "SELECT consumer_specimen_id FROM assay_sources "
+                "WHERE consumer_specimen_id IS NOT NULL "
+                "AND consumer_specimen_id NOT IN (SELECT specimen_id FROM specimens)"
+            ).fetchall()
+            for (oid,) in orphan_spec:
+                issues.append(
+                    f"assay_sources: consumer_specimen_id {oid!r} not in specimens table"
+                )
+
+        if "batches" in existing_tables:
+            # 5d. Every assays.batch_id must reference an existing batches row.
+            orphan_batches = conn.execute(
+                "SELECT assay_id, batch_id FROM assays "
+                "WHERE batch_id IS NOT NULL "
+                "AND batch_id NOT IN (SELECT batch_id FROM batches)"
+            ).fetchall()
+            for aid, bid in orphan_batches:
+                issues.append(
+                    f"assays: assay {aid!r} has batch_id {bid!r} not in batches table"
+                )
     finally:
         conn.close()
 
@@ -7327,6 +7544,10 @@ Examples:
         "--include-consent-revoked", action="store_true",
         help="[v0.4] Include consent-revoked patients and their assays",
     )
+    p_status.add_argument(
+        "--show-lineage", action="store_true",
+        help="[v0.6] Append assay-source lineage section (requires migrate-lineage)",
+    )
 
     # ── validate ──
     p_validate = subparsers.add_parser(
@@ -7537,6 +7758,11 @@ Examples:
         "--force-censored", action="store_true",
         help="[v0.4] Include censored/consent-revoked entities (default: skip)",
     )
+    p_rerun.add_argument(
+        "--include-sources", action="store_true",
+        help="[v0.6] Also emit rerun commands for source assays "
+             "recorded in assay_sources (e.g. to re-basecall after model update)",
+    )
 
     # ── export ──
     p_export = subparsers.add_parser(
@@ -7571,6 +7797,11 @@ Examples:
     p_export.add_argument(
         "--include-consent-revoked", action="store_true",
         help="[v0.4] Include consent-revoked patients and their assays",
+    )
+    p_export.add_argument(
+        "--include-lineage", action="store_true",
+        help="[v0.6] Also export assay_sources and batches tables "
+             "(auto-enabled for XLSX multi-sheet output)",
     )
 
     # ── register ──
