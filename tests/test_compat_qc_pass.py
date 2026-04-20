@@ -20,9 +20,22 @@ import casetrack
 CASETRACK_BIN = [sys.executable, str(Path(__file__).resolve().parent.parent / "casetrack.py")]
 
 
-def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+def _run(
+    args: list[str], check: bool = True, *, allow_legacy: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run a casetrack subcommand. `allow_legacy` sets
+    CASETRACK_ALLOW_LEGACY=1 in the subprocess env — needed when the test
+    deliberately operates on a v0.3 project that hasn't been migrated to
+    the v0.6 identity scheme yet (see proposal 0005 §9).
+    """
+    import os as _os
+    env = None
+    if allow_legacy:
+        env = _os.environ.copy()
+        env["CASETRACK_ALLOW_LEGACY"] = "1"
     return subprocess.run(
-        CASETRACK_BIN + args, check=check, capture_output=True, text=True
+        CASETRACK_BIN + args, check=check, capture_output=True, text=True,
+        env=env,
     )
 
 
@@ -72,11 +85,19 @@ def _build_v03(proj: Path) -> None:
 
 
 def test_v03_project_readable_on_v04_status(tmp_path: Path):
-    """status must not crash on a v0.3 project that hasn't been migrated yet."""
+    """status must not crash on a v0.3 project that hasn't been migrated yet.
+
+    v0.6 Part B final adds a hard-error gate refusing un-migrated projects
+    (proposal 0005 §9 step 4). The documented bypass for read-only audits
+    of legacy cohorts is CASETRACK_ALLOW_LEGACY=1 — exercising it here.
+    """
     proj = tmp_path / "v03"
     _build_v03(proj)
-    res = _run(["status", "--project-dir", str(proj), "--fmt", "json"])
-    assert res.returncode == 0
+    res = _run(
+        ["status", "--project-dir", str(proj), "--fmt", "json"],
+        allow_legacy=True,
+    )
+    assert res.returncode == 0, res.stderr
 
 
 def test_migrate_qc_preserves_qc_pass_information(tmp_path: Path):

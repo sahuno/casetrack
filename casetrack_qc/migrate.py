@@ -37,7 +37,12 @@ def _has_column(conn, table: str, column: str) -> bool:
 
 
 def cmd_migrate_qc(args) -> None:
-    project_dir, schema = casetrack._resolve_project(args.project_dir)
+    # migrate-qc is an upgrade path — by definition it operates on legacy
+    # projects, so it bypasses the v0.6 hard-error gate. End users still
+    # see the gate when running normal read/write commands.
+    project_dir, schema = casetrack._resolve_project(
+        args.project_dir, bypass_legacy_gate=True
+    )
     db_path = project_dir / casetrack.PROJECT_DB_NAME
     toml_path = project_dir / casetrack.PROJECT_TOML_NAME
 

@@ -996,6 +996,48 @@ def registry_touch(
         pass
 
 
+# Env-var bypass for the v0.6 final hard-error gate. Set to a truthy value
+# (1, true, yes — case-insensitive) to allow operations on legacy projects
+# that haven't been migrated yet. Intended for batch scripts auditing many
+# projects at once and for short-lived inspection of inherited cohorts.
+_LEGACY_BYPASS_ENV = "CASETRACK_ALLOW_LEGACY"
+
+
+def _legacy_bypass_enabled() -> bool:
+    return os.environ.get(_LEGACY_BYPASS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def require_project_identity_or_fail(
+    conn: sqlite3.Connection, schema: dict, project_dir: Path
+) -> None:
+    """Refuse to proceed when a project has no v0.6 identity wiring.
+
+    Triggered from `_resolve_project` for both read and write commands.
+    Bypassable via CASETRACK_ALLOW_LEGACY=1 for batch audits / inspection.
+    Suggestion-only — never auto-runs migrate-project-id, since that's a
+    destructive write the user should opt into explicitly.
+    """
+    toml_pid = schema.get("project", {}).get("project_id")
+    meta = read_project_meta(conn)
+    if toml_pid and meta:
+        return  # fully migrated — no gate needed
+    if _legacy_bypass_enabled():
+        return  # explicit opt-out
+
+    missing: list[str] = []
+    if not toml_pid:
+        missing.append("[project] project_id in casetrack.toml")
+    if meta is None:
+        missing.append("project_meta row in casetrack.db")
+    raise ValueError(
+        f"This project is missing v0.6 identity wiring "
+        f"({', '.join(missing)}). Run:\n"
+        f"    casetrack migrate-project-id --project-dir {project_dir}\n"
+        f"To bypass for a one-off read or batch audit, set "
+        f"{_LEGACY_BYPASS_ENV}=1."
+    )
+
+
 def check_project_identity_consistency(
     conn: sqlite3.Connection, schema: dict, project_dir: Path | None = None
 ) -> None:
@@ -3748,8 +3790,14 @@ def _resolve_project(
     project_dir: str | Path | None,
     *,
     project_id: str | None = None,
+    bypass_legacy_gate: bool = False,
 ) -> tuple[Path, dict]:
     """Validate a v0.3 project and load its schema.
+
+    `bypass_legacy_gate` is an internal opt-out for upgrade-path commands
+    (e.g. `migrate-qc`, `recover`) that by definition need to operate on
+    projects without v0.6 identity wiring. End-user commands should leave
+    it False; they go through the env-var bypass instead.
 
     Resolution order:
       1. If `project_id` is given, look it up in the registry.
@@ -3813,12 +3861,18 @@ def _resolve_project(
         print(f"Error: invalid schema in {toml_path}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # v0.6 Part B: cross-check TOML's project_id against the DB's
-    # project_meta row. Hard error on mismatch — usually means the DB was
-    # copied into the wrong directory. Skipped silently for legacy projects
-    # that don't have a project_id in TOML or a project_meta row.
+    # v0.6 Part B: two checks against the project's identity wiring.
+    #   1. require_project_identity_or_fail — refuses un-migrated projects
+    #      (alpha was tolerant; beta added the migrate command; final
+    #      flips this on so legacy state is loud, not silent).
+    #      Bypass via CASETRACK_ALLOW_LEGACY=1 for one-off audits.
+    #   2. check_project_identity_consistency — hard error when TOML
+    #      project_id differs from project_meta (DB was copied into the
+    #      wrong directory, or TOML was hand-edited after init).
     conn = open_project_db(db_path)
     try:
+        if not bypass_legacy_gate:
+            require_project_identity_or_fail(conn, schema, project_dir)
         check_project_identity_consistency(conn, schema, project_dir)
     except ValueError as e:
         conn.close()
