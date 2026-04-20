@@ -371,6 +371,40 @@ CASETRACK_ALLOW_LEGACY=1 casetrack projects scan --root ~/projects/
 
 Upgrade-path commands (`migrate-qc`, `migrate-project-id`, `recover`) bypass the gate automatically — they're designed to operate on legacy state.
 
+### AI-agent integration (MCP server)
+
+`casetrack-mcp` is a stdio MCP server that exposes two tools to AI agents (Claude Desktop, or any MCP client):
+
+| Tool | Arguments | Returns |
+|---|---|---|
+| `casetrack_list_projects` | (none) | JSON summary of the local registry |
+| `casetrack_query` | `project_id`, `sql` (SELECT / WITH only) | Rows as JSON |
+
+Install the optional dependency + wire it into Claude Desktop:
+
+```bash
+pip install casetrack[mcp]
+```
+
+`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) — equivalent path on Linux / Windows:
+
+```json
+{
+  "mcpServers": {
+    "casetrack": {
+      "command": "casetrack-mcp"
+    }
+  }
+}
+```
+
+Safety rails:
+- **Closed-world project lookup.** `project_id` must be in the registry — unknown ids return the valid set instead of a generic "not found." Agents can't invent paths because paths never appear in the tool signature (that's the hallucination-reduction lever from [proposal 0005 §5.6](docs/proposals/0005-id-format-and-project-identity.md)).
+- **Read-only SQL.** `casetrack_query` rejects non-SELECT statements. Mutations go through the CLI (which logs to `provenance.jsonl`).
+- **Row cap.** Results truncated at 10,000 rows with `truncated=true` flagged in the payload.
+
+See `casetrack_mcp/README.md` for the full install + legacy-project env override.
+
 ### Migrating legacy projects
 
 `casetrack migrate-project-id` brings v0.5 (or pre-v0.6) projects into the identity scheme without forcing a re-init. Idempotent; safe to run as often as you like.

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Author** | Samuel Ahuno ([ekwame001@gmail.com](mailto:ekwame001@gmail.com)) |
-| **Status** | Part A complete + Part B complete (alpha, beta, final all shipped 2026-04-19); only MCP wrapper remains |
+| **Status** | ✅ Fully shipped 2026-04-19 (Part A + Part B alpha/beta/final + MCP wrapper) |
 | **Date** | 2026-04-19 |
 | **Target release** | v0.6.0 |
 | **Breaking** | Yes — new required field (`project_id`) + stricter validation on patient/specimen/assay IDs. One-shot migration path. |
@@ -19,7 +19,7 @@
 | **Part B alpha — project identity (`project_id`, `project_meta`, registry)** | ✅ shipped | `_PROJECT_ID_PATTERN`, `project_meta` table, `~/.casetrack/registry.json` (single-user), `casetrack init --project-id`, `casetrack --project <id>`, `casetrack projects {list,register,deregister,scan}`. casetrack commit `3b3f5f1`. 51 new tests. Legacy v0.5 projects continue to work — no enforcement. |
 | **Part B beta — `casetrack migrate-project-id`** | ✅ shipped | Interactive single-project + `--scan` batch mode. Idempotent; refuses slug conflicts; writes provenance entry per migration. casetrack commit `3a678fa`. 15 new tests. |
 | **Part B final — hard requirement gate** | ✅ shipped | Runtime refuses un-migrated projects at every command (read + write). `CASETRACK_ALLOW_LEGACY=1` bypass for audits; upgrade-path commands (`migrate-qc`, `migrate-project-id`, `recover`) bypass internally. casetrack commit `48dcbf2`. 18 new tests. |
-| **Part B — MCP wrapper for AI agents** | ⏳ pending | `casetrack_list_projects()` + `casetrack_query(project_id, sql)` per §5.6 — out of code scope but documented. |
+| **Part B — MCP wrapper for AI agents** | ✅ shipped | `casetrack_mcp/` subpackage + `casetrack-mcp` console script. Two tools (`casetrack_list_projects`, `casetrack_query`). Closed-world project lookup, read-only SQL, 10k row cap, hard-gate respected with `CASETRACK_ALLOW_LEGACY` bypass. casetrack commit `5c517d0`. 29 new tests. Install: `pip install casetrack[mcp]`. |
 
 ## 0. Accepted decisions
 
@@ -67,7 +67,7 @@ Fix: introduce `project_id` as a machine-addressable slug, persist it inside the
 1. ✅ **Shipped.** Reject malformed hierarchy IDs at `register` / `migrate` / `add-metadata --allow-new` time with a clear error naming the offending value and the rule it violated. (`append` doesn't create IDs — it requires them to exist — so the effective INSERT surface is covered.)
 2. ✅ **Shipped (Part B alpha).** Give every casetrack project a globally-meaningful-within-a-registry identifier that does not depend on filesystem location. New projects get a `project_id` at init; `casetrack --project <id>` resolves via `~/.casetrack/registry.json`.
 3. ✅ **Shipped (Part B alpha).** Make every `casetrack.db` self-describing — `SELECT project_id FROM project_meta` answers "what project is this" without reading the TOML. Cross-checked against the TOML on every command.
-4. ⏳ **Pending (MCP wrapper).** Give AI agents a closed-world project lookup: `list_projects()` → `query(project_id, sql)`. The CLI primitives (`casetrack projects list --fmt json`, `casetrack --project <id> query "..."`) are now in place; the MCP wrapper that exposes them as tool calls is out of code scope.
+4. ✅ **Shipped.** Give AI agents a closed-world project lookup: `list_projects()` → `query(project_id, sql)`. Shipped as the `casetrack_mcp/` subpackage with the `casetrack-mcp` stdio server (commit `5c517d0`). Tools refuse unknown `project_id`s with the valid set enumerated, reject non-SELECT SQL, enforce the v0.6 hard gate, and cap result rows at 10,000.
 5. ✅ **Shipped.** Keep the escape hatch: existing projects with non-conforming IDs (real LIMS IDs with colons, cohorts imported from legacy systems) can opt out via `[levels.<level>] id_pattern` / `allow_case_variants` / `[project] allow_unicode_ids` in TOML.
 
 ## 3. Non-goals
@@ -370,7 +370,11 @@ If a project opts in to `allow_unicode_ids`, the per-assay summary TSVs must be 
 
 ### Remaining Part B items
 
-- ⏳ MCP wrapper exposing `list_projects()` + `query(project_id, sql)` to AI agents (§5.6). Per design-review, this will ship as a `casetrack_mcp/` subpackage in this repo with `pip install casetrack[mcp]` extras — not a separate repo.
+✅ All Part B items shipped. Part B is complete.
+
+### Proposal 0005 — fully shipped
+
+Everything in the proposal body landed in v0.6.0a1 + beta + final + MCP wrapper over the 2026-04-19 session. The only outstanding work is the punted-to-later open questions in §8 (team-shared registry Q1, UUID backing Q2) — tracked for a future proposal when a concrete driver lands, not blocking.
 
 ## 10. References
 
