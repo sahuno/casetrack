@@ -1,7 +1,7 @@
 # Proposal 0004 — Nextflow integration via `casetrack-nf-subworkflows`
 
-**Status**: accepted (v0.5.0 specimen-level L1 shipped 2026-04-20; v0.4.0 drop-in shipped 2026-04-19; v0.1.0 pilot shipped 2026-04-18)
-**Target release**: casetrack v0.5.0 + casetrack-nf-subworkflows v0.5.0
+**Status**: accepted (v0.5.4 workstream C fully shipped 2026-04-20; v0.5.0 specimen-level L1 shipped 2026-04-20; v0.4.0 drop-in shipped 2026-04-19; v0.1.0 pilot shipped 2026-04-18)
+**Target release**: casetrack v0.5.0 + casetrack-nf-subworkflows v0.5.4
 **Breaking**: no (additive; opt-in via `[layout]` / `[analyses]` TOML sections)
 **Author**: Samuel Ahuno
 
@@ -210,8 +210,11 @@ CASETRACK_REGISTER(tuple(meta, tool_name, summary_filename, summary_tsv))
 | Real-data validation | ✅ shipped | GIAB HG006_PAY77227 chr21 — see §Pilot below |
 | Specimen-level L1 wrapper (MODKIT_MERGED_TRACKED) | ✅ shipped v0.5.0 | Closes Q4 L1 half. ADR-001 captures the design. Stub smoke test: `test/run_test_merged.sh`. |
 | `nf_process` alias in `[analyses.*]` (wrapper-renamed analyses) | ✅ shipped v0.5.0 | L2/L3 importers look up both the analysis key and an optional `nf_process` alias, so `MODKIT_MERGED_TRACKED` (which internally still runs `MODKIT_PILEUP`) can land trace + versions on `[analyses.modkit_merged]`. |
-| Additional wrappers (DORADO, CALLMODS, SORT, SNIFFLES2) | ⏳ pending | Mechanical — one per week |
-| Publish to GitHub with CI | ⏳ pending | Repo is public; `.github/workflows/` not yet added |
+| `SAMTOOLS_SORT_TRACKED` | ✅ shipped v0.5.1 | C1 — coordinate-sort; summary: sorted_bam_path, sorted_bam_size_bytes, n_reads, sort_order. Stub smoke: `test/run_test_sort.sh`. |
+| `DORADO_BASECALLER_TRACKED` | ✅ shipped v0.5.2 | C2 — GPU basecaller; summary: basecaller_model, n_reads, n_bases, read_n50, pass_pct, mean_qscore. Local module (no nf-core equivalent). GPU profile added to nextflow.config. Stub smoke: `test/run_test_dorado.sh`. |
+| `MODKIT_CALLMODS_TRACKED` | ✅ shipped v0.5.3 | C3 — methylation re-call; summary: callmods_model, n_reads, n_skipped, n_failed. Stub smoke: `test/run_test_callmods.sh`. |
+| `SNIFFLES2_TRACKED` | ✅ shipped v0.5.4 | C4 — SV calling; summary: n_svs_total, n_pass, n_{ins,del,dup,inv,bnd}, vcf_path. stdlib VCF parser in `bin/summarize_sniffles.py`. Stub smoke: `test/run_test_sniffles2.sh`. |
+| CI (GitHub Actions stub smoke tests) | ✅ shipped v0.5.4 | `.github/workflows/smoke-tests.yml` — matrix over all 6 wrappers on every push/PR. |
 
 ## Implemented — L2: trace → manifest (v0.2.0)
 
@@ -330,22 +333,18 @@ Final casetrack row for `HG006_PAY77227` (assay level):
 
 ## Roadmap — priorities
 
-Short-term (next two weeks):
-1. **Commit & tag casetrack v0.5.0** (this proposal + v0.5 code).
-2. **Implement L2 trace parser** (~2 hours).
-3. **Run MODKIT_PILEUP_TRACKED on one real GIAB chr21 ONT BAM** (~1 hour) to validate container binding, real summarize script, run_tag semantics.
-
-Medium-term (next month):
-4. Add `MODKIT_CALLMODS_TRACKED`, `DORADO_BASECALLER_TRACKED`, `SAMTOOLS_SORT_TRACKED` wrappers.
-5. Push `casetrack-nf-subworkflows` to GitHub with CI (Nextflow + casetrack + stub smoke test).
-6. Document on mkdocs/Pages with one fully-worked example pipeline.
-
-Long-term:
-7. `casetrack-nf-subworkflows` publishes to `nf-core/subworkflows` if the upstream community wants it.
+**All short- and medium-term roadmap items shipped as of v0.5.4 (2026-04-20).**
 
 Shipped since original roadmap:
 - Drop-in `-c casetrack_dropin.config` — now generic, covers nf-core/methylseq (v0.4.0).
 - L3 (versions → manifest) formalization (v0.3.0).
+- Workstream C — all four wrappers (SAMTOOLS_SORT, DORADO_BASECALLER, MODKIT_CALLMODS, SNIFFLES2) shipped v0.5.1–v0.5.4 with L1/L2/L3 stub smoke tests.
+- GitHub Actions CI (`.github/workflows/smoke-tests.yml`) — matrix over all 6 wrappers.
+
+Remaining long-term:
+- `casetrack-nf-subworkflows` publishes to `nf-core/subworkflows` if the upstream community wants it.
+- Patient-level L1 wrapper when a concrete tool that operates on patient-pooled data lands (ADR-001 D3 deferred).
+- Real-data validation of C1–C4 wrappers (C0 MODKIT_MERGED_TRACKED validated 2026-04-20 against project_17424 chr17).
 
 ## Open questions
 
