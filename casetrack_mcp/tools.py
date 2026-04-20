@@ -1,0 +1,185 @@
+"""Pure-Python tool implementations for the casetrack MCP server.
+
+Kept separate from `server.py` so the tools are unit-testable without
+the `mcp` SDK installed. The MCP adapter just wraps these functions in
+`@app.call_tool()` handlers.
+
+Two exported helpers:
+  - list_projects_tool(): reads ~/.casetrack/registry.json.
+  - query_tool(project_id, sql): resolves project_id via the registry,
+    opens the project (enforcing the v0.6 hard-error gate), runs a
+    read-only SELECT, returns rows as a list of dicts.
+
+Design choices documented in proposal 0005 §5.6:
+  - Closed-world lookup — unknown project_id returns a fail-fast error
+    listing the valid set, not a generic "not found." Agents can't
+    invent paths because paths are never input.
+  - Read-only by default — non-SELECT SQL is rejected with
+    `MCPToolError`. Agents that need to mutate casetrack state go
+    through the regular CLI.
+  - Legacy projects are refused unless CASETRACK_ALLOW_LEGACY=1 is set
+    in the server's env, matching the v0.6 hard-gate semantics.
+
+Author: Samuel Ahuno (ekwame001@gmail.com)
+"""
+from __future__ import annotations
+
+import re
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+import casetrack
+
+
+class MCPToolError(Exception):
+    """Raised by a tool helper when the inputs are valid JSON but the
+    requested operation can't proceed (e.g. unknown project_id, non-SELECT
+    SQL). The server adapter surfaces this as a user-visible tool error
+    instead of a protocol-level exception."""
+
+
+# Only the first non-whitespace, non-comment token matters for the
+# read-only check — this is a heuristic, not a SQL parser, and it's
+# explicitly scoped to "block obvious mutations." A user determined to
+# cause damage will use the CLI; the MCP path just shouldn't be the
+# default attack surface.
+_READ_ONLY_PREFIX = re.compile(r"\A\s*(?:--[^\n]*\n|/\*.*?\*/|\s)*\s*(select|with)\b",
+                               re.IGNORECASE | re.DOTALL)
+
+
+def _read_registry() -> dict:
+    """Read the registry — shallow wrapper so tests can monkeypatch one spot."""
+    return casetrack._registry_load()
+
+
+def list_projects_tool() -> dict:
+    """Return a machine-readable summary of the local registry.
+
+    Shape:
+        {
+            "registry": "/home/user/.casetrack/registry.json",
+            "schema_v": 1,
+            "projects": [
+                {
+                    "project_id": "hgsoc-2026",
+                    "name": "HGSOC methylation cohort",
+                    "path": "/data/...",
+                    "created": "...",
+                    "last_seen": "...",
+                },
+                ...
+            ],
+        }
+
+    Designed to be small, flat, and JSON-serializable so an LLM can
+    pick a project_id from the list and pass it back to query_tool.
+    """
+    reg = _read_registry()
+    entries = sorted(
+        (
+            {"project_id": pid, **info}
+            for pid, info in reg.get("projects", {}).items()
+        ),
+        key=lambda e: e["project_id"],
+    )
+    return {
+        "registry": str(casetrack._registry_path()),
+        "schema_v": reg.get("schema_v"),
+        "projects": entries,
+    }
+
+
+def _is_read_only_sql(sql: str) -> bool:
+    return bool(_READ_ONLY_PREFIX.match(sql))
+
+
+def query_tool(project_id: str, sql: str, *, row_limit: int = 10_000) -> dict:
+    """Resolve `project_id` via the registry, run a read-only SELECT,
+    return rows as a list of dicts.
+
+    Raises MCPToolError with specific messages for the three failure
+    modes an agent might hit: unknown project_id, non-SELECT SQL, or
+    SQL execution error. Never raises a raw sqlite3 exception to the
+    caller — all paths produce a user-visible string.
+
+    `row_limit` caps how many rows we serialize; too-big result sets
+    crash LLM context windows and the cap keeps the tool responsive.
+    """
+    if not isinstance(project_id, str) or not project_id:
+        raise MCPToolError("project_id must be a non-empty string")
+    if not isinstance(sql, str) or not sql.strip():
+        raise MCPToolError("sql must be a non-empty string")
+
+    resolved = casetrack.registry_resolve(project_id)
+    if resolved is None:
+        known = sorted((_read_registry().get("projects") or {}).keys())
+        if known:
+            hint = f" Known project_ids: {', '.join(known)}."
+        else:
+            hint = " No projects are registered. Run `casetrack init ...` to create one."
+        raise MCPToolError(
+            f"project_id {project_id!r} is not in the casetrack registry.{hint}"
+        )
+
+    if not _is_read_only_sql(sql):
+        raise MCPToolError(
+            "casetrack_query accepts SELECT / WITH statements only. "
+            "To mutate data, use the `casetrack` CLI directly."
+        )
+
+    db_path = resolved / casetrack.PROJECT_DB_NAME
+    if not db_path.exists():
+        raise MCPToolError(
+            f"casetrack.db not found for project {project_id!r} at {resolved}. "
+            f"The registry entry may be stale — run `casetrack projects "
+            f"deregister {project_id}` or point it at the right path."
+        )
+
+    # The hard-gate check (proposal 0005 §9 step 4) is enforced by
+    # _resolve_project, which also catches TOML/DB drift. We don't
+    # import that helper directly here because it calls sys.exit() on
+    # failure — instead, we re-implement the gate inline so we can
+    # raise MCPToolError cleanly.
+    try:
+        schema = casetrack.load_schema(resolved / casetrack.PROJECT_TOML_NAME)
+    except casetrack.SchemaError as e:
+        raise MCPToolError(
+            f"schema load failed for project {project_id!r}: {e}"
+        ) from e
+
+    conn = casetrack.open_project_db(db_path)
+    try:
+        try:
+            casetrack.require_project_identity_or_fail(conn, schema, resolved)
+        except ValueError as e:
+            raise MCPToolError(str(e)) from e
+        try:
+            casetrack.check_project_identity_consistency(conn, schema, resolved)
+        except ValueError as e:
+            raise MCPToolError(str(e)) from e
+
+        # Run the query with a row cap. Using `execute + fetchmany(cap+1)`
+        # so we can detect truncation and flag it to the agent.
+        try:
+            cursor = conn.execute(sql)
+        except sqlite3.Error as e:
+            raise MCPToolError(f"SQL error: {e}") from e
+        cols = [d[0] for d in (cursor.description or [])]
+        rows_raw = cursor.fetchmany(row_limit + 1)
+        truncated = len(rows_raw) > row_limit
+        rows_raw = rows_raw[:row_limit]
+        rows = [dict(zip(cols, r)) for r in rows_raw]
+    finally:
+        conn.close()
+
+    casetrack.registry_touch(project_id)
+    return {
+        "project_id": project_id,
+        "project_path": str(resolved),
+        "columns": cols,
+        "rows": rows,
+        "row_count": len(rows),
+        "truncated": truncated,
+        "row_limit": row_limit,
+    }

@@ -9,7 +9,7 @@ setup(
     author="Samuel Ahuno",
     author_email="sahuno@mskcc.org",
     py_modules=["casetrack"],
-    packages=["casetrack_qc"],
+    packages=["casetrack_qc", "casetrack_mcp"],
     install_requires=[
         "pandas>=1.5.0",
         "duckdb>=0.9",
@@ -19,11 +19,15 @@ setup(
     extras_require={
         "excel": ["openpyxl>=3.0"],
         "parquet": ["pyarrow>=10.0"],
-        "all": ["openpyxl>=3.0", "pyarrow>=10.0"],
+        # v0.6 Part B: optional MCP server for AI-agent integration.
+        "mcp": ["mcp>=1.0"],
+        "all": ["openpyxl>=3.0", "pyarrow>=10.0", "mcp>=1.0"],
     },
     entry_points={
         "console_scripts": [
             "casetrack=casetrack:main",
+            # v0.6 Part B: `casetrack-mcp` stdio server (requires `mcp` extra).
+            "casetrack-mcp=casetrack_mcp.server:main",
         ],
     },
     python_requires=">=3.10",
