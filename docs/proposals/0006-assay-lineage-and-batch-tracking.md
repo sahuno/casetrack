@@ -10,48 +10,77 @@
 ## Motivation
 
 ONT sequencing routinely produces multiple flowcell runs per sample. In the
-current three-level hierarchy (`patients → specimens → assays`) both raw runs
-*and* the merged BAM produced from them are represented as assays — but the
-relationship between them is invisible to casetrack. Concretely:
+current three-level hierarchy (`patients → specimens → assays`) run-level assays
+exist as tracked entities, but their relationship to the specimen-level analysis
+that consumed them is invisible to casetrack.
+
+### Concrete reference case: project_17424
 
 ```
-p17424_6_run1  →  assay (flowcell 1 BAM)  ─┐
-                                             ├─ samtools merge → p17424_6 → modkit pileup
-p17424_6_run2  →  assay (flowcell 2 BAM)  ─┘
+p17424_6 (patient)
+  └── p17424_6_tumor (specimen)    ← modkit methylation lands here (specimen level)
+        ├── s17424_6_1_1_1_1_1     ← flowcell 1 BAM, 10.9M reads, R10.4.1
+        └── s17424_6_1_2_1_1_1     ← flowcell 2 BAM,  9.9M reads, R10.4.1
 ```
 
-Today `casetrack` can track `p17424_6` and both run assays independently,
-but cannot answer:
+Both run-level assays are already registered with `flowcell_id`, `chemistry`,
+`total_reads`, `mapped_pct`. Methylation results from `MODKIT_MERGED_TRACKED`
+landed on `p17424_6_tumor` (specimen) — modkit pileup reads both BAMs
+simultaneously; no explicit merged BAM artifact is written to disk.
 
-- "Which flowcells contributed to p17424_6?"
-- "Did run1 and run2 come from the same sequencing batch / reagent lot?"
-- "If batch B is contaminated, which merged assays are affected?"
+Casetrack currently cannot answer:
 
-This proposal adds two orthogonal, non-breaking features that address this:
+- "Which flowcells fed p17424_6_tumor's methylation call?"
+- "If s17424_6_1_1_1_1_1 had a basecalling issue, which specimens are affected?"
+- "Were run1 and run2 from the same reagent lot / library prep batch?"
+- "Across the cohort, which specimens drew from a contaminated flowcell batch?"
 
-1. **Assay lineage** — `assay_merges` join table recording `source → merged`
-   relationships, plus a `casetrack merge-assay` command to register merges.
+### Two distinct patterns in practice
+
+| Pattern | Example | Artifact on disk? |
+|---|---|---|
+| **Implicit merge** | modkit pileup reads N BAMs in one call | No — specimen IS the merge unit |
+| **Explicit merge** | samtools merge produces a combined BAM | Yes — a new BAM file, potentially a new assay |
+
+Both need lineage tracking. The schema below handles both.
+
+This proposal adds two orthogonal, non-breaking features:
+
+1. **Assay lineage** — `assay_sources` join table recording which assays (or
+   which assay→specimen pairs) fed a downstream analysis unit. Plus
+   `casetrack link-sources` to register the relationship.
 2. **Batch grouping** — `batch_id` nullable column on `assays` + a `batches`
    metadata table, plus `casetrack add-batch` / `casetrack censor --batch`.
 
 These features are independent but ship together because they interact at the
-QC layer (a censored batch cascades to merged assays that consumed its sources)
-and at `casetrack rerun` (merges may need to be re-done after a batch is
-remediated).
+QC layer (a censored batch cascades to downstream analyses that consumed its
+sources) and at `casetrack rerun` (sources may need re-running after a batch
+is remediated).
 
 ---
 
 ## Design decisions (locked)
 
-### D1 — Merged assay stays in the `assays` table; no 4th hierarchy level
+### D1 — No 4th hierarchy level; lineage tracked as a join table
 
-A merged BAM is still a specimen's assay. Adding a 4th level (`runs`) would
-be breaking (schema migration, all CLI flags, all queries) and is not justified
-biologically — the merge is a *processing* step, not a new entity type.
+Adding a `runs` level between specimens and assays would be breaking (schema
+migration, all CLI flags, all FK enforcement, all queries). Not justified.
 
-The `assay_merges(merged_assay_id, source_assay_id)` join table records the
-lineage additively. Both the merged assay and its source run assays live in
-`assays` under the same `specimen_id`.
+Instead: a new `assay_sources` join table records lineage between existing
+entities. It supports two modes:
+
+```
+Mode A — assay → assay  (explicit merged BAM case)
+  merged_assay_id: "p17424_6_merged"  →  source_assay_id: "s17424_6_1_1_1_1_1"
+  merged_assay_id: "p17424_6_merged"  →  source_assay_id: "s17424_6_1_2_1_1_1"
+
+Mode B — assay → specimen  (implicit merge / modkit multi-BAM case)
+  consumer_specimen_id: "p17424_6_tumor"  →  source_assay_id: "s17424_6_1_1_1_1_1"
+  consumer_specimen_id: "p17424_6_tumor"  →  source_assay_id: "s17424_6_1_2_1_1_1"
+```
+
+The table has nullable `merged_assay_id` and `consumer_specimen_id` — exactly
+one is non-null per row (enforced by CHECK).
 
 ### D2 — `assay_merges` is many-to-many and supports recursive merges
 
@@ -72,13 +101,25 @@ sequencing-run level, which maps to `assay`. A patient's specimens can span
 batches — that's the point. `batch_id` is a FK into the new `batches` table.
 Existing rows get `batch_id = NULL` — no migration needed.
 
-### D5 — `casetrack censor --batch <id>` cascades to assays
+**project_17424 note**: the `flowcell_id` column already exists on `assays`
+and carries the natural batch identifier. `batch_id` can alias `flowcell_id`
+or group multiple flowcells into a named library-prep batch — whichever
+granularity is relevant for QC (reagent lot contamination → prep batch;
+chemistry mismatch → per-flowcell). Both are supported: `batch_id` in `batches`
+is user-defined and can reference either granularity.
 
-Censoring a batch sets `qc_status = 'censored'` on every assay in that batch
-(same cascade semantics as `casetrack censor --level assay`). It also flags
-any *merged* assay whose direct sources include a censored-batch assay
-(cascade stops at merged assays — does not propagate further up to specimen/
-patient unless a separate censor is issued).
+### D5 — `casetrack censor --batch <id>` cascades to assays and their consumers
+
+Censoring a batch sets `qc_status = 'censored'` on every assay with that
+`batch_id`. It then looks up `assay_sources` and flags:
+
+- Mode A: any `merged_assay_id` whose sources include a censored assay.
+- Mode B: any `consumer_specimen_id` whose sources include a censored assay
+  (sets specimen `qc_status = 'warn'`, not `censored` — the specimen data
+  may still be usable if other sources are clean; the analyst decides).
+
+Cascade stops there — does not auto-propagate to patient unless a separate
+censor is issued.
 
 Reversible via `casetrack uncensor --batch <id>`.
 
@@ -87,6 +128,9 @@ Reversible via `casetrack uncensor --batch <id>`.
 ## Schema additions
 
 ### New table: `batches`
+
+(`batch_id` is user-defined — can be a flowcell ID, a library prep lot, a
+sequencing date, or any other grouping label meaningful to the project.)
 
 ```sql
 CREATE TABLE IF NOT EXISTS batches (
@@ -107,16 +151,33 @@ ALTER TABLE assays ADD COLUMN batch_id TEXT REFERENCES batches(batch_id);
 
 Added via `casetrack migrate-batch` (additive; no data loss).
 
-### New table: `assay_merges`
+### New table: `assay_sources`
+
+Tracks lineage for both patterns — implicit merge (assay→specimen) and
+explicit merge (assay→assay). Exactly one of `merged_assay_id` /
+`consumer_specimen_id` is non-null per row.
 
 ```sql
-CREATE TABLE IF NOT EXISTS assay_merges (
-    merged_assay_id TEXT NOT NULL REFERENCES assays(assay_id),
-    source_assay_id TEXT NOT NULL REFERENCES assays(assay_id),
-    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
-    PRIMARY KEY (merged_assay_id, source_assay_id),
+CREATE TABLE IF NOT EXISTS assay_sources (
+    source_assay_id      TEXT NOT NULL REFERENCES assays(assay_id),
+    -- Mode A: explicit merged BAM assay
+    merged_assay_id      TEXT REFERENCES assays(assay_id),
+    -- Mode B: implicit merge into specimen-level analysis
+    consumer_specimen_id TEXT REFERENCES specimens(specimen_id),
+    created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    PRIMARY KEY (source_assay_id, merged_assay_id, consumer_specimen_id),
+    CHECK (
+        (merged_assay_id IS NOT NULL) != (consumer_specimen_id IS NOT NULL)
+    ),
     CHECK (merged_assay_id != source_assay_id)
 );
+```
+
+**project_17424 example** (Mode B — implicit merge):
+```sql
+INSERT INTO assay_sources (source_assay_id, consumer_specimen_id)
+VALUES ('s17424_6_1_1_1_1_1', 'p17424_6_tumor'),
+       ('s17424_6_1_2_1_1_1', 'p17424_6_tumor');
 ```
 
 ---
@@ -134,19 +195,33 @@ casetrack add-batch --batch-id BATCH_B \
 Creates a row in `batches`. Idempotent — if the `batch_id` already exists,
 updates the metadata fields that are provided.
 
-### `casetrack merge-assay`
+### `casetrack link-sources`
 
-```
-casetrack merge-assay \
-    --merged-id  p17424_6 \
-    --sources    p17424_6_run1,p17424_6_run2 \
+Links source assays to their downstream consumer — either an explicit merged
+assay (Mode A) or a specimen (Mode B, the project_17424 pattern).
+
+```bash
+# Mode A — explicit merged BAM assay
+casetrack link-sources \
+    --sources    s17424_6_1_1_1_1_1,s17424_6_1_2_1_1_1 \
+    --merged-id  p17424_6_merged \
+    --project-dir /path/to/proj
+
+# Mode B — implicit merge into specimen (no merged BAM on disk)
+casetrack link-sources \
+    --sources    s17424_6_1_1_1_1_1,s17424_6_1_2_1_1_1 \
+    --specimen   p17424_6_tumor \
     --project-dir /path/to/proj
 ```
 
-Inserts rows into `assay_merges`. All IDs must already exist in `assays`.
-Idempotent — re-registering the same pair is a no-op.
+Inserts rows into `assay_sources`. All IDs must exist. Idempotent.
+Provenance: writes a `link_sources` action to `provenance.jsonl`.
 
-Provenance: writes a `merge_assay` action to `provenance.jsonl`.
+**Bulk registration from a TSV** (for project_17424's 12 assays → 6 specimens):
+```bash
+casetrack link-sources --from-tsv links.tsv --project-dir /path/to/proj
+# links.tsv columns: source_assay_id, consumer_specimen_id (or merged_assay_id)
+```
 
 ### `casetrack censor --batch <id>`
 
@@ -188,21 +263,43 @@ DuckDB query mode already works against any table — `assay_merges` and
 
 ---
 
-## `casetrack migrate-batch` command
+## `casetrack migrate-lineage` command
 
 One-shot migration for projects that predate this proposal:
 
 ```
-casetrack migrate-batch --project-dir /path/to/proj
+casetrack migrate-lineage --project-dir /path/to/proj
 ```
 
 1. Adds `batch_id` column to `assays` (ALTER TABLE; safe if column exists).
-2. Creates `batches` and `assay_merges` tables (safe if they exist).
-3. Writes a `migrate_batch` provenance entry.
+2. Creates `batches` and `assay_sources` tables (safe if they exist).
+3. Writes a `migrate_lineage` provenance entry.
 4. Prints "Migration complete — no data changed, all new columns nullable."
 
-Idempotent. Does NOT modify `schema_version` — this is an additive migration,
-not a schema contract change.
+Idempotent. Does NOT modify `schema_version` — additive migration only.
+
+**project_17424 quick-start after migration**:
+```bash
+casetrack migrate-lineage --project-dir /path/to/project_17424
+
+# Register all 6 specimen→assay links in one pass:
+cat > links.tsv <<TSV
+source_assay_id,consumer_specimen_id
+s17424_1_1_1_1_1_1,p17424_1_tumor
+s17424_1_1_2_1_1_1,p17424_1_tumor
+s17424_2_1_1_1_1_1,p17424_2_tumor
+s17424_2_1_2_1_1_1,p17424_2_tumor
+s17424_3_1_1_1_1_1,p17424_3_tumor
+s17424_3_1_2_1_1_1,p17424_3_tumor
+s17424_4_1_1_1_1_1,p17424_4_tumor
+s17424_4_1_2_1_1_1,p17424_4_tumor
+s17424_5_1_1_1_1_1,p17424_5_tumor
+s17424_5_1_2_1_1_1,p17424_5_tumor
+s17424_6_1_1_1_1_1,p17424_6_tumor
+s17424_6_1_2_1_1_1,p17424_6_tumor
+TSV
+casetrack link-sources --from-tsv links.tsv --project-dir /path/to/project_17424
+```
 
 ---
 
@@ -253,14 +350,15 @@ process — it's the same "local executor, sqlite write" pattern.
 | O1 | Should `casetrack rerun` refuse to rerun a merged assay if any source is censored? | Warn but don't block — the user may be rerunning *because* a source was fixed. |
 | O2 | Should `assays.batch_id` be required (non-null) for new assays once `batches` is populated? | No — keep nullable. Different assay types (derived analyses) may not map to a wet-lab batch. |
 | O3 | Is `batches` project-scoped or global? | Project-scoped (lives in the same `casetrack.db`). Cross-project batch comparisons go through `casetrack query` + DuckDB `ATTACH`. |
-| O4 | Should `casetrack add-batch` accept a TSV to bulk-load many batches at once? | Yes — `--from-tsv batches.tsv` with columns `batch_id, prep_date, reagent_lot, operator, notes`. |
+| O4 | Should `casetrack add-batch` accept a TSV to bulk-load many batches at once? | Yes — `--from-tsv batches.tsv` with columns `batch_id, prep_date, reagent_lot, operator, notes`. Similarly `link-sources --from-tsv`. |
+| O5 | For project_17424: should `flowcell_id` be auto-populated as `batch_id` during migration? | Opt-in: `--map-flowcell-to-batch` flag on `migrate-lineage` copies `flowcell_id` → `batch_id` for every assay that has a `flowcell_id` and no `batch_id`. Non-destructive. |
 
 ---
 
 ## Implementation order
 
-1. `casetrack migrate-batch` + schema DDL (tests first).
-2. `casetrack add-batch` + `casetrack merge-assay` commands.
+1. `casetrack migrate-lineage` + schema DDL (`batches` + `assay_sources`) — tests first.
+2. `casetrack add-batch` + `casetrack link-sources` commands (both modes A and B; `--from-tsv`).
 3. `casetrack censor --batch` + cascade logic + `uncensor --batch`.
 4. `casetrack rerun --include-sources`.
 5. `casetrack status --show-lineage` + `validate` / `doctor` invariants.
