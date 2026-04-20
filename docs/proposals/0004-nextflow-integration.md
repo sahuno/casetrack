@@ -1,7 +1,7 @@
 # Proposal 0004 — Nextflow integration via `casetrack-nf-subworkflows`
 
-**Status**: accepted (v0.4.0 drop-in shipped 2026-04-19; v0.1.0 pilot shipped 2026-04-18)
-**Target release**: casetrack v0.5.0 + casetrack-nf-subworkflows v0.4.0
+**Status**: accepted (v0.5.0 specimen-level L1 shipped 2026-04-20; v0.4.0 drop-in shipped 2026-04-19; v0.1.0 pilot shipped 2026-04-18)
+**Target release**: casetrack v0.5.0 + casetrack-nf-subworkflows v0.5.0
 **Breaking**: no (additive; opt-in via `[layout]` / `[analyses]` TOML sections)
 **Author**: Samuel Ahuno
 
@@ -208,6 +208,8 @@ CASETRACK_REGISTER(tuple(meta, tool_name, summary_filename, summary_tsv))
 | nf-core/methylseq drop-in config | ✅ shipped v0.4.0 | Covered by the generic drop-in above; no methylseq-specific work needed |
 | Tutorial + worked example | ✅ shipped | `casetrack-nf-subworkflows/docs/TUTORIAL.md` + `examples/giab_chr21/` |
 | Real-data validation | ✅ shipped | GIAB HG006_PAY77227 chr21 — see §Pilot below |
+| Specimen-level L1 wrapper (MODKIT_MERGED_TRACKED) | ✅ shipped v0.5.0 | Closes Q4 L1 half. ADR-001 captures the design. Stub smoke test: `test/run_test_merged.sh`. |
+| `nf_process` alias in `[analyses.*]` (wrapper-renamed analyses) | ✅ shipped v0.5.0 | L2/L3 importers look up both the analysis key and an optional `nf_process` alias, so `MODKIT_MERGED_TRACKED` (which internally still runs `MODKIT_PILEUP`) can land trace + versions on `[analyses.modkit_merged]`. |
 | Additional wrappers (DORADO, CALLMODS, SORT, SNIFFLES2) | ⏳ pending | Mechanical — one per week |
 | Publish to GitHub with CI | ⏳ pending | Repo is public; `.github/workflows/` not yet added |
 
@@ -361,7 +363,11 @@ If `CASETRACK_REGISTER` fails (e.g. DB busy), does the wrapper's `.out.casetrack
 
 ### Q4 — patient-level and specimen-level tracked subworkflows
 
-**Partially resolved in v0.4.0.** The drop-in config + level-aware L2/L3 helpers (`--level {patient,specimen,assay}`) now handle trace and versions tracking at any level. L1 wrappers (`*_tracked.nf`) remain assay-only — extending the `CASETRACK_REGISTER` contract to patient/specimen outputs is still deferred to when the first non-assay wrapper is requested.
+**Resolved for specimen-level in v0.5.0** (ADR-001, casetrack-nf-subworkflows b1121c5+).
+
+- L2/L3 helpers went level-aware in v0.4.0.
+- L1 wrappers went level-aware in v0.5.0: `CASETRACK_REGISTER` accepts `params.casetrack_level`, `SUMMARIZE_MODKIT` adapts its TSV key column, `INPUT_CHECK` validates a level-appropriate samplesheet schema, and `MODKIT_MERGED_TRACKED` is the first specimen-level reference wrapper. Separately, `[analyses.*]` now accepts an `nf_process` alias so wrapper-renamed analyses (like `[analyses.modkit_merged] nf_process = "MODKIT_PILEUP"`) still match L2/L3 trace rows.
+- Patient-level L1 is still deferred (ADR-001 D3) — no concrete driver yet. When a tool that operates on patient-pooled data lands, the plumbing already supports `params.casetrack_level = patient`.
 
 ### Q5 — interaction with QC autoflag
 
