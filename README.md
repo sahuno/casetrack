@@ -346,7 +346,30 @@ casetrack projects deregister some-old-project
 casetrack projects scan --root ~/projects/    # or: casetrack projects --root ~/projects/
 ```
 
-If TOML's `project_id` and the DB's `project_meta.project_id` disagree (you copied a `.db` into the wrong directory, or hand-edited TOML after init), the next command fails loudly with both values shown. Legacy v0.5 projects without `project_meta` continue to work — the consistency check skips silently until you migrate.
+If TOML's `project_id` and the DB's `project_meta.project_id` disagree (you copied a `.db` into the wrong directory, or hand-edited TOML after init), the next command fails loudly with both values shown.
+
+### Legacy projects must be migrated (v0.6+)
+
+v0.6 refuses to run any command on a project that lacks `project_id` + `project_meta`. The error prints the exact migration command to run:
+
+```
+Error: This project is missing v0.6 identity wiring
+([project] project_id in casetrack.toml, project_meta row in casetrack.db). Run:
+    casetrack migrate-project-id --project-dir /data/old_cohort
+To bypass for a one-off read or batch audit, set CASETRACK_ALLOW_LEGACY=1.
+```
+
+**Bypass for read-only audits** — if you've inherited a v0.5 project and want to inspect it before deciding to migrate, set the env var:
+
+```bash
+# One-off read:
+CASETRACK_ALLOW_LEGACY=1 casetrack status --project-dir /data/old_cohort
+
+# Audit every legacy cohort under a root before migrating:
+CASETRACK_ALLOW_LEGACY=1 casetrack projects scan --root ~/projects/
+```
+
+Upgrade-path commands (`migrate-qc`, `migrate-project-id`, `recover`) bypass the gate automatically — they're designed to operate on legacy state.
 
 ### Migrating legacy projects
 

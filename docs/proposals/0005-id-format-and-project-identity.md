@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Author** | Samuel Ahuno ([ekwame001@gmail.com](mailto:ekwame001@gmail.com)) |
-| **Status** | Part A complete + Part B alpha + beta shipped 2026-04-19 (v0.6.0a1 + b1); hard-requirement gate still pending |
+| **Status** | Part A complete + Part B complete (alpha, beta, final all shipped 2026-04-19); only MCP wrapper remains |
 | **Date** | 2026-04-19 |
 | **Target release** | v0.6.0 |
 | **Breaking** | Yes — new required field (`project_id`) + stricter validation on patient/specimen/assay IDs. One-shot migration path. |
@@ -18,7 +18,7 @@
 | **Part A — `casetrack doctor --id-format`** | ✅ shipped | Scan-only health check + rename suggestions; `--fmt table\|tsv`. casetrack commit `9e4369e`. |
 | **Part B alpha — project identity (`project_id`, `project_meta`, registry)** | ✅ shipped | `_PROJECT_ID_PATTERN`, `project_meta` table, `~/.casetrack/registry.json` (single-user), `casetrack init --project-id`, `casetrack --project <id>`, `casetrack projects {list,register,deregister,scan}`. casetrack commit `3b3f5f1`. 51 new tests. Legacy v0.5 projects continue to work — no enforcement. |
 | **Part B beta — `casetrack migrate-project-id`** | ✅ shipped | Interactive single-project + `--scan` batch mode. Idempotent; refuses slug conflicts; writes provenance entry per migration. casetrack commit `3a678fa`. 15 new tests. |
-| **Part B final — hard requirement gate** | ⏳ pending | Hard error on un-migrated projects at command start. Deferred so users can migrate at their own pace before the gate lands (§9 step 3). |
+| **Part B final — hard requirement gate** | ✅ shipped | Runtime refuses un-migrated projects at every command (read + write). `CASETRACK_ALLOW_LEGACY=1` bypass for audits; upgrade-path commands (`migrate-qc`, `migrate-project-id`, `recover`) bypass internally. casetrack commit `48dcbf2`. 18 new tests. |
 | **Part B — MCP wrapper for AI agents** | ⏳ pending | `casetrack_list_projects()` + `casetrack_query(project_id, sql)` per §5.6 — out of code scope but documented. |
 
 ## 0. Accepted decisions
@@ -318,7 +318,9 @@ For hierarchy IDs, `casetrack doctor --id-format` ✅ shipped — scans all thre
 
 ### 7.1 Backward compatibility with v0.5 and earlier projects
 
-- ✅ **Shipped (alpha) — tolerant.** Projects without a `project_meta` table or without `[project] project_id` in TOML continue to work normally. The cross-check (`check_project_identity_consistency`) silently skips when either side is absent. ✅ **Beta** added the `casetrack migrate-project-id` command to bring legacy projects into the new scheme. ⏳ Part B final will tighten the runtime to require a `project_meta` row.
+- ✅ **Alpha (tolerant).** Projects without a `project_meta` table or without `[project] project_id` in TOML continued to work normally; the cross-check silently skipped when either side was absent.
+- ✅ **Beta.** Added the `casetrack migrate-project-id` command so users could upgrade their legacy projects.
+- ✅ **Final.** Runtime now refuses un-migrated projects with a one-line migration suggestion. Override via `CASETRACK_ALLOW_LEGACY=1` env var (documented bypass for read-only audits of inherited legacy cohorts). Upgrade-path commands (`migrate-qc`, `migrate-project-id`, `recover`) bypass the gate internally — they operate on legacy state by definition.
 - ✅ **Shipped.** Hierarchy IDs that already exist and violate the new regex: commands continue to work on read paths (query, export, dashboard, recover); INSERT paths (register, migrate, add-metadata --allow-new) reject malformed values on new rows until the offending existing row is renamed or `id_pattern` is loosened in TOML. Rationale: strict-on-new, tolerant-of-existing.
 
 ## 8. Open questions
@@ -359,7 +361,7 @@ If a project opts in to `allow_unicode_ids`, the per-assay summary TSVs must be 
 1. ✅ **v0.6.0-part-a (shipped 2026-04-19)**: hierarchy ID format enforcement landed in `casetrack.py` commit `1849cc6` + tests `test_id_format.py` (37 tests) + Nextflow integration tests in `casetrack-nf-subworkflows` commit `9f958a1` + `casetrack doctor --id-format` scanner in commit `9e4369e`. **Deviation from original plan**: shipped as enforcement-by-default, not warn-mode alpha, because the validator errors are actionable and the escape hatches (`id_pattern`, `allow_case_variants`, `allow_unicode_ids`) cover every legitimate legacy case.
 2. ✅ **v0.6.0-part-b alpha (shipped 2026-04-19)**: `project_id` + `project_meta` table + `--project <id>` resolver + registry read+write path + `casetrack projects list` / `register` / `deregister` / `scan` shipped in commit `3b3f5f1` with 51 new tests. No enforcement — new projects get `project_id`, legacy v0.5 projects continue to work because cross-check skips when either TOML or DB lacks the field.
 3. ✅ **v0.6.0-part-b beta (shipped 2026-04-19)**: `casetrack migrate-project-id` interactive single-project + `--scan` batch mode shipped in commit `3a678fa` with 15 new tests. Idempotent; refuses drift + slug conflicts; provenance entry per migration. Hard-requirement gate intentionally deferred to step 4.
-4. ⏳ **v0.6.0 final (pending)**: hard error on un-migrated projects at command start. Dashboard, query, export all require the registry entry to exist. Deferred so users can adopt `migrate-project-id` at their own pace before the gate lands.
+4. ✅ **v0.6.0 final (shipped 2026-04-19)**: hard error on un-migrated projects at command start. `_resolve_project` now calls `require_project_identity_or_fail` for every read or write command. Bypass via `CASETRACK_ALLOW_LEGACY=1` for one-off audits; upgrade-path commands (`migrate-qc`, `migrate-project-id`, `recover`) bypass internally. Shipped in commit `48dcbf2` with 18 new tests.
 5. ⏳ **v0.7.x**: revisit team-shared registry (Q1) and UUID backing (Q2) as separate proposals.
 
 ### Remaining Part A items
@@ -368,8 +370,7 @@ If a project opts in to `allow_unicode_ids`, the per-assay summary TSVs must be 
 
 ### Remaining Part B items
 
-- ⏳ Hard-error gate on un-migrated projects (rollout step 4 above).
-- ⏳ MCP wrapper exposing `list_projects()` + `query(project_id, sql)` to AI agents (§5.6).
+- ⏳ MCP wrapper exposing `list_projects()` + `query(project_id, sql)` to AI agents (§5.6). Per design-review, this will ship as a `casetrack_mcp/` subpackage in this repo with `pip install casetrack[mcp]` extras — not a separate repo.
 
 ## 10. References
 
