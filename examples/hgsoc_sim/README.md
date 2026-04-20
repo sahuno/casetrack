@@ -83,6 +83,38 @@ adjust purity; the VISOR BEDs are regenerated from this file by
 
 See `config.yaml` for the full spec.
 
+## Optional real-RNA lane
+
+The default lane above is DNA-only (VISOR + Badread). A separate opt-in
+lane produces real splice-aware ONT-RNA BAMs via NanoSim's transcriptome
+mode + minimap2's splice preset.
+
+To turn it on, add an `rna:` sub-block to any specimen in `config.yaml`
+(the shipped config already does this on two specimens as examples —
+`HGSOC_SIM_01 tumor` with a BRCA1 LOF multiplier, `HGSOC_SIM_02 normal`
+with a low read count that mirrors the broken DNA normal), then run:
+
+```bash
+bash examples/hgsoc_sim/run_rna_lane.sh
+```
+
+Outputs land next to the DNA BAMs:
+
+```
+sandbox/hgsoc_sim/cohort/
+  HGSOC_SIM_01/tumor/rna/sim.srt.bam      # BRCA1 × 0.1
+  HGSOC_SIM_02/normal/rna/sim.srt.bam     # deliberately under-sampled
+```
+
+Extra container pulls (gffread, NanoSim) are covered in
+[`containers/README.md`](containers/README.md#optional-real-rna-lane-nanosim).
+Specimens without an `rna:` block are silently skipped — the DNA lane is
+unaffected.
+
+Chemistry caveat: NanoSim's public pre-trained cDNA model is R9.4.1;
+the real HGSOC cohort is R10.4.1. The cDNA-vs-DNA distinction is what
+this lane is for, not chemistry fidelity.
+
 ## Tradeoffs / caveats
 
 - **Reads are R10.4.1 via Badread** (`nanopore2023` error + qscore models).
