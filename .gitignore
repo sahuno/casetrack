@@ -27,7 +27,11 @@ Thumbs.db
 .docs/
 
 # Claude Code local harness state (per-checkout settings, slash commands)
-.claude/
+# — ignore everything under .claude/ EXCEPT the shipped casetrack skill bundle.
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/casetrack/
 
 # hgsoc_sim HPC demo run artifacts — dashboards + benchmark reports are
 # regenerated every run by the summary phase, not source.

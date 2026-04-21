@@ -1,0 +1,26 @@
+{
+  "skill_name": "casetrack",
+  "evals": [
+    {
+      "id": 0,
+      "name": "cohort-setup-from-scratch",
+      "prompt": "I have a new ATLL (adult T-cell leukemia) cohort with 4 patients. Each patient has one tumor sample (existing BAM) and one normal sample (pod5 raw data only, not yet basecalled). I want to track which samples have been sorted, variant-called, and methylation-called using casetrack. The project should live at /tmp/atll_new/. Walk me through setting this up from scratch — what commands do I run in what order, and what should casetrack.toml look like?",
+      "expected_output": "Agent produces an ordered sequence: casetrack init, edit TOML to add analyses (samtools_sort, sniffles2, modkit_pileup) plus pod5_path on assays, casetrack schema apply, add-metadata for patients then specimens then assays with --allow-new --yes. Should NOT use 'casetrack append' for entity registration.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "record-analysis-results",
+      "prompt": "I just finished running samtools sort on all 6 tumor specimens in my casetrack project at /data1/greenbab/users/ahunos/casetrack_projects/project_17424. I wrote a summary TSV at /tmp/sort_summary.tsv with columns: specimen_id, sorted_bam_path, sorted_bam_size_bytes, n_reads, sort_order (one row per specimen). How do I record these results in the casetrack DB so the specimens' sort_done timestamp and sort stats columns get populated? This is the second time I've run this analysis — the first run populated some cells with earlier data.",
+      "expected_output": "Agent uses `casetrack append --project-dir <path> --analysis samtools_sort --results /tmp/sort_summary.tsv --overwrite`. Critically includes --overwrite (because the user noted it's a rerun). Uses --analysis samtools_sort (not add-metadata, not a different analysis name). Explains that column_prefix 'sort' from the TOML prepends to columns.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "generate-pending-samplesheet",
+      "prompt": "I need a Nextflow samplesheet for all the normal samples in /data1/greenbab/users/ahunos/casetrack_projects/project_17424 that are ready to be basecalled with dorado but haven't been yet. One of the normals (s17424_C_6_1_1_1_1_1) is censored because its pod5 rsync isn't complete — it should be excluded. Generate the SQL query and show me the resulting CSV with columns: sample, patient, specimen, pod5_dir, genome.",
+      "expected_output": "Agent writes a SQL query that JOINs assays, specimens, patients; filters condition='normal', qc_status='pass' (or uses _active view), dorado_basecaller_done IS NULL. Produces a CSV with exactly 5 rows (p17424_1 through p17424_5 normals). Uses `casetrack query --project-dir ... --sql '...'` or the MCP tool.",
+      "files": []
+    }
+  ]
+}
