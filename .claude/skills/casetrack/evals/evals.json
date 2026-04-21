@@ -21,6 +21,41 @@
       "prompt": "I need a Nextflow samplesheet for all the normal samples in /data1/greenbab/users/ahunos/casetrack_projects/project_17424 that are ready to be basecalled with dorado but haven't been yet. One of the normals (s17424_C_6_1_1_1_1_1) is censored because its pod5 rsync isn't complete — it should be excluded. Generate the SQL query and show me the resulting CSV with columns: sample, patient, specimen, pod5_dir, genome.",
       "expected_output": "Agent writes a SQL query that JOINs assays, specimens, patients; filters condition='normal', qc_status='pass' (or uses _active view), dorado_basecaller_done IS NULL. Produces a CSV with exactly 5 rows (p17424_1 through p17424_5 normals). Uses `casetrack query --project-dir ... --sql '...'` or the MCP tool.",
       "files": []
+    },
+    {
+      "id": 3,
+      "name": "schema-migration-with-data",
+      "prompt": "I added 3 new columns to my casetrack.toml under [levels.assay.columns] (genome, library_kit, run_date) but now when I try to run `casetrack add-metadata --level assay --metadata new_assays.tsv` I get `sqlite3.OperationalError: no such column: genome`. The DB already has 18 assays I don't want to lose. How do I fix this without rebuilding the project?",
+      "expected_output": "Agent identifies the problem: TOML edits don't auto-apply to the SQLite DB. Tells user to run `casetrack schema apply --project-dir .` which runs non-destructive ALTER TABLE statements (existing data preserved). Mentions schema_v gets bumped. Should NOT suggest dropping the DB or re-init.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "name": "rerun-after-bug-fix",
+      "prompt": "I just patched a bug in my modkit_callmods summary script — it was reporting n_reads as zero for everyone. All 12 specimens in project_17424 are already marked modkit_callmods_done with the buggy values. I have a fresh /tmp/modkit_callmods_summary.tsv with the corrected stats (one row per specimen, keyed on specimen_id). How do I push the corrected values into the casetrack DB?",
+      "expected_output": "Agent uses `casetrack append --project-dir <path> --analysis modkit_callmods --results /tmp/modkit_callmods_summary.tsv --overwrite`. The --overwrite is critical — without it, fill-only behavior keeps the buggy zeros. Should NOT suggest deleting rows or running uncensor (modkit_callmods_done isn't a QC event). Should NOT use add-metadata.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "name": "nextflow-infer-from-path-troubleshoot",
+      "prompt": "My Nextflow CASETRACK_REGISTER process keeps failing with `Error: --analysis is required (or infer it with --infer-from-path)`. Inside the process I'm running `casetrack append --infer-from-path --overwrite` from the directory `results/samtools_sort/20260421_hg38_test/p17424_1/p17424_1_tumor/`, where I just placed a TSV named `sort_summary.tsv`. My casetrack.toml has [analyses.samtools_sort] with summary_tsv = 'samtools_sort_summary.tsv'. What's wrong and how do I fix it?",
+      "expected_output": "Agent identifies the filename mismatch: the file on disk is `sort_summary.tsv` but the TOML declares `summary_tsv = 'samtools_sort_summary.tsv'`. --infer-from-path looks for the declared filename. Fix is to rename the file (or update the TOML). Bonus points if agent notes the path also looks valid against [layout.path_templates.specimen].",
+      "files": []
+    },
+    {
+      "id": 6,
+      "name": "consent-revoked-cascade",
+      "prompt": "Patient p17424_3 in my project at /data1/greenbab/users/ahunos/casetrack_projects/project_17424 just withdrew consent on 2026-04-22 (IRB ref: ATLL-IRB-2026-007). I need to record this in casetrack so all their specimens and assays disappear from analysis queries automatically. How do I do this and what are the implications? Show me the exact command and explain the cascade.",
+      "expected_output": "Agent uses `casetrack censor --project-dir <path> --level patient --id p17424_3 --kind consent_revoked --reason 'consent withdrawn 2026-04-22 IRB ATLL-IRB-2026-007' --withdrawal-date 2026-04-22`. Explains _active view cascades: any specimen/assay under p17424_3 is automatically excluded from all queries against _active. Mentions reversal requires --ethics-override --yes.",
+      "files": []
+    },
+    {
+      "id": 7,
+      "name": "cross-project-cohort-overlap",
+      "prompt": "I have 3 separate casetrack projects on this machine using overlapping patient cohorts: project_17424 (ONT WGS), and hypothetically project_18001 (RNA-seq) and project_18205 (CITE-seq). I want to find which patient_ids exist in all 3 projects. How would I do this with casetrack? Walk me through the discovery and the queries.",
+      "expected_output": "Agent uses `mcp__casetrack__casetrack_list_projects` first to enumerate registered projects, then uses `mcp__casetrack__casetrack_query` against each project to get patient_ids. Notes that the comparison is done client-side (each casetrack project has its own DB; there's no cross-project JOIN built in). Suggests scripting it via Python or shell. Should NOT invent a `casetrack cohort-overlap` command if it doesn't exist; should mention `casetrack cohort` if it knows it.",
+      "files": []
     }
   ]
 }
