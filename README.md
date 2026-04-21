@@ -69,11 +69,13 @@ Three recommended patterns by user shape:
 ## Contents
 
 - [Install](#install)
+- [The three-level hierarchy](#the-three-level-hierarchy)
 - [Quick start — v0.3 project mode (recommended)](#quick-start--v03-project-mode-recommended)
 - [Quick start — v0.2 flat mode (deprecated)](#quick-start--v02-flat-mode-deprecated)
 - [Commands](#commands)
 - [Project identity & registry (v0.6+)](#project-identity--registry-v06)
 - [The three-phase SLURM pattern](#the-three-phase-slurm-pattern)
+- [Driving the next batch from the DB](#driving-the-next-batch-from-the-db)
 - [Concurrency & safety rails](#concurrency--safety-rails)
 - [Provenance](#provenance)
 - [Nextflow integration](#nextflow-integration)
@@ -136,6 +138,34 @@ if you already have a layout. Full design: `docs/proposals/0003-init-scaffold.md
 > `ALTER TABLE`. Existing rows are preserved; `schema_v` bumps. Skipping
 > this step produces `sqlite3.OperationalError: no such column: <name>` on
 > the next `add-metadata` or `append`.
+
+## The three-level hierarchy
+
+Every project mode database has exactly three levels with strict foreign-key
+parentage:
+
+```
+patients           ← clinical/demographic metadata
+                     (sex, cohort, sample_id, internal_id, timepoint, age…)
+  └── specimens    ← biological sample (tumor, normal, cell line, …)
+                     most analysis tracking lives here
+        └── assays ← individual sequencing run
+                     per-run basecalling + QC lives here
+```
+
+**Which level does my analysis go on?** Match the *granularity of the input*:
+
+| Analysis type            | Typical level | Examples                                  |
+|--------------------------|---------------|-------------------------------------------|
+| Per-run                  | `assay`       | basecalling (dorado), per-run flagstat    |
+| Per-sample / per-merge   | `specimen`    | sort, merge, modkit pileup/callmods, SV   |
+| Per-patient / cohort-wide| `patient`     | family-level SV, cohort-level summary     |
+
+Each `[analyses.<tool>]` block in `casetrack.toml` declares which level it
+writes to; that determines which table grows the `{tool}_done` timestamp and
+the `{column_prefix}_*` result columns. You can register entities at any
+level (patient → specimen → assay; FK enforces order) and you can add new
+analyses to existing levels by editing TOML and running `casetrack schema apply`.
 
 ## Quick start — v0.3 project mode (recommended)
 
@@ -252,6 +282,11 @@ and exact SQL.
 | `qc-history`     | **v0.4** — full QC event history for one entity (or all active)              |
 | `migrate-qc`     | **v0.4** — one-shot: add QC schema + port a legacy `qc_pass` column          |
 | `cohort`         | **v0.4** — cohort readiness summary + paired-design view (`--pair-by`)       |
+| `migrate-lineage`| **v0.6** — add assay lineage + batch tables to an existing project           |
+| `add-batch`      | **v0.6** — register a sequencing/library-prep batch (manual or `--from-tsv`) |
+| `link-sources`   | **v0.6** — record which run assays fed a specimen or merged assay (Mode A: run→merged-assay; Mode B: run→specimen) |
+| `project`        | **v0.7** — project lifecycle (`set-status`, `status`) — active / complete / archived |
+| `migrate-status` | **v0.7** — add lifecycle `status` column to `project_meta` (idempotent)       |
 
 `casetrack <cmd> --help` for the full option list on any subcommand.
 
@@ -689,7 +724,11 @@ action — including QC — is replayable via `casetrack recover`.
 
 ## Nextflow integration
 
-Reusable DSL2 module in `examples/nextflow/casetrack.nf`:
+Two integration paths, depending on how much pipeline you bring of your own.
+
+### Drop-in module — `examples/nextflow/casetrack.nf`
+
+For pipelines you've already written, include the standalone DSL2 module:
 
 ```groovy
 include { casetrack_append } from './modules/casetrack.nf'
@@ -700,16 +739,43 @@ workflow {
 }
 ```
 
-See `examples/nextflow/README.md` for:
-- the full override matrix (`casetrack_manifest`, `casetrack_key`, `casetrack_bin`, …)
-- a ready-to-run example pipeline
-- profiles for `standard` / `slurm` / `apptainer` / `test`
-- three integration patterns (standalone, `afterScript`, collect-and-batch)
+See `examples/nextflow/README.md` for the full override matrix
+(`casetrack_manifest`, `casetrack_key`, `casetrack_bin`, …), a ready-to-run
+example pipeline, profiles for `standard` / `slurm` / `apptainer` / `test`, and
+three integration patterns (standalone, `afterScript`, collect-and-batch). The
+`casetrack_append_project` process inherits v0.4's strict-refuse + autoflag
+automatically — nothing to configure. If a summarize step emits a TSV with
+`qc_pass=False`, the append step turns it into a `qc_events` row in the same
+transaction.
 
-The `casetrack_append_project` process inherits v0.4's strict-refuse +
-autoflag automatically — nothing to configure. If a summarize step emits a
-TSV with `qc_pass=False`, the append step in the pipeline turns it into a
-`qc_events` row in the same transaction.
+### Reusable subworkflows — [`casetrack-nf-subworkflows`](https://github.com/sahuno/casetrack-nf-subworkflows)
+
+For new pipelines built around tracked nf-core modules (samtools sort, dorado
+basecaller, modkit callmods, sniffles2, etc.), the
+[`casetrack-nf-subworkflows`](https://github.com/sahuno/casetrack-nf-subworkflows)
+repo ships ready-made wrappers. Each subworkflow follows the 3-phase contract
+(run tool → summarize → register) and uses the canonical
+`CASETRACK_REGISTER` process:
+
+```groovy
+include { SAMTOOLS_SORT_TRACKED } from 'casetrack-nf-subworkflows/subworkflows/local/samtools_sort_tracked'
+
+workflow {
+    SAMTOOLS_SORT_TRACKED(ch_bam)
+    // CASETRACK_REGISTER fires automatically with --infer-from-path --overwrite
+    // and writes `samtools_sort_done` + `sort_*` columns to the specimen row.
+}
+```
+
+Required pipeline params: `--casetrack_project_dir`, `--run_tag`,
+`--casetrack_level`. The summary TSV lands at the path declared in
+`[layout.path_templates]` and `casetrack append --infer-from-path` recovers
+tool / run_tag / patient / specimen / assay from the path.
+
+Implementation notes (`executor 'local'` + `maxForks 1` for the register step,
+publishDir conventions for `data/processed/`, common pitfalls): see the
+subworkflows repo's README and `references/nextflow-integration.md` in the
+shipped Claude Code skill.
 
 ## Claude Code integration
 
