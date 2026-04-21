@@ -113,8 +113,10 @@ cohort/
 ├── casetrack.{toml,db}           # schema + DB (DB gitignored)
 ├── provenance.jsonl              # append-only audit log
 ├── .gitignore                    # excludes DB, raw data, sifs, large outputs
-├── data/{raw,ref,validation}/    # immutable inputs, references, truth sets
-├── results/                      # analysis outputs (pipelines create subdirs)
+├── data/{raw,processed,ref,validation}/  # raw=immutable inputs;
+│                                         # processed/{genome}/{patient}/{assay}/  ← persistent BAMs/VCFs (DB-indexed);
+│                                         # ref=reference genome+indexes; validation=truth sets
+├── results/                      # analysis outputs (per-run summary TSVs, trace files)
 ├── scripts/                      # top-level analysis scripts (01_, 02_, …)
 ├── docs/{research,hypothesis}/   # literature notes, analysis plans
 ├── manuscript/
@@ -128,6 +130,13 @@ Every leaf ships a `.gitkeep` so the tree survives `git clone`. Re-running
 existing files. Opt out with `casetrack init --project-dir <path> --bare`
 if you already have a layout. Full design: `docs/proposals/0003-init-scaffold.md`.
 
+> **Whenever you edit `casetrack.toml`** (add a column, declare a new
+> `[analyses.<tool>]`, change an enum), run `casetrack schema apply
+> --project-dir .` to apply the change to the SQLite DB via non-destructive
+> `ALTER TABLE`. Existing rows are preserved; `schema_v` bumps. Skipping
+> this step produces `sqlite3.OperationalError: no such column: <name>` on
+> the next `add-metadata` or `append`.
+
 ## Quick start — v0.3 project mode (recommended)
 
 ```bash
@@ -138,15 +147,27 @@ casetrack init --project-dir cohort/ --from-template hgsoc \
     --project-id hgsoc-2026 \
     --project-name "HGSOC methylation cohort, spring 2026"
 
-# 2. Register a few rows. IDs are validated against
-#    \A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z — typos with whitespace, shell
-#    metacharacters, or path separators fail loudly here, not three jobs in.
+# 2a. Register one row at a time. IDs are validated against
+#     \A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z — typos with whitespace, shell
+#     metacharacters, or path separators fail loudly here, not three jobs in.
 casetrack register --project hgsoc-2026 --level patient  --id HGSOC002 \
     --meta 'age=55,sex=F,brca_status=brca1'
 casetrack register --project hgsoc-2026 --level specimen --id HGSOC002-normal \
     --parent HGSOC002 --meta 'tissue_site=normal'
 casetrack register --project hgsoc-2026 --level assay    --id HGSOC002-normal-ONT-RNA \
     --parent HGSOC002-normal --meta 'assay_type=ONT'
+
+# 2b. RECOMMENDED for real cohorts — bulk-register from a TSV. One TSV per
+#     level, columns matching [levels.<level>.columns] in casetrack.toml.
+#     `--allow-new --yes` is the double opt-in to admit IDs not yet in the DB;
+#     parent-FK enforcement means patients must land before specimens, before assays.
+casetrack add-metadata --project hgsoc-2026 --level patient \
+    --metadata patients.tsv  --allow-new --yes
+casetrack add-metadata --project hgsoc-2026 --level specimen \
+    --metadata specimens.tsv --allow-new --yes
+casetrack add-metadata --project hgsoc-2026 --level assay \
+    --metadata assays.tsv    --allow-new --yes
+# Use --overwrite (without --allow-new) to update existing rows in place.
 
 # 3. At the end of a SLURM job, append the per-sample summary TSV.
 #    If the TSV has qc_pass=False, casetrack auto-emits a qc_events row
@@ -246,7 +267,10 @@ casetrack append \
 ```
 - Smart-merge: if the analysis columns already exist from a sibling SLURM task,
   NaN cells get filled in without `--overwrite`.
-- `--overwrite` replaces existing values for the target columns.
+- `--overwrite` replaces existing values for the target columns. **Required for
+  reruns** — without it, fill-only is the default and previously populated cells
+  silently win over the fresh run. The most common cause of "I patched the
+  summarize script and re-ran but the DB still shows the old buggy values."
 - `--allow-new --yes` admits sample IDs not in the manifest. Without `--yes`,
   it previews the new IDs and refuses to commit — prevents typo'd IDs from
   silently growing the manifest.
@@ -542,6 +566,59 @@ templates, and fills `--project-dir`, `--level`, `--analysis`,
 run_tag is injected as `{prefix}_run_tag` in the target row so re-runs can
 be compared later via `casetrack query`. Explicit flags still override.
 
+## Driving the next batch from the DB
+
+casetrack is at its most useful when it drives Nextflow / Snakemake samplesheets
+**dynamically**. The DB already knows what's done and what's pending; query it
+to produce the next batch. This avoids hand-curated samplesheets that drift
+from reality.
+
+The pattern depends on storing input file paths on the entity row — usually
+`pod5_path` and/or `bam_path` on `assays`. Add them to your TOML:
+
+```toml
+[levels.assay.columns]
+assay_id    = { type = "TEXT", required = true, unique = true }
+specimen_id = { type = "TEXT", required = true }
+condition   = { type = "TEXT" }   # tumor / normal / etc.
+pod5_path   = { type = "TEXT" }   # raw signal — input to basecaller
+bam_path    = { type = "TEXT" }   # basecalled BAM — input to downstream tools
+```
+
+Then any tool that needs work to do queries the DB:
+
+```bash
+# All normals that are ready to basecall but haven't been
+casetrack query --project hgsoc-2026 --fmt csv --sql "
+  SELECT a.assay_id    AS sample,
+         p.patient_id  AS patient,
+         s.specimen_id AS specimen,
+         a.pod5_path   AS pod5_dir,
+         'hg38'        AS genome
+  FROM assays a
+  JOIN specimens s ON a.specimen_id = s.specimen_id
+  JOIN patients  p ON s.patient_id  = p.patient_id
+  WHERE a.condition = 'normal'
+    AND a.qc_status = 'pass'
+    AND a.dorado_basecaller_done IS NULL
+" > pending_normals.csv
+
+# Submit the pipeline
+nextflow run main.nf --input pending_normals.csv ...
+
+# Resubmit safely — Nextflow -resume skips completed tasks; casetrack
+# --overwrite (in CASETRACK_REGISTER) keeps the DB current. The pending
+# query shrinks on every run.
+```
+
+Why this works:
+- Censored samples (e.g. `qc_warn` for "pod5 rsync incomplete") are excluded
+  by `qc_status = 'pass'` (or by querying the `_active` view).
+- New samples added via `add-metadata` automatically appear in the next
+  pending query — no pipeline config to update.
+- The same pattern works at every level: pending sorts, pending pileups,
+  pending SV calls. Just swap the level and the `*_done` column name.
+
 ## Concurrency & safety rails
 
 - **SQLite WAL + `busy_timeout=30000`** in project mode (`BEGIN IMMEDIATE`
@@ -636,11 +713,39 @@ TSV with `qc_pass=False`, the append step in the pipeline turns it into a
 
 ## Claude Code integration
 
-Level 2 hook in `examples/claude/`: after a SLURM analysis finishes and calls
-`casetrack append`, a companion shell script invokes `claude --print`, captures a
-QC review as a second TSV, validates its shape, and appends it back as its own
-analysis (`cc_<analysis>_review`) — so the manifest carries both the raw numbers
-and an LLM verdict, fully traceable.
+Two integration points, both shipped in this repo.
+
+### Skill bundle — `.claude/skills/casetrack/`
+
+A Claude Code skill that teaches agents the canonical casetrack patterns:
+project init, TOML schema design, the `add-metadata` vs `append` distinction,
+the `--overwrite` rerun gotcha, the 3-phase analysis pattern, Nextflow
+`CASETRACK_REGISTER` integration, batch/incremental queries, and the QC event
+system.
+
+The skill is auto-discovered when Claude Code runs from any directory inside
+this repo. To use it from anywhere on your machine, symlink it into your global
+skills directory:
+
+```bash
+ln -s /path/to/casetrack/.claude/skills/casetrack ~/.claude/skills/
+```
+
+Inside the skill bundle:
+- `SKILL.md` — main entry point, < 500 lines
+- `references/patterns.md` — full pattern reference
+- `references/toml-example.md` — annotated complete TOML
+- `references/nextflow-integration.md` — `CASETRACK_REGISTER` + publishDir
+- `references/common-queries.md` — SQL recipes for samplesheets, progress, QC
+- `evals/evals.json` — 8 regression test scenarios
+
+### Post-analysis QC hook — `examples/claude/`
+
+Level 2 hook (flat-mode era, still works for v0.2 manifests): after a SLURM
+analysis finishes and calls `casetrack append`, a companion shell script
+invokes `claude --print`, captures a QC review as a second TSV, validates its
+shape, and appends it back as its own analysis (`cc_<analysis>_review`) — so
+the manifest carries both the raw numbers and an LLM verdict, fully traceable.
 
 ```bash
 export SAMPLE_ID ANALYSIS=modkit MANIFEST RESULTS_TSV=summary.tsv
@@ -661,12 +766,19 @@ cohort_v4/
 ├── .gitignore                      # excludes casetrack.db + -wal/-shm + exports/
 ├── data/
 │   ├── raw/                        # immutable inputs — never modified in place
+│   ├── processed/{genome}/{patient_id}/{assay_id}/   # persistent biological outputs
+│   │                                                  # — sorted BAMs, called VCFs, etc.
+│   │                                                  # Filenames carry genome tag:
+│   │                                                  # {assay_id}.{genome}.sorted.bam
+│   │                                                  # The DB stores absolute paths to
+│   │                                                  # these files so downstream tools
+│   │                                                  # find them by query, not by scan.
 │   ├── ref/                        # reference genome + annotations + indexes
 │   └── validation/                 # truth sets / ground-truth BEDs / benchmark VCFs
-├── results/
-│   ├── modkit/{assay_id}/
-│   ├── tldr/{assay_id}/
-│   └── qc/{assay_id}/
+├── results/                        # analysis bookkeeping — summary TSVs, trace files
+│   ├── modkit/{run_tag}/{patient_id}/{specimen_id}/{assay_id}/
+│   ├── samtools_sort/{run_tag}/{patient_id}/{specimen_id}/
+│   └── sniffles2/{run_tag}/{patient_id}/{specimen_id}/
 ├── scripts/
 │   ├── summarize_modkit.py         # distils raw output → assay TSV
 │   ├── summarize_tldr.py           # emits qc_pass / qc_fail_reason optionally
