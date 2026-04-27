@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}{{ patient.patient_id }} — {{ project_id }}{% endblock %}
+{% block crumbs %}<nav class="crumbs">
+  <a href="/">projects</a><span class="sep">›</span>
+  <a href="/p/{{ project_id }}" class="mono">{{ project_id }}</a><span class="sep">›</span>
+  <span class="mono">{{ patient.patient_id }}</span>
+</nav>{% endblock %}
+{% block body %}
+<h1 class="mono">{{ patient.patient_id }}</h1>
+<dl class="kv">
+  {% for k, v in patient.items() if k != 'patient_id' and v is not none %}
+    <dt>{{ k }}</dt><dd>{{ v }}</dd>
+  {% endfor %}
+</dl>
+
+{% if qc_events %}
+<h2>QC events on this patient</h2>
+{% for e in qc_events %}
+  <div class="qc-event kind-{{ e.kind }}{% if e.resolved_at %} resolved{% endif %}">
+    <div class="header">
+      <span class="level">{{ e.kind }}</span>
+      <span class="muted mono">{{ e.created_at }}</span>
+    </div>
+    <div class="reason">{{ e.reason }}</div>
+  </div>
+{% endfor %}
+{% endif %}
+
+<h2>Specimens</h2>
+{% for sp in specimens %}
+  <div class="card" style="margin-bottom: 16px;">
+    <h3 class="mono">{{ sp.specimen_id }}
+      <span class="muted" style="font-weight: normal;">
+        {{ sp.specimen_type or '' }}{% if sp.qc_status and sp.qc_status != 'pass' %} · QC {{ sp.qc_status }}{% endif %}
+      </span>
+    </h3>
+
+    <div class="muted" style="font-size: 12px;">
+      {% for k, v in sp.items() %}
+        {% if k.endswith('_done') %}
+          <span style="margin-right: 14px;">
+            <span class="mono">{{ k[:-5] }}</span>
+            {% if v %}<span style="color: var(--done);">●</span>{% else %}<span style="color: var(--pending);">◯</span>{% endif %}
+          </span>
+        {% endif %}
+      {% endfor %}
+    </div>
+
+    {% for e in sp.qc_events %}
+      <div class="qc-event kind-{{ e.kind }}{% if e.resolved_at %} resolved{% endif %}" style="margin-top: 10px;">
+        <div class="header">
+          <span class="level">{{ e.kind }}</span>
+          <span class="muted mono">{{ e.created_at }}</span>
+        </div>
+        <div class="reason">{{ e.reason }}</div>
+      </div>
+    {% endfor %}
+
+    {% if sp.assays %}
+      <h4 style="margin: 14px 0 6px 0;">Assays</h4>
+      <table class="data">
+        <thead>
+          <tr>
+            <th>assay_id</th>
+            <th>type</th>
+            <th>condition</th>
+            <th>chemistry</th>
+            <th>QC</th>
+            <th>analyses</th>
+            <th>actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for a in sp.assays %}
+            <tr>
+              <td class="mono">{{ a.assay_id }}</td>
+              <td>{{ a.assay_type or '' }}</td>
+              <td>{{ a.condition or '' }}</td>
+              <td>{{ a.chemistry or '' }}</td>
+              <td>{{ a.qc_status or '' }}</td>
+              <td class="mono" style="font-size: 12px;">
+                {% for k, v in a.items() if k.endswith('_done') %}
+                  {{ k[:-5] }}{% if v %}<span style="color: var(--done);">●</span>{% else %}<span style="color: var(--pending);">◯</span>{% endif %}{% if not loop.last %} · {% endif %}
+                {% endfor %}
+              </td>
+              <td>
+                {% if a.qc_status not in ('fail',) %}
+                <form class="inline" method="post" action="/p/{{ project_id }}/censor"
+                      onsubmit="return confirm('Censor {{ a.assay_id }} as qc_fail?');">
+                  <input type="hidden" name="level" value="assay">
+                  <input type="hidden" name="entity_id" value="{{ a.assay_id }}">
+                  <input type="hidden" name="kind" value="qc_fail">
+                  <input type="hidden" name="reason" value="manual via GUI">
+                  <input type="hidden" name="return_to" value="/p/{{ project_id }}/patient/{{ patient.patient_id }}">
+                  <button class="danger" type="submit">Censor</button>
+                </form>
+                {% endif %}
+                {% for e in a.qc_events if not e.resolved_at %}
+                  <form class="inline" method="post" action="/p/{{ project_id }}/uncensor"
+                        onsubmit="return confirm('Uncensor event {{ e.id }} on {{ a.assay_id }}?');">
+                    <input type="hidden" name="event_id" value="{{ e.id }}">
+                    <input type="hidden" name="reason" value="manual via GUI">
+                    <input type="hidden" name="return_to" value="/p/{{ project_id }}/patient/{{ patient.patient_id }}">
+                    <button class="muted" type="submit">Uncensor #{{ e.id }}</button>
+                  </form>
+                {% endfor %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </div>
+{% endfor %}
+{% endblock %}

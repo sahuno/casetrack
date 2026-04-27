@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}casetrack — projects{% endblock %}
+{% block body %}
+<h1>casetrack projects</h1>
+<div class="muted">Reading <span class="mono">~/.casetrack/registry.json</span></div>
+
+{% if not projects %}
+  <p class="muted">No registered projects. Run <span class="mono">casetrack projects register --project-dir ...</span> to add one.</p>
+{% else %}
+<table class="data" style="margin-top: 16px;">
+  <thead><tr><th>Project ID</th><th>Name</th><th>Path</th><th>Last seen</th></tr></thead>
+  <tbody>
+  {% for pid, info in projects.items() %}
+    <tr>
+      <td><a href="/p/{{ pid }}" class="mono">{{ pid }}</a></td>
+      <td>{{ info.name }}</td>
+      <td class="mono muted">{{ info.path }}</td>
+      <td class="mono muted">{{ info.last_seen }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

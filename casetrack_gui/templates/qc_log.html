@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}QC log — {{ project_id }}{% endblock %}
+{% block crumbs %}<nav class="crumbs">
+  <a href="/">projects</a><span class="sep">›</span>
+  <a href="/p/{{ project_id }}" class="mono">{{ project_id }}</a><span class="sep">›</span>
+  qc
+</nav>{% endblock %}
+{% block body %}
+<h1>QC events — {{ project_id }}</h1>
+<div class="metrics">
+  <div class="metric"><div class="value">{{ summary.qc.fail }}</div><div class="label">fail</div></div>
+  <div class="metric"><div class="value">{{ summary.qc.warn }}</div><div class="label">warn</div></div>
+  <div class="metric"><div class="value">{{ summary.qc.censored }}</div><div class="label">other censored</div></div>
+  <div class="metric"><div class="value">{{ events | length }}</div><div class="label">total rows</div></div>
+</div>
+
+<div class="layout-2col" style="grid-template-columns: 1fr 320px;">
+  <div>
+    {% if not events %}
+      <p class="muted">No QC events recorded.</p>
+    {% endif %}
+    {% for e in events %}
+      <div class="qc-event kind-{{ e.kind }}{% if e.resolved_at %} resolved{% endif %}">
+        <div class="header">
+          <span class="level">{{ e.level }} · {{ e.kind }}</span>
+          <span class="id mono">{{ e.entity_id }}</span>
+          <span class="muted mono">{{ e.created_at }}{% if e.created_by %} · {{ e.created_by }}{% endif %}</span>
+          {% if e.resolved_at %}
+            <span class="muted">resolved {{ e.resolved_at }} ({{ e.resolved_reason }})</span>
+          {% endif %}
+        </div>
+        <div class="reason">{{ e.reason }}</div>
+        {% if not e.resolved_at and e.kind != 'consent_revoked' %}
+        <form class="inline" method="post" action="/p/{{ project_id }}/uncensor" style="margin-top: 8px;">
+          <input type="hidden" name="event_id" value="{{ e.id }}">
+          <input type="hidden" name="reason" value="resolved via GUI">
+          <input type="hidden" name="return_to" value="/p/{{ project_id }}/qc">
+          <button class="muted" type="submit"
+                  onclick="return confirm('Resolve event #{{ e.id }} on {{ e.entity_id }}?');">
+            Resolve
+          </button>
+        </form>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <h2>Add event</h2>
+    <form class="stack" method="post" action="/p/{{ project_id }}/censor">
+      <label>Level
+        <select name="level" required>
+          <option value="patient">patient</option>
+          <option value="specimen">specimen</option>
+          <option value="assay" selected>assay</option>
+        </select>
+      </label>
+      <label>Entity ID <input name="entity_id" required></label>
+      <label>Kind
+        <select name="kind" required>
+          <option value="qc_fail">qc_fail</option>
+          <option value="qc_warn">qc_warn</option>
+          <option value="library_prep_failed">library_prep_failed</option>
+        </select>
+      </label>
+      <label>Reason <textarea name="reason" rows="3" required></textarea></label>
+      <input type="hidden" name="return_to" value="/p/{{ project_id }}/qc">
+      <button type="submit">Record event</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

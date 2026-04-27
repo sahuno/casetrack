@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}{{ project_id }} — casetrack{% endblock %}
+{% block crumbs %}<nav class="crumbs"><a href="/">projects</a><span class="sep">›</span><span class="mono">{{ project_id }}</span></nav>{% endblock %}
+{% block body %}
+<h1>{{ project_id }}</h1>
+<div class="muted mono">{{ project_dir }}</div>
+
+<div class="metrics">
+  <div class="metric"><div class="value">{{ summary.counts.patients or 0 }}</div><div class="label">patients</div></div>
+  <div class="metric"><div class="value">{{ summary.counts.specimens or 0 }}</div><div class="label">specimens</div></div>
+  <div class="metric"><div class="value">{{ summary.counts.assays or 0 }}</div><div class="label">assays</div></div>
+  <div class="metric"><div class="value">{{ summary.qc.fail }}</div><div class="label">QC fail</div></div>
+  <div class="metric"><div class="value">{{ summary.qc.warn }}</div><div class="label">QC warn</div></div>
+  <div class="metric"><div class="value">{{ summary.qc.censored }}</div><div class="label">censored</div></div>
+</div>
+
+<div class="layout-2col">
+  <div class="card">
+    <h2>{{ heatmap.row_level }} × analyses</h2>
+    {% if not heatmap.analyses %}
+      <p class="muted">No <span class="mono">*_done</span> columns yet on the {{ heatmap.row_level }} table.
+        Run an analysis (or the Nextflow CASETRACK_REGISTER hook) to populate them.</p>
+    {% else %}
+    <div style="overflow-x: auto;">
+    <table class="heatmap">
+      <thead>
+        <tr>
+          <th class="row-header">{{ heatmap.row_level[:-1] }}</th>
+          {% for a in heatmap.analyses %}<th>{{ a }}</th>{% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in heatmap.rows %}
+        <tr>
+          <th>
+            {% if row.parent_id %}
+              <a href="/p/{{ project_id }}/patient/{{ row.parent_id }}">{{ row.row_id }}</a>
+            {% else %}
+              <span class="mono">{{ row.row_id }}</span>
+            {% endif %}
+            {% if row.qc_status and row.qc_status not in ('pass', None) %}
+              <span class="muted" style="font-size: 11px;">[{{ row.qc_status }}]</span>
+            {% endif %}
+          </th>
+          {% for cell in row.cells %}
+            <td class="{{ cell.css_class }}" title="{{ cell.title }}">{{ cell.glyph }}</td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <div class="legend">
+      <span><span class="g">●</span>done</span>
+      <span><span class="g">◐</span>in-flight</span>
+      <span><span class="g">◯</span>pending</span>
+      <span><span class="g">⊘</span>failed</span>
+      <span><span class="g">⚠</span>warn</span>
+      <span><span class="g">—</span>n/a</span>
+      {% if heatmap.aggregated_child_level %}
+        <br><span class="muted">multi-glyph cells = aggregated across {{ heatmap.aggregated_child_level }}</span>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Next up</h2>
+    {% if not queue %}
+      <p class="muted">All tracked analyses complete. Add a new analysis (extend the schema TOML or push from a wrapper) to grow the heatmap.</p>
+    {% else %}
+      {% for q in queue %}
+      <div class="queue-item">
+        <div class="head">
+          <span class="name">{{ q.analysis }}</span>
+          <span class="count">{{ q.count }} pending</span>
+        </div>
+        <div class="ids">
+          {{ q.ids | join(', ') }}{% if q.more %} …+{{ q.more }} more{% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    {% endif %}
+
+    <h3 style="margin-top: 24px;">Active QC events</h3>
+    {% if not events %}
+      <p class="muted">None.</p>
+    {% else %}
+      {% for e in events[:5] %}
+      <div class="qc-event kind-{{ e.kind }}{% if e.resolved_at %} resolved{% endif %}">
+        <div class="header">
+          <span class="level">{{ e.level }}</span>
+          <span class="id"><a href="/p/{{ project_id }}/qc">{{ e.entity_id }}</a></span>
+          <span class="muted mono">{{ e.created_at }}</span>
+        </div>
+        <div class="reason">{{ e.reason }}</div>
+      </div>
+      {% endfor %}
+      <a href="/p/{{ project_id }}/qc">View full QC log →</a>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

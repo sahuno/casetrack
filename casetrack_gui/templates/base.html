@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}casetrack{% endblock %}</title>
+<link rel="stylesheet" href="/static/casetrack.css">
+</head>
+<body>
+{% block crumbs %}{% endblock %}
+{% if request.query_params.get('last_status') %}
+  <div class="flash {{ request.query_params.get('last_status') }}">
+    <strong>{{ 'Done' if request.query_params.get('last_status') == 'ok' else 'Failed' }}.</strong>
+    {% if request.query_params.get('last_msg') %}<pre>{{ request.query_params.get('last_msg') }}</pre>{% endif %}
+  </div>
+{% endif %}
+{% block body %}{% endblock %}
+</body>
+</html>

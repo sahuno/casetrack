@@ -9,7 +9,8 @@ setup(
     author="Samuel Ahuno",
     author_email="sahuno@mskcc.org",
     py_modules=["casetrack"],
-    packages=["casetrack_qc", "casetrack_mcp", "casetrack_lineage", "casetrack_lifecycle"],
+    packages=["casetrack_qc", "casetrack_mcp", "casetrack_lineage", "casetrack_lifecycle", "casetrack_gui"],
+    package_data={"casetrack_gui": ["templates/*.html", "static/*"]},
     install_requires=[
         "pandas>=1.5.0",
         "duckdb>=0.9",
@@ -21,7 +22,12 @@ setup(
         "parquet": ["pyarrow>=10.0"],
         # v0.6 Part B: optional MCP server for AI-agent integration.
         "mcp": ["mcp>=1.0"],
-        "all": ["openpyxl>=3.0", "pyarrow>=10.0", "mcp>=1.0"],
+        # v0.8: optional operator GUI (FastAPI + Jinja2).
+        "gui": ["fastapi>=0.110", "jinja2>=3.1", "uvicorn>=0.27", "starlette>=0.36"],
+        "all": [
+            "openpyxl>=3.0", "pyarrow>=10.0", "mcp>=1.0",
+            "fastapi>=0.110", "jinja2>=3.1", "uvicorn>=0.27", "starlette>=0.36",
+        ],
     },
     entry_points={
         "console_scripts": [
