@@ -20,13 +20,14 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from casetrack_gui import heatmap as heatmap_mod
 from casetrack_gui import mutations
+from casetrack_gui.auth import AuthConfig
 from casetrack_gui.introspect import introspect
 
 
@@ -155,8 +156,18 @@ def _patient_drill(conn: sqlite3.Connection, patient_id: str) -> dict:
     }
 
 
-def create_app(*, registry_path_override: Path | None = None) -> FastAPI:
-    """Build the FastAPI app. ``registry_path_override`` is for tests."""
+def create_app(
+    *,
+    registry_path_override: Path | None = None,
+    auth_config: AuthConfig | None = None,
+) -> FastAPI:
+    """Build the FastAPI app.
+
+    ``registry_path_override`` and ``auth_config`` are both optional —
+    tests pass ``auth_config=None`` to skip the basic-auth gate; the CLI
+    refuses to start without credentials unless the operator passes
+    ``--no-auth``.
+    """
     app = FastAPI(title="casetrack GUI", docs_url=None, redoc_url=None)
     if _STATIC.exists():
         app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
@@ -166,11 +177,15 @@ def create_app(*, registry_path_override: Path | None = None) -> FastAPI:
         # of the process — tests use TestClient in-process which is fine.
         os.environ["CASETRACK_REGISTRY"] = str(registry_path_override)
 
+    auth_deps: list = []
+    if auth_config is not None:
+        auth_deps = [Depends(auth_config.make_dependency())]
+
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/", response_class=HTMLResponse)
+    @app.get("/", response_class=HTMLResponse, dependencies=auth_deps)
     def projects_index(request: Request) -> Any:
         projects = _load_registry()
         return _TEMPLATES.TemplateResponse(
@@ -178,7 +193,7 @@ def create_app(*, registry_path_override: Path | None = None) -> FastAPI:
             {"projects": projects},
         )
 
-    @app.get("/p/{project_id}", response_class=HTMLResponse)
+    @app.get("/p/{project_id}", response_class=HTMLResponse, dependencies=auth_deps)
     def project_home(request: Request, project_id: str) -> Any:
         project_dir = _resolve_project(project_id)
         conn = _connect(project_dir)
@@ -203,7 +218,7 @@ def create_app(*, registry_path_override: Path | None = None) -> FastAPI:
             },
         )
 
-    @app.get("/p/{project_id}/patient/{pid}", response_class=HTMLResponse)
+    @app.get("/p/{project_id}/patient/{pid}", response_class=HTMLResponse, dependencies=auth_deps)
     def patient_view(request: Request, project_id: str, pid: str) -> Any:
         project_dir = _resolve_project(project_id)
         conn = _connect(project_dir)
@@ -217,7 +232,7 @@ def create_app(*, registry_path_override: Path | None = None) -> FastAPI:
             {"project_id": project_id, "shape": shape, **data},
         )
 
-    @app.get("/p/{project_id}/qc", response_class=HTMLResponse)
+    @app.get("/p/{project_id}/qc", response_class=HTMLResponse, dependencies=auth_deps)
     def qc_log(request: Request, project_id: str) -> Any:
         project_dir = _resolve_project(project_id)
         conn = _connect(project_dir)
@@ -236,7 +251,7 @@ def create_app(*, registry_path_override: Path | None = None) -> FastAPI:
             },
         )
 
-    @app.post("/p/{project_id}/censor")
+    @app.post("/p/{project_id}/censor", dependencies=auth_deps)
     def censor_action(
         project_id: str,
         level: str = Form(...),
@@ -256,7 +271,7 @@ def create_app(*, registry_path_override: Path | None = None) -> FastAPI:
             status_code=303,
         )
 
-    @app.post("/p/{project_id}/uncensor")
+    @app.post("/p/{project_id}/uncensor", dependencies=auth_deps)
     def uncensor_action(
         project_id: str,
         event_id: int = Form(...),
@@ -281,8 +296,13 @@ def create_app(*, registry_path_override: Path | None = None) -> FastAPI:
     return app
 
 
-def serve(host: str, port: int, registry_path: Path | None = None) -> None:
+def serve(
+    host: str,
+    port: int,
+    registry_path: Path | None = None,
+    auth_config: AuthConfig | None = None,
+) -> None:
     """Run uvicorn in the foreground. Blocks."""
     import uvicorn
-    app = create_app(registry_path_override=registry_path)
+    app = create_app(registry_path_override=registry_path, auth_config=auth_config)
     uvicorn.run(app, host=host, port=port, log_level="info")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 
@@ -23,6 +24,69 @@ def build_gui_subparsers(subparsers) -> None:
         "--registry",
         help="Override ~/.casetrack/registry.json (also honors $CASETRACK_REGISTRY)",
     )
+    # ── auth ────────────────────────────────────────────────────────────────
+    p.add_argument(
+        "--username",
+        help="Browser login username. Default: $CASETRACK_GUI_USER or 'operator'.",
+    )
+    p.add_argument(
+        "--password-file",
+        help="Path to a file whose first line is the password (preferred over "
+             "$CASETRACK_GUI_PASSWORD — keeps the password out of `ps`).",
+    )
+    p.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="Disable HTTP Basic auth. Only safe on a trusted host with no other "
+             "users. By default the GUI refuses to start without credentials.",
+    )
+
+
+def _resolve_auth(args: argparse.Namespace):
+    """Return (AuthConfig | None). None means the operator opted out."""
+    from casetrack_gui.auth import AuthConfig
+
+    if getattr(args, "no_auth", False):
+        if args.host != "127.0.0.1":
+            print(
+                f"[casetrack gui] WARNING: --no-auth with --host {args.host} exposes the "
+                f"GUI without authentication. Reachable from anyone who can connect to "
+                f"port {args.port} on this host.",
+                file=sys.stderr,
+            )
+        return None
+
+    username = (
+        getattr(args, "username", None)
+        or os.environ.get("CASETRACK_GUI_USER")
+        or "operator"
+    )
+
+    password: str | None = None
+    pw_file = (
+        getattr(args, "password_file", None)
+        or os.environ.get("CASETRACK_GUI_PASSWORD_FILE")
+    )
+    if pw_file:
+        path = Path(pw_file).expanduser()
+        if not path.exists():
+            raise SystemExit(f"[casetrack gui] --password-file not found: {path}")
+        password = path.read_text().splitlines()[0].strip() if path.read_text().strip() else ""
+        if not password:
+            raise SystemExit(f"[casetrack gui] --password-file is empty: {path}")
+    else:
+        password = os.environ.get("CASETRACK_GUI_PASSWORD")
+
+    if not password:
+        raise SystemExit(
+            "[casetrack gui] No password configured. Set one of:\n"
+            "  • CASETRACK_GUI_PASSWORD=<your_pw> casetrack gui ...\n"
+            "  • casetrack gui --password-file ~/.casetrack/gui_password\n"
+            "  • casetrack gui --no-auth   (only on a trusted single-user host)\n"
+            f"Username defaults to {username!r} (override with --username or $CASETRACK_GUI_USER)."
+        )
+
+    return AuthConfig(username=username, password=password)
 
 
 def cmd_gui(args: argparse.Namespace) -> None:
@@ -34,10 +98,19 @@ def cmd_gui(args: argparse.Namespace) -> None:
             f"(missing: {e.name})"
         ) from e
 
+    auth_config = _resolve_auth(args)
+
     registry = Path(args.registry) if getattr(args, "registry", None) else None
     if registry:
         os.environ["CASETRACK_REGISTRY"] = str(registry)
-    serve(host=args.host, port=args.port, registry_path=registry)
+
+    if auth_config is not None:
+        print(
+            f"[casetrack gui] HTTP Basic auth enabled — username={auth_config.username!r}. "
+            f"Open http://{args.host}:{args.port}/ in your browser.",
+            file=sys.stderr,
+        )
+    serve(host=args.host, port=args.port, registry_path=registry, auth_config=auth_config)
 
 
 def gui_command_dispatch() -> dict:
