@@ -113,5 +113,37 @@ def cmd_gui(args: argparse.Namespace) -> None:
     serve(host=args.host, port=args.port, registry_path=registry, auth_config=auth_config)
 
 
+def build_snapshot_subparsers(subparsers) -> None:
+    p = subparsers.add_parser(
+        "snapshot",
+        help="[v0.8] Export a self-contained HTML snapshot of a project for PI consumption.",
+    )
+    p.add_argument(
+        "--project-id",
+        required=True,
+        help="Project ID (must be registered in ~/.casetrack/registry.json).",
+    )
+    p.add_argument(
+        "--output",
+        required=True,
+        help="Directory to write snapshot files into (created if absent).",
+    )
+    p.add_argument(
+        "--project-dir",
+        help="Override registry lookup — use this project directory directly.",
+    )
+
+
+def cmd_snapshot(args: argparse.Namespace) -> None:
+    try:
+        from casetrack_gui.snapshot import cmd_snapshot as _cmd_snapshot
+    except ImportError as e:
+        raise SystemExit(
+            f"casetrack snapshot requires the optional 'gui' extras: pip install -e '.[gui]'\n"
+            f"(missing: {getattr(e, 'name', e)})"
+        ) from e
+    _cmd_snapshot(args)
+
+
 def gui_command_dispatch() -> dict:
-    return {"gui": cmd_gui}
+    return {"gui": cmd_gui, "snapshot": cmd_snapshot}

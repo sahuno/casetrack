@@ -7946,17 +7946,23 @@ Examples:
     from casetrack_lifecycle.cli import build_lifecycle_subparsers as _build_lifecycle_subparsers
     _build_lifecycle_subparsers(subparsers)
 
-    # ── v0.8 GUI subcommand (casetrack gui --port 8765) ──
+    # ── v0.8 GUI + snapshot subcommands ──
     # Optional: only registered when the casetrack_gui package is importable.
     # That keeps the core CLI working even when the source tree isn't on
     # sys.path (e.g. the installed `casetrack` console script invoked from
     # an unrelated cwd) or when the optional FastAPI deps are missing.
     try:
-        from casetrack_gui.cli import build_gui_subparsers as _build_gui_subparsers
+        from casetrack_gui.cli import (
+            build_gui_subparsers as _build_gui_subparsers,
+            build_snapshot_subparsers as _build_snapshot_subparsers,
+        )
     except ImportError:
         _build_gui_subparsers = None
+        _build_snapshot_subparsers = None
     if _build_gui_subparsers is not None:
         _build_gui_subparsers(subparsers)
+    if _build_snapshot_subparsers is not None:
+        _build_snapshot_subparsers(subparsers)
 
     args = parser.parse_args()
 
