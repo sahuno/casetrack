@@ -84,6 +84,7 @@
                 {% endfor %}
               </td>
               <td>
+                {% if not snapshot %}
                 {% if a.qc_status not in ('fail',) %}
                 <form class="inline" method="post" action="/p/{{ project_id }}/censor"
                       onsubmit="return confirm('Censor {{ a.assay_id }} as qc_fail?');">
@@ -104,6 +105,7 @@
                     <button class="muted" type="submit">Uncensor #{{ e.id }}</button>
                   </form>
                 {% endfor %}
+                {% endif %}
               </td>
             </tr>
           {% endfor %}

@@ -30,7 +30,7 @@
           {% endif %}
         </div>
         <div class="reason">{{ e.reason }}</div>
-        {% if not e.resolved_at and e.kind != 'consent_revoked' %}
+        {% if not snapshot and not e.resolved_at and e.kind != 'consent_revoked' %}
         <form class="inline" method="post" action="/p/{{ project_id }}/uncensor" style="margin-top: 8px;">
           <input type="hidden" name="event_id" value="{{ e.id }}">
           <input type="hidden" name="reason" value="resolved via GUI">
@@ -45,6 +45,7 @@
     {% endfor %}
   </div>
 
+  {% if not snapshot %}
   <div class="card">
     <h2>Add event</h2>
     <form class="stack" method="post" action="/p/{{ project_id }}/censor">
@@ -68,5 +69,6 @@
       <button type="submit">Record event</button>
     </form>
   </div>
+  {% endif %}
 </div>
 {% endblock %}
