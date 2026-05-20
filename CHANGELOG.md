@@ -4,6 +4,30 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Cohort-level artifacts — a first-class home for analysis outputs that span many
+samples (joint-genotyped VCFs, panels-of-normals, cohort matrices). See
+[proposal 0009](docs/proposals/0009-cohort-level-artifacts.md).
+
+### Added
+
+- **`cohort_artifacts` + `cohort_artifact_inputs` tables** — additive sibling
+  tables (the `qc_events` pattern), created by `casetrack init`; the three-level
+  core is untouched. One row per cohort output, keyed by `(analysis, run_tag)`,
+  with a many-to-many join to contributing `assay_id`s. The
+  4th-hierarchy-level alternative was rejected (proposal 0009 §7).
+- **`casetrack append-cohort`** — register a cohort artifact + its assay lineage
+  in one transaction (`--inputs a,b` or `--inputs-from FILE`, optional `--stats`
+  JSON and `--checksum`). Writes an `action='append_cohort'` provenance entry.
+  A distinct `run_tag` gives v1/v2 of a re-genotyping run separate identity.
+- **`casetrack cohort-artifacts`** — list artifacts with **read-time staleness**:
+  an artifact is flagged `STALE` when any contributing assay is currently
+  censored or consent-revoked, derived live from the QC/consent cascade
+  (proposal 0002 §4.4) with no stored flag. `--stale-only`, `--fmt table|tsv|json`.
+- **`casetrack migrate-cohort`** — additive migration to create the two tables on
+  a pre-0009 project (`--dry-run` supported).
+
 ## [0.5.0] — 2026-04-18
 
 Tool-first results directory convention + one-flag `append` via path inference.
