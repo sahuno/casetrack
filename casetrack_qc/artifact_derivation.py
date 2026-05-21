@@ -117,9 +117,64 @@ class LineageNode:
         raise DerivationError(f"unknown node scope {self.scope!r}")
 
 
+# ── edges + cycle prevention ──────────────────────────────────────────────────
+
+def list_edges(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT down_node, up_node, recorded_at, transaction_id "
+        "FROM artifact_derivation ORDER BY down_node, up_node"
+    ).fetchall()
+    return [{"down_node": d, "up_node": u, "recorded_at": r, "transaction_id": t}
+            for (d, u, r, t) in rows]
+
+
+def upstream_nodes(conn: sqlite3.Connection, node: str) -> list[str]:
+    """Direct artifact_derivation upstreams of *node* (one hop, 0011 edges only)."""
+    return [u for (u,) in conn.execute(
+        "SELECT up_node FROM artifact_derivation WHERE down_node = ?", (node,)
+    ).fetchall()]
+
+
+def _reaches(conn: sqlite3.Connection, start: str, target: str) -> bool:
+    """True if *target* is reachable walking up_node edges from *start* (0011 only)."""
+    seen: set[str] = set()
+    stack = [start]
+    while stack:
+        cur = stack.pop()
+        if cur == target:
+            return True
+        if cur in seen:
+            continue
+        seen.add(cur)
+        stack.extend(upstream_nodes(conn, cur))
+    return False
+
+
+def record_edge(conn: sqlite3.Connection, *, down: str, up: str,
+                transaction_id: str, recorded_at: str | None = None) -> None:
+    """Record one derived-from edge (down derives from up). Idempotent.
+
+    Validates both node-refs and refuses an edge that would create a cycle in
+    the artifact_derivation graph (0011 §6.4).
+    """
+    LineageNode.parse(down)  # validate
+    LineageNode.parse(up)
+    if down == up or _reaches(conn, up, down):
+        raise DerivationError(
+            f"refusing edge {down} <- {up}: would create a derivation cycle")
+    if recorded_at is None:
+        recorded_at = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    conn.execute(
+        "INSERT OR IGNORE INTO artifact_derivation "
+        "(down_node, up_node, recorded_at, transaction_id) VALUES (?, ?, ?, ?)",
+        (down, up, recorded_at, transaction_id),
+    )
+
+
 __all__ = [
     "TIMESTAMP_FMT", "NODE_SCOPES", "DerivationError",
     "artifact_derivation_ddl", "artifact_derivation_indexes",
     "derivation_schema_exists", "ensure_derivation_schema",
     "LineageNode",
+    "list_edges", "upstream_nodes", "record_edge",
 ]
