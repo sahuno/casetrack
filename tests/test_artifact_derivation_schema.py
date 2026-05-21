@@ -38,6 +38,7 @@ def test_lineage_node_fields():
 
 
 def test_lineage_node_rejects_malformed():
-    for bad in ("", "bogus:x", "cohort:noatsign", "reference:", "analysis:only/two"):
+    for bad in ("", "bogus:x", "cohort:noatsign", "reference:", "analysis:only/two",
+                "analysis:patient/ /clair3"):
         with pytest.raises(ad.DerivationError):
             ad.LineageNode.parse(bad)

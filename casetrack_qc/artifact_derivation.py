@@ -15,11 +15,11 @@ Author: Samuel Ahuno (ekwame001@gmail.com)
 """
 from __future__ import annotations
 
-import datetime
+import datetime  # noqa: F401  used by record_edge (Task 2)
 import sqlite3
 from dataclasses import dataclass
 
-TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S"
+TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S"  # used by record_edge (Task 2)
 NODE_SCOPES = ("cohort", "reference", "analysis")
 
 
@@ -60,7 +60,7 @@ def derivation_schema_exists(conn: sqlite3.Connection) -> bool:
 
 
 def ensure_derivation_schema(conn: sqlite3.Connection) -> list[str]:
-    """Create the artifact_derivation table + indexes. Idempotent."""
+    """Create the artifact_derivation table + indexes. Idempotent. Returns executed SQL."""
     if _table_exists(conn, "artifact_derivation"):
         return []
     executed = [artifact_derivation_ddl()]
@@ -100,7 +100,7 @@ class LineageNode:
             return cls(scope="reference", ref_key=payload)
         if scope == "analysis":
             parts = payload.split("/")
-            if len(parts) != 3 or not all(parts):
+            if len(parts) != 3 or not all(p.strip() for p in parts):
                 raise DerivationError(
                     f"analysis node-ref needs <level>/<entity_id>/<analysis>: {s!r}")
             return cls(scope="analysis", entity_level=parts[0],
