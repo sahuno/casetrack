@@ -169,3 +169,80 @@ def test_all_derived_stale_listing(tmp_path):
     stale = ad.all_derived_stale(conn)
     nodes = {r["node"] for r in stale if r["state"] == "STALE"}
     assert "cohort:annot@v1" in nodes
+
+
+# ── Task 3 review fixes: cycle-safety + cross-table cycle guard + dedup ───────
+
+
+def _raw_edge(conn, down, up):
+    """Insert a derivation edge DIRECTLY, bypassing record_edge's cycle guard."""
+    conn.execute(
+        "INSERT INTO artifact_derivation(down_node, up_node, recorded_at, transaction_id) "
+        "VALUES (?, ?, '2026-01-01T00:00:00', 'raw')",
+        (down, up),
+    )
+    conn.commit()
+
+
+def test_cyclic_graph_handled_losslessly(tmp_path):
+    """A 0011 cycle inserted raw (bypassing the guard), with one node in the
+    cycle directly stale, must NOT crash, NOT return a false 'fresh', and must
+    name the stale node — the memo-poisoning failure mode the rewrite dissolves.
+    """
+    conn = _project(tmp_path)
+    _add_cohort(conn, "joint", "v1", ["A1", "A2"])   # this node is directly stale once censored
+    _add_cohort(conn, "annot", "v1", ["A1"])
+    _add_cohort(conn, "call", "v1", ["A1"])
+    # Build a cycle joint -> annot -> call -> joint (raw, bypassing record_edge)
+    _raw_edge(conn, "cohort:joint@v1", "cohort:annot@v1")
+    _raw_edge(conn, "cohort:annot@v1", "cohort:call@v1")
+    _raw_edge(conn, "cohort:call@v1", "cohort:joint@v1")
+    # consumer derives from joint
+    _add_cohort(conn, "report", "v1", ["A1"])
+    _raw_edge(conn, "cohort:report@v1", "cohort:joint@v1")
+    _censor_assay(conn, "A2")  # makes joint directly input-stale
+    s = ad.derived_staleness(conn, "cohort:report@v1")
+    assert s["state"] == "STALE"
+    assert any("joint@v1" in r for r in s["reasons"])
+    # all_derived_stale must also terminate over the cycle
+    listing = ad.all_derived_stale(conn)
+    assert {r["node"] for r in listing if r["state"] == "STALE"}  # non-empty, no hang/crash
+
+
+def test_cross_table_cycle_refused_at_write(tmp_path):
+    """cohort:C uses ref R via reference_usage; recording reference:R -> cohort:C
+    closes a C->R->C cycle through the combined graph and must be refused.
+    """
+    conn = _project(tmp_path)
+    cid = _add_cohort(conn, "call", "v1", ["A1"])
+    ra.sync_references_from_toml(
+        conn, {"pon": {"path": "/x/pon.vcf", "version": "pon_v1", "kind": "known_variants"}})
+    ra.record_usage(conn, scope="cohort", artifact_id=cid, ref_key="pon",
+                    version_used="pon_v1", transaction_id="t")
+    conn.commit()
+    # cohort:call@v1 already reaches reference:pon via the reference_usage edge;
+    # adding reference:pon <- cohort:call@v1 would close the loop.
+    with pytest.raises(ad.DerivationError):
+        ad.record_edge(conn, down="reference:pon", up="cohort:call@v1", transaction_id="t")
+
+
+def test_diamond_does_not_drop_reasons(tmp_path):
+    """Two upstream paths from ROOT both reach the same stale source; the stale
+    source must be reported EXACTLY once (dedup), and ROOT must be STALE.
+    """
+    conn = _project(tmp_path)
+    _add_cohort(conn, "joint", "v1", ["A1", "A2"])   # the shared stale source
+    _add_cohort(conn, "left", "v1", ["A1"])
+    _add_cohort(conn, "right", "v1", ["A1"])
+    _add_cohort(conn, "root", "v1", ["A1"])
+    # diamond: root -> {left, right} -> joint
+    ad.record_edge(conn, down="cohort:left@v1", up="cohort:joint@v1", transaction_id="t")
+    ad.record_edge(conn, down="cohort:right@v1", up="cohort:joint@v1", transaction_id="t")
+    ad.record_edge(conn, down="cohort:root@v1", up="cohort:left@v1", transaction_id="t")
+    ad.record_edge(conn, down="cohort:root@v1", up="cohort:right@v1", transaction_id="t")
+    conn.commit()
+    _censor_assay(conn, "A2")  # joint becomes directly stale
+    s = ad.derived_staleness(conn, "cohort:root@v1")
+    assert s["state"] == "STALE"
+    joint_reasons = [r for r in s["reasons"] if "joint@v1" in r]
+    assert len(joint_reasons) == 1, joint_reasons  # reported exactly once, not twice

@@ -136,7 +136,17 @@ def upstream_nodes(conn: sqlite3.Connection, node: str) -> list[str]:
 
 
 def _reaches(conn: sqlite3.Connection, start: str, target: str) -> bool:
-    """True if *target* is reachable walking up_node edges from *start* (0011 only)."""
+    """True if *target* is reachable walking upstream from *start*.
+
+    Walks the SAME combined edge set the staleness walk uses — both 0011
+    ``artifact_derivation`` edges and the 0010 ``reference_usage`` edges
+    (``_all_upstreams``). This is what lets ``record_edge``'s cycle guard reject
+    a cross-table cycle: e.g. ``cohort:C uses ref R`` (a reference_usage row)
+    plus an attempted ``reference:R -> cohort:C`` artifact_derivation edge would
+    close a real C→R→C loop in the graph the staleness walk traverses
+    (proposal 0011 §6.4). ``_all_upstreams`` is defined later in this module;
+    the forward reference resolves at call time.
+    """
     seen: set[str] = set()
     stack = [start]
     while stack:
@@ -146,7 +156,7 @@ def _reaches(conn: sqlite3.Connection, start: str, target: str) -> bool:
         if cur in seen:
             continue
         seen.add(cur)
-        stack.extend(upstream_nodes(conn, cur))
+        stack.extend(_all_upstreams(conn, cur))
     return False
 
 
@@ -214,15 +224,27 @@ def _reference_usage_upstreams(conn: sqlite3.Connection, node: str) -> list[str]
 
 
 def _all_upstreams(conn: sqlite3.Connection, node: str) -> list[str]:
-    """Union of 0011 artifact_derivation edges and the 0010 reference_usage edges."""
-    return upstream_nodes(conn, node) + _reference_usage_upstreams(conn, node)
+    """Union of 0011 artifact_derivation edges and the 0010 reference_usage edges.
+
+    Deduped (order-preserving): the same ``reference:<ref_key>`` can appear as
+    both an artifact_derivation edge and a reference_usage edge, and walking it
+    twice would otherwise produce duplicate reason strings downstream.
+    """
+    return list(dict.fromkeys(
+        upstream_nodes(conn, node) + _reference_usage_upstreams(conn, node)))
 
 
-def _direct_stale(conn: sqlite3.Connection, node: str) -> list[str]:
+def _direct_stale(conn: sqlite3.Connection, node: str,
+                  cohort_stale: dict[int, list[str]] | None = None) -> list[str]:
     """A node's OWN direct staleness reasons (0009 input + 0010 ref), no recursion.
 
     reference nodes have no intrinsic direct staleness (only derived).
     analysis nodes have only 0010 ref-staleness (no 0009 inputs).
+
+    *cohort_stale* is the pre-computed ``cohort_artifacts.artifact_staleness``
+    map. Passing it in lets callers compute the whole-cohort scan ONCE and reuse
+    it across every visited node, instead of rescanning per cohort node (which
+    made ``all_derived_stale`` roughly O(k²)). If omitted, it is computed here.
     """
     n = LineageNode.parse(node)
     reasons: list[str] = []
@@ -230,7 +252,9 @@ def _direct_stale(conn: sqlite3.Connection, node: str) -> list[str]:
         from casetrack_qc import cohort_artifacts as _ca
         aid = _resolve_artifact_id(conn, n.analysis, n.run_tag)
         if aid is not None:
-            censored = _ca.artifact_staleness(conn).get(aid, [])
+            if cohort_stale is None:
+                cohort_stale = _ca.artifact_staleness(conn)
+            censored = cohort_stale.get(aid, [])
             if censored:
                 reasons.append(f"inputs censored: {', '.join(sorted(censored))}")
             ref = _ref_state(conn, scope="cohort", artifact_id=aid)
@@ -252,55 +276,78 @@ def _ref_state(conn: sqlite3.Connection, **kw) -> list[str]:
     return s["reasons"] if s["state"] == "STALE" else []
 
 
-def _is_stale(conn: sqlite3.Connection, node: str, memo: dict,
-              path: set) -> tuple[bool, list[str]]:
-    """is_stale(node) = direct OR any upstream is_stale. Memoized, cycle-guarded.
+def _upstream_reachable(conn: sqlite3.Connection, node: str) -> list[str]:
+    """All nodes reachable UPSTREAM from *node* (>=1 hop) over ``_all_upstreams``.
 
-    *path* is the set of nodes currently being evaluated (the DFS call stack). A
-    back-edge (node already in path) contributes nothing — terminate, return False.
-    *memo* caches the final result once a node's full subgraph is resolved.
+    Plain visited-set traversal — inherently cycle-safe and order-independent.
+    A visited set never re-enters a node, so back-edges in a cyclic graph simply
+    terminate that branch; there is no memo to poison and no path to taint
+    (this is what dissolves the memo-poisoning failure mode of the old
+    recursion). The starting *node* itself is excluded from the result so we
+    roll up only its upstreams, never its own direct causes (proposal 0011 §6.2).
     """
-    if node in memo:
-        return memo[node]
-    if node in path:           # back-edge: terminate with no contribution
-        return (False, [])
-    path = path | {node}       # immutable update so sibling branches are independent
-    reasons = list(_direct_stale(conn, node))
-    for up in _all_upstreams(conn, node):
-        up_stale, up_reasons = _is_stale(conn, up, memo, path)
-        if up_stale:
-            why = f"; {'; '.join(up_reasons)}" if up_reasons else ""
-            reasons.append(f"upstream {up} is STALE{why}")
-    result = (len(reasons) > 0, reasons)
-    memo[node] = result
-    return result
+    seen: set[str] = set()
+    out: list[str] = []
+    stack = list(_all_upstreams(conn, node))
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        out.append(cur)
+        stack.extend(_all_upstreams(conn, cur))
+    return out
+
+
+def _staleness_for(conn: sqlite3.Connection, node: str,
+                   cohort_stale: dict[int, list[str]] | None = None) -> dict:
+    """Core of ``derived_staleness`` with a hoistable cohort-staleness map."""
+    if cohort_stale is None:
+        from casetrack_qc import cohort_artifacts as _ca
+        cohort_stale = (_ca.artifact_staleness(conn)
+                        if _table_exists(conn, "cohort_artifacts") else {})
+    reasons: list[str] = []
+    for up in _upstream_reachable(conn, node):
+        direct = _direct_stale(conn, up, cohort_stale=cohort_stale)
+        if direct:
+            reasons.append(
+                f"upstream {up} is STALE ({'; '.join(sorted(direct))})")
+    reasons = sorted(set(reasons))
+    return {"state": "STALE" if reasons else "fresh", "reasons": reasons}
 
 
 def derived_staleness(conn: sqlite3.Connection, node: str) -> dict:
     """{'state': 'fresh'|'STALE', 'reasons': [...]} for *node*.
 
-    derived_stale = any upstream node is_stale (excludes the node's OWN direct
-    causes — those are 0009 ``stale`` / 0010 ``ref_stale``). Boolean two-state
-    rollup: a node with no upstream-derivation edges is cleanly ``fresh`` (NOT
-    ``untracked`` — proposal 0011 §6.2).
+    derived_stale = any node reachable UPSTREAM from *node* is itself directly
+    stale (0009 input-censored / 0010 ref-stale). Excludes *node*'s OWN direct
+    causes — those are surfaced as 0009 ``stale`` / 0010 ``ref_stale``. Boolean
+    two-state rollup: a node with no upstream-derivation edges is cleanly
+    ``fresh`` (NOT ``untracked`` — proposal 0011 §6.2).
+
+    Cycle-safe: computed by visited-set upstream reachability, so a cyclic
+    derivation graph terminates and reports staleness losslessly (no false
+    fresh, no dropped reasons). The expensive whole-cohort
+    ``artifact_staleness`` scan runs once per call.
     """
-    memo: dict = {}
-    reasons: list[str] = []
-    for up in _all_upstreams(conn, node):
-        up_stale, up_reasons = _is_stale(conn, up, memo, {node})
-        if up_stale:
-            why = f"; {'; '.join(up_reasons)}" if up_reasons else ""
-            reasons.append(f"upstream {up} is STALE{why}")
-    return {"state": "STALE" if reasons else "fresh", "reasons": sorted(reasons)}
+    return _staleness_for(conn, node)
 
 
 def all_derived_stale(conn: sqlite3.Connection) -> list[dict]:
-    """Every down_node with >=1 derivation edge, annotated with derived staleness."""
+    """Every down_node with >=1 derivation edge, annotated with derived staleness.
+
+    The whole-cohort ``artifact_staleness`` scan is computed ONCE and reused
+    across all nodes, avoiding the per-node rescan that made this O(k²).
+    """
+    from casetrack_qc import cohort_artifacts as _ca
+    cohort_stale = (_ca.artifact_staleness(conn)
+                    if _table_exists(conn, "cohort_artifacts") else {})
     out: list[dict] = []
     for (node,) in conn.execute(
         "SELECT DISTINCT down_node FROM artifact_derivation"
     ).fetchall():
-        out.append({"node": node, **derived_staleness(conn, node)})
+        out.append({"node": node,
+                    **_staleness_for(conn, node, cohort_stale=cohort_stale)})
     return out
 
 
