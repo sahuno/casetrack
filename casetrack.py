@@ -7812,7 +7812,7 @@ def cmd_validate_project(args):
         # 7. Proposal 0011: dangling derivation edges + acyclicity.
         from casetrack_qc.artifact_derivation import (
             derivation_schema_exists as _deriv_exists,
-            list_edges as _list_edges, upstream_nodes as _upstream_nodes,
+            list_edges as _list_edges, _all_upstreams as _combined_upstreams,
             LineageNode as _LineageNode, DerivationError as _DerivErr,
         )
         if _deriv_exists(conn):
@@ -7850,26 +7850,39 @@ def cmd_validate_project(args):
                                 f"artifact_derivation: dangling node-ref {node!r} "
                                 f"(no matching artifact/reference/entity)")
 
-            # acyclicity: DFS from each node over up edges. Always colour BLACK on
-            # exit (no early return) so a node that merely points INTO a cycle is
-            # not itself reported — only the actual back-edge (GREY hit) is flagged.
+            # acyclicity: iterative (explicit-stack) DFS over the COMBINED upstream
+            # edge set (0011 derivation ∪ 0010 reference_usage — same set the
+            # write-time guard uses, so cross-table cycles are caught here too).
+            # Iterative, not recursive, so a deep chain can't RecursionError the
+            # validate command. Colour GREY on push, BLACK on pop; a GREY hit is a
+            # back-edge (reported once). A node merely pointing INTO a cycle is not
+            # itself flagged — only the actual back-edge is.
             WHITE, GREY, BLACK = 0, 1, 2
             color: dict = {}
 
-            def _dfs(node: str) -> None:
-                color[node] = GREY
-                for up in _upstream_nodes(conn, node):
-                    c = color.get(up, WHITE)
-                    if c == GREY:
-                        issues.append(
-                            f"artifact_derivation: cycle through {node!r} -> {up!r}")
-                    elif c == WHITE:
-                        _dfs(up)
-                color[node] = BLACK
+            def _iter_dfs(start: str) -> None:
+                color[start] = GREY
+                stack = [(start, iter(_combined_upstreams(conn, start)))]
+                while stack:
+                    node, it = stack[-1]
+                    descended = False
+                    for up in it:
+                        c = color.get(up, WHITE)
+                        if c == GREY:
+                            issues.append(
+                                f"artifact_derivation: cycle through {node!r} -> {up!r}")
+                        elif c == WHITE:
+                            color[up] = GREY
+                            stack.append((up, iter(_combined_upstreams(conn, up))))
+                            descended = True
+                            break
+                    if not descended:
+                        color[node] = BLACK
+                        stack.pop()
 
             for (dn,) in conn.execute("SELECT DISTINCT down_node FROM artifact_derivation"):
                 if color.get(dn, WHITE) == WHITE:
-                    _dfs(dn)
+                    _iter_dfs(dn)
     finally:
         conn.close()
 

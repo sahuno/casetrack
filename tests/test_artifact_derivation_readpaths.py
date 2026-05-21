@@ -376,6 +376,60 @@ def test_validate_flags_cycle(tmp_path):
     )
 
 
+def test_validate_deep_chain_no_recursionerror(tmp_path):
+    """A very deep derivation chain must not RecursionError the validate command
+    (the acyclicity walk is iterative, not recursive)."""
+    p = _proj(tmp_path)
+    conn = casetrack.open_project_db(p / "casetrack.db")
+    # raw-insert a 2000-deep linear chain n0<-n1<-...<-n2000 (well past the
+    # Python recursion limit). Nodes are dangling, which validate will also
+    # flag — that's fine; the point is it must not crash.
+    edges = [
+        (f"cohort:n{i}@v1", f"cohort:n{i+1}@v1", "2026-01-01T00:00:00", "raw")
+        for i in range(2000)
+    ]
+    conn.executemany(
+        "INSERT OR IGNORE INTO artifact_derivation"
+        "(down_node, up_node, recorded_at, transaction_id) VALUES (?,?,?,?)",
+        edges,
+    )
+    conn.commit()
+    conn.close()
+    r = _run(["validate", "--project-dir", str(p)])
+    assert "RecursionError" not in (r.stdout + r.stderr)
+    assert "Traceback" not in r.stderr
+
+
+def test_validate_flags_cross_table_cycle(tmp_path):
+    """validate's acyclicity walks the combined edge set, so a cycle closed
+    through a reference_usage edge (not just 0011 edges) is reported."""
+    proj = _init_project(tmp_path)
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        _entity_rows(conn)
+        conn.commit()
+        ca.ensure_cohort_artifacts_schema(conn)
+        ra.ensure_reference_schema(conn)
+        ad.ensure_derivation_schema(conn)
+        cid = _add_cohort(conn, "call", "v1", ["A1"])
+        ra.sync_references_from_toml(
+            conn, {"pon": {"path": "/x/pon", "version": "v1", "kind": "known_variants"}})
+        # call USES pon (0010 edge: call -> reference:pon)
+        ra.record_usage(conn, scope="cohort", artifact_id=cid, ref_key="pon",
+                        version_used="v1", transaction_id="t")
+        # raw-insert the closing 0011 edge: reference:pon -> cohort:call@v1
+        conn.execute(
+            "INSERT OR IGNORE INTO artifact_derivation"
+            "(down_node, up_node, recorded_at, transaction_id) "
+            "VALUES ('reference:pon','cohort:call@v1','2026-01-01T00:00:00','raw')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    r = _run(["validate", "--project-dir", str(proj)])
+    assert "cycle" in (r.stdout + r.stderr).lower()
+
+
 def test_validate_cycle_no_false_positive_for_external_pointer(tmp_path):
     """A node that merely points INTO a cycle must NOT be reported as a cycle.
 

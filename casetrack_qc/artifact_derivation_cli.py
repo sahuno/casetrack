@@ -131,6 +131,11 @@ def cmd_derivation(args) -> None:
         node = getattr(args, "node", None)
         stale_only = getattr(args, "stale_only", False)
         if node:
+            try:
+                ad.LineageNode.parse(node)  # validate the user-supplied node-ref
+            except ad.DerivationError as e:
+                print(f"Error: --node: {e}", file=sys.stderr)
+                sys.exit(2)
             rows = [
                 {"node": node, "direction": "upstream", "other": u}
                 for u in ad.upstream_nodes(conn, node)

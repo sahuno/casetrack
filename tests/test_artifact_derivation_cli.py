@@ -129,6 +129,15 @@ def test_derived_from_refuses_cycle(tmp_path):
     assert "cycle" in (r.stderr + r.stdout).lower()
 
 
+def test_derivation_node_malformed_clean_exit(tmp_path):
+    """``derivation --node <malformed>`` exits 2 cleanly, not with a traceback."""
+    p = _project_with_artifacts(tmp_path)
+    r = _run(["derivation", "--project-dir", str(p), "--node", "garbage-no-colon"])
+    assert r.returncode == 2
+    assert "Error" in r.stderr
+    assert "Traceback" not in r.stderr
+
+
 def test_derivation_lists_and_stale(tmp_path):
     """``derivation --stale-only`` surfaces a node that is derived-stale."""
     p = _project_with_artifacts(tmp_path)
