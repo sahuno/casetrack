@@ -151,6 +151,9 @@ def build_qc_subparsers(subparsers) -> None:
     p_appc.add_argument("--checksum", help="Artifact checksum (e.g. sha256)")
     p_appc.add_argument("--created-by", dest="created_by",
                         help="Override the recorded actor (default: manual:$USER)")
+    p_appc.add_argument("--uses-references", dest="uses_references", default=None,
+                        help="[v0.8] Comma-separated reference keys this cohort "
+                             "output consumed (e.g. genome,dbsnp)")
 
     # ── migrate-cohort ──
     p_migc = subparsers.add_parser(

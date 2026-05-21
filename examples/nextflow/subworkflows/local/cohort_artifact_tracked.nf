@@ -19,6 +19,11 @@
  *                      drops --stats accordingly). Pairing them in one channel
  *                      avoids the `.combine([])` arity trap and matches reality —
  *                      the joint step produces the artifact and its stats together.
+ *   ch_uses_references — (optional, default []) a value channel emitting a
+ *                      comma-joined string of reference keys consumed by this
+ *                      cohort analysis (e.g. "genome,dbsnp").  Pass `[]` or
+ *                      omit when no references need recording — the process
+ *                      drops --uses-references accordingly, mirroring stats.
  *
  * `analysis` and `run_tag` come from params (pipeline-level config), matching
  * the rest of the casetrack Nextflow module. `(analysis, run_tag)` is the
@@ -36,9 +41,10 @@
  *
  *       COHORT_ARTIFACT_TRACKED(
  *           gvcfs.map { it[0] },                     // assay_ids
- *           joint.combine(stats)                     // (artifact, stats)
+ *           joint.combine(stats),                    // (artifact, stats)
+ *           Channel.value("genome,dbsnp")            // uses_references (optional)
  *       )
- *       // …or with no stats:  joint.map { v -> tuple(v, []) }
+ *       // …or with no stats/refs:  joint.map { v -> tuple(v, []) }  + omit 3rd arg
  *   }
  *
  * Params consumed:
@@ -58,8 +64,9 @@ params.run_tag         = params.containsKey('run_tag') ? params.run_tag : 'run'
 workflow COHORT_ARTIFACT_TRACKED {
 
     take:
-      ch_assay_ids       // queue channel: one assay_id per contributing assay
-      ch_artifact_stats  // value channel: ONE tuple (artifact, stats-or-[])
+      ch_assay_ids        // queue channel: one assay_id per contributing assay
+      ch_artifact_stats   // value channel: ONE tuple (artifact, stats-or-[])
+      ch_uses_references  // value channel: comma-joined ref keys, or [] to omit
 
     main:
       // Gather the lineage into one assay-id-per-line manifest. collectFile
@@ -69,12 +76,13 @@ workflow COHORT_ARTIFACT_TRACKED {
 
       // Assemble the single fan-in tuple the registration process expects.
       // combine of a 1-item channel with the (artifact, stats) tuple yields
-      // (tsv, artifact, stats); stats stays a single element (possibly []),
-      // so the process drops --stats when it's empty.
+      // (tsv, artifact, stats); stats and uses_references stay single elements
+      // (possibly []), so the process drops their flags when they are empty.
       ch_call = inputs_tsv
           .combine(ch_artifact_stats)
-          .map { tsv, artifact, stats ->
-              tuple(params.cohort_analysis, params.run_tag, artifact, tsv, stats)
+          .combine(ch_uses_references)
+          .map { tsv, artifact, stats, uses_refs ->
+              tuple(params.cohort_analysis, params.run_tag, artifact, tsv, stats, uses_refs)
           }
 
       casetrack_append_cohort(ch_call)

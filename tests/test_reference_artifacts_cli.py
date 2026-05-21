@@ -163,3 +163,30 @@ def test_references_command_lists_and_filters_stale(tmp_path):
                          "--project-dir", str(pdir), "--stale-only"],
                         capture_output=True, text=True)
     assert "S1" in r2.stdout and "STALE" in r2.stdout
+
+
+def test_append_cohort_uses_references(tmp_path):
+    pdir = _init_project(tmp_path)
+    toml = pdir / "casetrack.toml"
+    toml.write_text(toml.read_text() +
+        '\n[references.genome]\npath="/db/hg38.fa"\nversion="hg38_v0"\nkind="genome"\n')
+    subprocess.run([sys.executable, "-m", "casetrack", "schema", "apply",
+                    "--project-dir", str(pdir)], check=True, capture_output=True, text=True)
+    _bootstrap_one_specimen(pdir)
+    # need an assay for cohort inputs (direct INSERT — add-metadata rejects
+    # undeclared columns and assay_type is NOT NULL)
+    conn = sqlite3.connect(pdir / casetrack.PROJECT_DB_NAME)
+    conn.execute("INSERT INTO assays (assay_id, specimen_id, assay_type) "
+                 "VALUES ('A1', 'S1', 'ONT')")
+    conn.commit(); conn.close()
+    vcf = pdir / "joint.vcf.gz"; vcf.write_text("x")
+    subprocess.run([sys.executable, "-m", "casetrack", "append-cohort",
+                    "--project-dir", str(pdir), "--analysis", "joint_genotype",
+                    "--run-tag", "rt1", "--path", str(vcf), "--inputs", "A1",
+                    "--uses-references", "genome"], check=True,
+                   capture_output=True, text=True)
+    conn = sqlite3.connect(pdir / casetrack.PROJECT_DB_NAME)
+    aid = conn.execute("SELECT artifact_id FROM cohort_artifacts").fetchone()[0]
+    s = ra.output_staleness(conn, scope="cohort", artifact_id=aid)
+    assert s["state"] == "fresh"
+    conn.close()
