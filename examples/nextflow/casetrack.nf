@@ -177,12 +177,16 @@ process casetrack_register_project {
  * with `per_assay_ch.map{ it[0] }.collectFile(name: 'inputs.txt', newLine: true)`.
  *
  * Input  : tuple(val analysis, val run_tag, path artifact, path inputs_tsv,
- *                path stats_json)
+ *                path stats_json, val uses_references, val derived_from)
  *          - (analysis, run_tag) is the unique key; a re-run uses a new run_tag.
  *          - inputs_tsv: one assay_id per line ('assay_id' header tolerated).
  *          - stats_json: cohort-level summary, OPTIONAL — pass `[]` (an empty
  *            list) for the staged-file slot when there are no stats, and the
  *            `--stats` flag is omitted. (`append-cohort` is stats-optional too.)
+ *          - uses_references: OPTIONAL — comma-joined reference keys this artifact
+ *            consumed (0010). Pass `[]` to omit --uses-references entirely.
+ *          - derived_from: OPTIONAL — comma-joined upstream node-refs this artifact
+ *            derives from (0011). Pass `[]` to omit --derived-from entirely.
  * Output : tuple(val analysis, val run_tag) so a downstream report/QC step can
  *          chain off the confirmed-registered artifact.
  * ──────────────────────────────────────────────────────────────────────────*/
@@ -195,7 +199,7 @@ process casetrack_append_cohort {
     maxRetries 2
 
     input:
-      tuple val(analysis), val(run_tag), path(artifact), path(inputs_tsv), path(stats_json), val(uses_references)
+      tuple val(analysis), val(run_tag), path(artifact), path(inputs_tsv), path(stats_json), val(uses_references), val(derived_from)
 
     output:
       tuple val(analysis), val(run_tag)
@@ -207,6 +211,9 @@ process casetrack_append_cohort {
     // uses_references is optional: pass `[]` (or empty string) when not needed;
     // when non-empty, the value is a comma-joined list of reference keys.
     def uses_references_arg = uses_references ? "--uses-references '${uses_references}'" : ''
+    // derived_from is optional (proposal 0011): pass `[]` when not needed;
+    // when non-empty, the value is a comma-joined list of upstream node-refs.
+    def derived_from_arg = derived_from ? "--derived-from '${derived_from}'" : ''
     """
     ${params.casetrack_bin} append-cohort \\
         --project-dir '${params.casetrack_project_dir}' \\
@@ -214,7 +221,7 @@ process casetrack_append_cohort {
         --run-tag '${run_tag}' \\
         --path '${artifact}' \\
         --inputs-from '${inputs_tsv}' \\
-        ${stats_arg} ${uses_references_arg} ${params.casetrack_extra}
+        ${stats_arg} ${uses_references_arg} ${derived_from_arg} ${params.casetrack_extra}
     """
 }
 
