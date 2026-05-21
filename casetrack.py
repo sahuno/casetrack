@@ -7748,6 +7748,68 @@ def cmd_validate_project(args):
                     f"reference_usage references unknown ref_key {ref_key!r} "
                     f"(removed from [references]?)"
                 )
+
+        # 7. Proposal 0011: dangling derivation edges + acyclicity.
+        from casetrack_qc.artifact_derivation import (
+            derivation_schema_exists as _deriv_exists,
+            list_edges as _list_edges, upstream_nodes as _upstream_nodes,
+            LineageNode as _LineageNode, DerivationError as _DerivErr,
+        )
+        if _deriv_exists(conn):
+            def _resolves(node: str) -> bool:
+                try:
+                    n = _LineageNode.parse(node)
+                except _DerivErr:
+                    return False
+                if n.scope == "cohort":
+                    return conn.execute(
+                        "SELECT 1 FROM cohort_artifacts WHERE analysis=? AND run_tag=?",
+                        (n.analysis, n.run_tag)).fetchone() is not None
+                if n.scope == "reference":
+                    return conn.execute(
+                        "SELECT 1 FROM reference_artifacts WHERE ref_key=?",
+                        (n.ref_key,)).fetchone() is not None
+                # analysis: accept if the entity row exists at its level
+                tbl = {"patient": "patients", "specimen": "specimens",
+                       "assay": "assays"}.get(n.entity_level)
+                col = {"patient": "patient_id", "specimen": "specimen_id",
+                       "assay": "assay_id"}.get(n.entity_level)
+                if not tbl:
+                    return False
+                return conn.execute(
+                    f"SELECT 1 FROM {tbl} WHERE {col}=?",
+                    (n.entity_id,)).fetchone() is not None
+
+            seen_nodes: set = set()
+            for e in _list_edges(conn):
+                for node in (e["down_node"], e["up_node"]):
+                    if node not in seen_nodes:
+                        seen_nodes.add(node)
+                        if not _resolves(node):
+                            issues.append(
+                                f"artifact_derivation: dangling node-ref {node!r} "
+                                f"(no matching artifact/reference/entity)")
+
+            # acyclicity: DFS from each node over up edges
+            WHITE, GREY, BLACK = 0, 1, 2
+            color: dict = {}
+
+            def _dfs(node: str) -> bool:
+                color[node] = GREY
+                for up in _upstream_nodes(conn, node):
+                    c = color.get(up, WHITE)
+                    if c == GREY:
+                        issues.append(
+                            f"artifact_derivation: cycle through {node!r} -> {up!r}")
+                        return True
+                    if c == WHITE and _dfs(up):
+                        return True
+                color[node] = BLACK
+                return False
+
+            for (dn,) in conn.execute("SELECT DISTINCT down_node FROM artifact_derivation"):
+                if color.get(dn, WHITE) == WHITE:
+                    _dfs(dn)
     finally:
         conn.close()
 

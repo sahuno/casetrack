@@ -331,3 +331,46 @@ def test_export_include_derivation(tmp_path):
     # The edge recorded in _proj: down=cohort:annot@v1, up=cohort:joint@v1
     assert "cohort:annot@v1" in content
     assert "cohort:joint@v1" in content
+
+
+# ── Task 11: validate dangling + acyclic invariants (0011 §6.5) ───────────────
+
+
+def test_validate_flags_dangling_edge(tmp_path):
+    """``validate`` reports a dangling node-ref when artifact_derivation points
+    at a cohort artifact that does not exist in cohort_artifacts."""
+    p = _proj(tmp_path)
+    conn = casetrack.open_project_db(p / "casetrack.db")
+    # Raw-insert an edge whose up_node references a nonexistent cohort artifact.
+    conn.execute(
+        "INSERT INTO artifact_derivation(down_node, up_node, recorded_at) "
+        "VALUES ('cohort:annot@v1','cohort:ghost@v9','2026-01-01T00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+    r = _run(["validate", "--project-dir", str(p)])
+    out = r.stdout + r.stderr
+    assert "ghost@v9" in out or "dangling" in out.lower(), (
+        f"Expected 'ghost@v9' or 'dangling' in output; got:\n{out}"
+    )
+
+
+def test_validate_flags_cycle(tmp_path):
+    """``validate`` reports a cycle when artifact_derivation contains a back-edge
+    (raw-inserted, bypassing record_edge's cycle guard)."""
+    p = _proj(tmp_path)
+    # _proj already has edge annot@v1 <- joint@v1.
+    # Add the reverse edge to form a two-node cycle: joint@v1 <- annot@v1.
+    conn = casetrack.open_project_db(p / "casetrack.db")
+    conn.execute(
+        "INSERT OR IGNORE INTO artifact_derivation"
+        "(down_node, up_node, recorded_at, transaction_id) "
+        "VALUES ('cohort:joint@v1','cohort:annot@v1','2026-01-01T00:00:00','raw')"
+    )
+    conn.commit()
+    conn.close()
+    r = _run(["validate", "--project-dir", str(p)])
+    out = r.stdout + r.stderr
+    assert "cycle" in out.lower(), (
+        f"Expected 'cycle' in validate output; got:\n{out}"
+    )
