@@ -4360,6 +4360,7 @@ class _AppendOnCensored(Exception):
 
 def cmd_append_project(args):
     """Attach analysis results to rows at --level, extending the schema as needed."""
+    from casetrack_qc.artifact_derivation import DerivationError as _ADDerivationError
     project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     from casetrack_lifecycle.gate import assert_not_archived as _assert_not_archived
     _assert_not_archived(
@@ -4638,6 +4639,10 @@ def cmd_append_project(args):
         conn.close()
         print(f"Error: append aborted — {type(e).__name__}: {e}", file=sys.stderr)
         sys.exit(1)
+    except _ADDerivationError as e:
+        conn.close()
+        print(f"Error: --derived-from: {e}", file=sys.stderr)
+        sys.exit(2)
     finally:
         if conn:
             conn.close()
@@ -4659,6 +4664,10 @@ def cmd_append_project(args):
         "schema_v_after": schema["project"]["schema_v"],
         "autoflag_events": [e["qc_event_id"] for e in autoflag_emitted],
         "run_tag": inferred_run_tag,
+        "derived_from": (
+            [s.strip() for s in args.derived_from.split(",") if s.strip()]
+            if getattr(args, "derived_from", None) else []
+        ),
     })
 
     # One `censor` provenance entry per autoflag event, all sharing the

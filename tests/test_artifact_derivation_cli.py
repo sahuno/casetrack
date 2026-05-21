@@ -259,6 +259,45 @@ def test_append_cohort_derived_from(tmp_path):
         conn.close()
 
 
+def test_append_cohort_derived_from_cycle_rejected(tmp_path):
+    """A self-cycle via --derived-from on append-cohort exits 2 with a clean message,
+    not a raw traceback."""
+    p = _project_with_artifacts(tmp_path)
+    r = _run([
+        "append-cohort", "--project-dir", str(p),
+        "--analysis", "vqsr", "--run-tag", "v1", "--path", "/x/vqsr.vcf",
+        "--inputs", "A1,A2", "--derived-from", "cohort:vqsr@v1",  # self-cycle
+    ])
+    assert r.returncode == 2
+    assert "Error" in r.stderr
+    assert "Traceback" not in r.stderr  # clean error, not an unhandled exception
+
+
+def test_append_sample_level_derived_from(tmp_path):
+    """``append --derived-from`` records analysis:<level>/<id>/<analysis> edges."""
+    p = _project_with_artifacts(tmp_path)  # has joint@v1; assays A1, A2 registered
+    # results TSV keyed on assay_id; the hgsoc template registers assays as the
+    # leaf level. Append a small analysis result for A1 with a derived-from edge.
+    results = p / "modkit_summary.tsv"
+    results.write_text("assay_id\tmodkit_done\nA1\t2026-05-21\n")
+    r = _run([
+        "append", "--project-dir", str(p), "--level", "assay",
+        "--analysis", "modkit", "--results", str(results),
+        "--derived-from", "cohort:joint@v1",
+    ])
+    assert r.returncode == 0, r.stderr
+    conn = casetrack.open_project_db(p / "casetrack.db")
+    try:
+        edges = ad.list_edges(conn)
+        assert any(
+            e["down_node"] == "analysis:assay/A1/modkit"
+            and e["up_node"] == "cohort:joint@v1"
+            for e in edges
+        ), f"expected sample-level edge not found; edges={edges}"
+    finally:
+        conn.close()
+
+
 def test_toml_derived_from_malformed_ref_rejected(tmp_path):
     """A malformed derived_from node-ref fails loudly at schema-load validation."""
     proj = _init_project(tmp_path)
