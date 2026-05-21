@@ -402,3 +402,19 @@ def test_validate_cycle_no_false_positive_for_external_pointer(tmp_path):
     assert n_cycle_issues == 1, (
         f"expected exactly 1 cycle issue, got {n_cycle_issues}:\n{out}"
     )
+
+
+# ── Task 12: Dashboard Derivation section (0011 §6.5) ────────────────────────
+
+
+def test_dashboard_has_derivation_section(tmp_path):
+    """Dashboard HTML contains a Derivation section when derivation edges exist."""
+    p = _proj(tmp_path)
+    out = tmp_path / "dash.html"
+    r = _run(["dashboard", "--project-dir", str(p), "--output", str(out)])
+    assert r.returncode == 0, r.stderr
+    assert out.exists(), "dashboard HTML file not written"
+    html_text = out.read_text()
+    assert "Derivation" in html_text, (
+        "Expected 'Derivation' section in dashboard HTML; section absent"
+    )

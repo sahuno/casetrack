@@ -5736,6 +5736,19 @@ def cmd_dashboard_project(args):
             qc_info["reference_stale"] = [
                 o for o in _ra_stale(conn) if o["state"] == "STALE"
             ]
+
+        # Proposal 0011: derivation-edge section with derived-stale badges.
+        # Degrades silently when absent (pre-0011 / no artifact_derivation table).
+        from casetrack_qc.artifact_derivation import (
+            derivation_schema_exists as _ad_exists,
+            all_derived_stale as _ad_all,
+            list_edges as _ad_edges,
+        )
+        if _ad_exists(conn):
+            qc_info["derivation_edges"] = _ad_edges(conn)
+            qc_info["derivation_stale"] = [
+                r for r in _ad_all(conn) if r["state"] == "STALE"
+            ]
     finally:
         conn.close()
 
@@ -5977,6 +5990,8 @@ def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
 
   {_references_html(qc_info)}
 
+  {_derivation_html(qc_info)}
+
   <h2>Patients</h2>
   {"".join(body_sections) if body_sections
      else '<p class="muted">No patients registered yet.</p>'}
@@ -6079,6 +6094,51 @@ def _references_html(qc_info: dict | None) -> str:
         "<th>ref_key</th><th>version</th><th>kind</th>"
         "</tr></thead><tbody>"
         f"{''.join(rows)}</tbody></table>"
+    )
+
+
+def _derivation_html(qc_info: dict | None) -> str:
+    """Render the derivation section (proposal 0011) with derived-stale badges.
+
+    Returns "" when no derivation edges exist so pre-0011 projects render
+    identically to before.
+    """
+    if not qc_info:
+        return ""
+    edges = qc_info.get("derivation_edges") or []
+    if not edges:
+        return ""
+    esc = html.escape
+    stale = qc_info.get("derivation_stale") or []
+    n_stale = len(stale)
+    rows = "".join(
+        f"<tr><td>{esc(e['down_node'])}</td>"
+        f"<td>{esc(e['up_node'])}</td></tr>"
+        for e in edges
+    )
+    if stale:
+        stale_items = "".join(
+            f"<li><span class='qc-chip qc-chip-amber'>DERIVED-STALE</span> "
+            f"{esc(r['node'])} "
+            f"<small class='muted'>{esc('; '.join(r['reasons']))}</small></li>"
+            for r in stale
+        )
+        stale_block = f"<ul>{stale_items}</ul>"
+    else:
+        stale_block = "<p class='muted'>None derived-stale.</p>"
+    if n_stale:
+        badge = f'<span class="qc-chip qc-chip-amber">{n_stale} derived-stale node(s)</span>'
+    else:
+        badge = '<span class="qc-chip qc-chip-grey">0 derived-stale</span>'
+    return (
+        f"<h2>Derivation <span class='muted'>({len(edges)} edge(s), "
+        f"{n_stale} derived-stale)</span></h2>"
+        f"{badge}"
+        f"{stale_block}"
+        "<table><thead><tr>"
+        "<th>derived node</th><th>derives from</th>"
+        "</tr></thead><tbody>"
+        f"{rows}</tbody></table>"
     )
 
 
