@@ -418,3 +418,25 @@ def test_dashboard_has_derivation_section(tmp_path):
     assert "Derivation" in html_text, (
         "Expected 'Derivation' section in dashboard HTML; section absent"
     )
+    # the edge endpoints must actually render (not just the heading)
+    assert "cohort:annot@v1" in html_text and "cohort:joint@v1" in html_text
+
+
+def test_dashboard_derivation_escapes_node_refs(tmp_path):
+    """Node-ref strings (CLI-sourced) must be HTML-escaped in the dashboard."""
+    p = _proj(tmp_path)
+    conn = casetrack.open_project_db(p / "casetrack.db")
+    # raw-insert an edge whose down_node carries HTML metacharacters
+    conn.execute(
+        "INSERT OR IGNORE INTO artifact_derivation"
+        "(down_node, up_node, recorded_at, transaction_id) "
+        "VALUES ('cohort:<script>@v1','cohort:joint@v1','2026-01-01T00:00:00','raw')"
+    )
+    conn.commit()
+    conn.close()
+    out = tmp_path / "dash.html"
+    r = _run(["dashboard", "--project-dir", str(p), "--output", str(out)])
+    assert r.returncode == 0, r.stderr
+    html_text = out.read_text()
+    assert "<script>" not in html_text       # raw tag must NOT appear
+    assert "&lt;script&gt;" in html_text      # escaped form must appear
