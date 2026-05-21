@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Author** | Samuel Ahuno ([ekwame001@gmail.com](mailto:ekwame001@gmail.com)) |
-| **Status** | accepted (design) — 2026-05-21 |
+| **Status** | accepted (implemented) — 2026-05-21 |
 | **Depends on** | 0001 (hierarchy), 0002 (QC cascade), 0009 (cohort artifacts), 0010 (reference artifacts) |
 | **Companion** | 0010 (reference artifacts) — the single-hop predecessor 0010 §5 carved this out of |
 | **Target HPC** | IRIS @ MSKCC (WekaFS, SLURM, Apptainer) |

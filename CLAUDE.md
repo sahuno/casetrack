@@ -6,21 +6,22 @@ Manifest-centric case management CLI for bioinformatics pipelines on HPC (SLURM)
 
 - **Repo**: https://github.com/sahuno/casetrack (private)
 - **Author**: Samuel Ahuno (ekwame001@gmail.com / sahuno@mskcc.org)
-- **Current release**: v0.8.0 — reference artifacts + downstream ref-staleness (proposal 0010)
-- **Next release**: 0011 (artifact-to-artifact lineage) → v1.0 (flat-mode removal)
+- **Current release**: v0.9.0 — artifact-to-artifact lineage + transitive derived-staleness (proposal 0011)
+- **Next release**: v1.0 (flat-mode removal)
 - **HPC target**: IRIS @ MSKCC (SLURM, WekaFS shared storage, Apptainer containers)
 
 ## Key context files (read these to resume work)
 
 | File | What it tells you |
 |---|---|
+| `docs/proposals/0011-artifact-to-artifact-lineage.md` | **The shipped artifact-lineage design.** Generic `derived-from` edge between any two lineage nodes; transitive `derived_stale` flag; `artifact_derivation` sibling table. §0 = nine locked decisions; §7 = rejected alternatives. |
 | `docs/proposals/0010-reference-artifacts.md` | **The shipped reference-artifacts design.** Versioned upstream inputs (genome, GTF, dbSNP) with read-time downstream staleness via two additive sibling tables. §6.2 = three-state staleness + orthogonality to 0009; §7 = why no 4th level / no version-history table. |
 | `docs/proposals/0009-cohort-level-artifacts.md` | **The shipped cohort-artifacts design.** One output from many assays (joint VCFs, PoNs, cohort matrices) via two additive sibling tables. §7 records *why a 4th hierarchy level was rejected* (Option A vs B). §9 = nothing open; fully implemented. |
 | `docs/proposals/0003-init-scaffold.md` | **The shipped v0.4.2 design.** `casetrack init` now scaffolds 16 leaf directories + expanded .gitignore. `--bare` opts out. |
 | `docs/proposals/0002-qc-events-and-censoring.md` | **The shipped v0.4 design.** QC events, cascade semantics, consent rules, cohort `--pair-by`. §0 has the 13 locked-in decisions. |
 | `docs/proposals/0001-sqlite-normalized-backend.md` | **The shipped v0.3 design.** Three-level hierarchy, SQLite backend, concurrency strategy. |
 | `docs/MIGRATION_v0.3_to_v0.4.md` | Step-by-step upgrade guide (one command: `casetrack migrate-qc`). |
-| `CHANGELOG.md` | Release notes (most recent = v0.4.0). |
+| `CHANGELOG.md` | Release notes (most recent = v0.9.0). |
 | `casetrack.py` | v0.3 commands, in one file (~5.6K lines). |
 | `casetrack_qc/` | v0.4 QC subsystem — lives next to the monolith, never merged into it. |
 | `README.md` | User-facing command table. |
@@ -62,6 +63,12 @@ v0.4 lives in `casetrack_qc/` (a new subpackage alongside `casetrack.py`). The m
 
 Each `[analyses.<tool>]` declares `uses = [...]`; `append` auto-snapshots the current version of each. **Ref-staleness is read-time, three-state** (`fresh`/`STALE`/`untracked`) with a named reason, derived live in `casetrack_qc/reference_artifacts.py` (`output_staleness` / `all_stale_outputs`) — **orthogonal** to 0009's input-staleness (a cohort artifact carries both a `stale` and a distinct `ref_stale` flag). Surfaced in `references` + `migrate-references` commands, `status` (section), `query` (`_reference_usage` view + `_cohort_artifacts.ref_stale`), `export --include-references`, the dashboard, `validate` (orphan-usage), and the `casetrack_references` MCP tool. Version history lives in `provenance.jsonl` (`reference_version_change`), not the DB. The 4th-level and full-version-history alternatives were **rejected** (proposal 0010 §7). Code: `casetrack_qc/reference_artifacts.py` (+ `_cli.py`); Nextflow `casetrack_append_cohort` gains an optional `uses_references` input.
 
+**Artifact-to-artifact lineage (proposal 0011)**: the recursive layer that 0009 and 0010 each lack — a generic `derived-from` edge between any two lineage nodes (`cohort:`, `reference:`, `analysis:`), making the lineage a multi-hop DAG and making staleness **transitive**. One more **additive sibling table**:
+
+- `artifact_derivation` — `(down_node, up_node, note, recorded_at)` where each endpoint is a canonical node-ref string over the three node types.
+
+**`derived_stale` is a third orthogonal flag**: a node is derived-stale when any upstream node it derives from is stale by *any* cause (input-stale, ref-stale, or derived-stale — recursively). Computed at read-time with memoization and a cycle guard (`casetrack_qc/artifact_derivation.py`). Surfaced in `derived-from` + `derivation` + `migrate-derivation` commands, `status` (section), `query` (`_artifact_derivation` view + `derived_stale` on `_cohort_artifacts`), `export --include-derivation`, the dashboard, `validate` (dangling + acyclic invariants), and the `casetrack_derivation` MCP tool. Edges declared in TOML via `[references.<key>].derived_from` or at registration time via `--derived-from` on `append`/`append-cohort`. History in `provenance.jsonl` (`artifact_derivation_link`); the table holds only current edges. The `derivation` command name was chosen because `lineage` is taken by proposal 0006 (assay-merge subsystem). Code: `casetrack_qc/artifact_derivation.py` (+ `_cli.py`); Nextflow `casetrack_append_cohort`/`casetrack_append_project` gain an optional `derived_from` input.
+
 ## Commands
 
 | Group | Subcommands |
@@ -71,6 +78,7 @@ Each `[analyses.<tool>]` declares `uses = [...]`; `append` auto-snapshots the cu
 | later | `migrate-lineage`, `add-batch`, `link-sources`, `project`, `migrate-status` |
 | cohort artifacts (0009) | `append-cohort`, `cohort-artifacts`, `migrate-cohort` |
 | reference artifacts (0010) | `references`, `migrate-references` (+ `append`/`append-cohort` `--uses-references`) |
+| derivation / lineage (0011) | `derived-from`, `derivation`, `migrate-derivation` (+ `append`/`append-cohort` `--derived-from`) |
 
 Note: `cohort` (v0.4) is the paired-design *readiness* view; `cohort-artifacts` (0009) lists cohort-level *output artifacts* with staleness — different things.
 
@@ -176,3 +184,5 @@ casetrack/
 > For cohort-level artifacts: read `docs/proposals/0009-cohort-level-artifacts.md` (§7 = why no 4th level; §9 = nothing open). Code is `casetrack_qc/cohort_artifacts.py` (+ `_cli.py`); `casetrack_mcp/` has the agent-facing tool. casetrack.py read-path hooks: `cmd_dashboard_project` (section), `_prepare_v03_query_connection` (`_cohort_artifacts` view), `cmd_status_project` + `cmd_export_project`. The Nextflow process/subworkflow live in `examples/nextflow/`.
 >
 > For reference artifacts: read `docs/proposals/0010-reference-artifacts.md` (§6.2 = three-state staleness + orthogonality to 0009; §7 = rejected alternatives). Code is `casetrack_qc/reference_artifacts.py` (+ `_cli.py`); the `_reference_usage` view + `_cohort_artifacts.ref_stale` live in `casetrack_qc/reader.py`. casetrack.py hooks: init schema in `cmd_init_project`, sync in `_schema_apply`, capture in `cmd_append_project` (`capture_reference_usage`), `_emit_references_section` (status), export `--include-references`, dashboard `_references_html`, validate orphan check. MCP tool `casetrack_references` in `casetrack_mcp/`. The version contract is TOML `[references]` → `reference_artifacts`; bump a `version` + `schema apply` to flip outputs stale.
+>
+> For artifact-to-artifact lineage: read `docs/proposals/0011-artifact-to-artifact-lineage.md` (§0 = nine locked decisions; §7 = rejected alternatives). Code is `casetrack_qc/artifact_derivation.py` (+ `_cli.py`); the `_artifact_derivation` view + `derived_stale` on `_cohort_artifacts` live in `casetrack_qc/reader.py`. casetrack.py hooks: init schema in `cmd_init_project`, capture via `--derived-from` in `cmd_append_project`/`cmd_append_cohort`, `_emit_derivation_section` (status), export `--include-derivation`, dashboard `_derivation_html`, validate dangling + acyclic checks. MCP tool `casetrack_derivation` in `casetrack_mcp/`. The `derivation` command inspects the DAG; `derived-from` adds edges; `migrate-derivation` retrofits. Command name is `derivation` (not `lineage`) because 0006 already owns `casetrack lineage`.
