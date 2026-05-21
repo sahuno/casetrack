@@ -167,3 +167,69 @@ def test_migrate_derivation_dry_run(tmp_path):
     assert "dry-run" in r.stdout.lower()
     conn = casetrack.open_project_db(proj / "casetrack.db")
     assert not ad.derivation_schema_exists(conn)
+
+
+# ── Task 6: init hook + TOML derived_from materialization ───────────────────
+
+
+def test_init_creates_derivation_table(tmp_path):
+    """``casetrack init`` creates the artifact_derivation table on fresh projects."""
+    proj = _init_project(tmp_path)
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        assert ad.derivation_schema_exists(conn)
+    finally:
+        conn.close()
+
+
+def test_toml_derived_from_materialized_on_schema_apply(tmp_path):
+    """[references.pon].derived_from is materialized into artifact_derivation on ``schema apply``."""
+    from casetrack_qc import cohort_artifacts as _ca
+
+    proj = _init_project(tmp_path)
+
+    # Register the upstream cohort artifact the reference derives from.
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        _ca.ensure_cohort_artifacts_schema(conn)
+        _ca.insert_artifact(
+            conn,
+            analysis="make_pon",
+            run_tag="v1",
+            path="/x/pon",
+            n_inputs=0,
+            transaction_id="t",
+            checksum=None,
+            stats_json=None,
+            created_by="t",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Append a [references.pon] block with derived_from to the TOML.
+    toml_path = proj / "casetrack.toml"
+    toml_path.write_text(
+        toml_path.read_text()
+        + (
+            '\n[references.pon]\n'
+            'path = "/x/pon.vcf"\n'
+            'version = "pon_v1"\n'
+            'kind = "known_variants"\n'
+            'derived_from = ["cohort:make_pon@v1"]\n'
+        )
+    )
+
+    # Run schema apply and assert the edge was recorded.
+    r = _run(["schema", "apply", "--project-dir", str(proj)])
+    assert r.returncode == 0, r.stderr
+
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        edges = ad.list_edges(conn)
+        assert any(
+            e["down_node"] == "reference:pon" and e["up_node"] == "cohort:make_pon@v1"
+            for e in edges
+        ), f"expected edge not found; edges={edges}"
+    finally:
+        conn.close()

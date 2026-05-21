@@ -574,6 +574,13 @@ def _validate_references(references: dict) -> None:
                 f"[references.{ref_key}] kind={kind!r} must be one of "
                 f"{list(REFERENCE_KINDS)}"
             )
+        # Proposal 0011: optional derived_from — list of upstream node-ref strings.
+        df = spec.get("derived_from")
+        if df is not None:
+            if not isinstance(df, list) or not all(isinstance(x, str) for x in df):
+                raise SchemaError(
+                    f"[references.{ref_key}] derived_from must be a list of node-refs"
+                )
 
 
 def _validate_level(level: str, spec: dict) -> None:
@@ -1551,6 +1558,9 @@ def cmd_init_project(args):
     from casetrack_qc.reference_artifacts import (
         ensure_reference_schema as _ensure_reference_schema,
     )
+    from casetrack_qc.artifact_derivation import (
+        ensure_derivation_schema as _ensure_derivation_schema,
+    )
 
     conn = open_project_db(db_path)
     qc_ddl: list[str] = []
@@ -1563,6 +1573,8 @@ def cmd_init_project(args):
             _ensure_cohort_artifacts_schema(conn)
             # Proposal 0010: reference-artifact sibling tables, same init txn.
             _ensure_reference_schema(conn)
+            # Proposal 0011: artifact_derivation sibling table, same init txn.
+            _ensure_derivation_schema(conn)
             # v0.6 Part B: write the project_meta row in the same
             # transaction as the QC schema so init is atomic.
             write_project_meta(
@@ -4854,6 +4866,23 @@ def _schema_apply(project_dir: Path, schema: dict, issues: list[dict]) -> None:
             with begin_immediate(conn):
                 ensure_reference_schema(conn)
                 ref_changes = sync_references_from_toml(conn, references)
+                # Proposal 0011: materialize [references.<key>].derived_from edges.
+                from casetrack_qc.artifact_derivation import (
+                    ensure_derivation_schema as _ensure_deriv,
+                    record_edge as _record_edge,
+                    DerivationError as _DerivErr,
+                )
+                _ensure_deriv(conn)
+                for ref_key, spec in references.items():
+                    for up in (spec.get("derived_from") or []):
+                        try:
+                            _record_edge(conn, down=f"reference:{ref_key}", up=up,
+                                         transaction_id=txn_id)
+                        except _DerivErr as e:
+                            print(
+                                f"Warning: skipping derived_from for {ref_key}: {e}",
+                                file=sys.stderr,
+                            )
         finally:
             conn.close()
         for ch in ref_changes:
