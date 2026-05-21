@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>How casetrack works</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a212b;
+    --panel2: #232c38;
+    --ink: #e6edf3;
+    --muted: #9aa7b4;
+    --line: #30363d;
+    --blue: #4493f8;
+    --green: #3fb950;
+    --amber: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --teal: #39c5cf;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.6; font-size: 16px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px 96px; }
+  header {
+    padding: 56px 24px 40px; text-align: center;
+    background: radial-gradient(ellipse at top, #18222e 0%, var(--bg) 70%);
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 2.6rem; margin: 0 0 8px; letter-spacing: -.02em; }
+  header .tag { color: var(--muted); font-size: 1.15rem; max-width: 640px; margin: 0 auto; }
+  header .pills { margin-top: 18px; }
+  .pill {
+    display: inline-block; font-family: var(--mono); font-size: .8rem;
+    background: var(--panel2); border: 1px solid var(--line); color: var(--teal);
+    padding: 3px 10px; border-radius: 999px; margin: 3px;
+  }
+  h2 {
+    font-size: 1.6rem; margin: 56px 0 6px; letter-spacing: -.01em;
+    display: flex; align-items: center; gap: 12px;
+  }
+  h2 .num {
+    font-family: var(--mono); font-size: 1rem; color: var(--bg);
+    background: var(--blue); width: 30px; height: 30px; flex: 0 0 30px;
+    border-radius: 8px; display: grid; place-items: center; font-weight: 700;
+  }
+  h2 + .sub { color: var(--muted); margin: 0 0 20px; }
+  h3 { font-size: 1.15rem; margin: 28px 0 8px; color: var(--ink); }
+  p { color: #d4dce4; }
+  code {
+    font-family: var(--mono); font-size: .88em; background: #11161d;
+    border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; color: var(--teal);
+  }
+  pre {
+    background: #0b0f14; border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; overflow-x: auto; font-family: var(--mono);
+    font-size: .85rem; line-height: 1.55; color: #cdd9e5;
+  }
+  pre .c { color: #6e7b8a; }      /* comment */
+  pre .k { color: var(--purple); } /* keyword/command */
+  pre .f { color: var(--amber); }  /* flag */
+  pre .s { color: var(--green); }  /* string */
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 22px 24px; margin: 18px 0;
+  }
+  .callout {
+    border-left: 4px solid var(--amber); background: #21242b;
+    border-radius: 0 8px 8px 0; padding: 12px 18px; margin: 18px 0;
+  }
+  .callout.danger { border-color: var(--red); }
+  .callout.good   { border-color: var(--green); }
+  .callout strong { color: var(--ink); }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: .92rem; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: .82rem; text-transform: uppercase; letter-spacing: .04em; }
+  td code { white-space: nowrap; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px){ .grid2 { grid-template-columns: 1fr; } }
+
+  /* hierarchy diagram */
+  .tree { display: flex; flex-direction: column; gap: 0; align-items: flex-start; margin: 8px 0; }
+  .node {
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px 18px;
+    background: var(--panel2); position: relative;
+  }
+  .node .lvl { font-family: var(--mono); font-weight: 700; font-size: 1.05rem; }
+  .node .desc { color: var(--muted); font-size: .85rem; }
+  .node.patient { border-left: 4px solid var(--blue); }
+  .node.specimen { border-left: 4px solid var(--green); margin-left: 40px; }
+  .node.assay { border-left: 4px solid var(--amber); margin-left: 80px; }
+  .connector { width: 2px; height: 18px; background: var(--line); margin-left: 20px; }
+  .connector.s2 { margin-left: 60px; }
+
+  /* flow row */
+  .flow { display: flex; align-items: stretch; gap: 0; flex-wrap: wrap; margin: 14px 0; }
+  .step {
+    flex: 1; min-width: 150px; background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px 16px; position: relative;
+  }
+  .step .ph { font-family: var(--mono); font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .step .t { font-weight: 700; margin: 4px 0; }
+  .step .d { font-size: .85rem; color: var(--muted); }
+  .arrow { display: grid; place-items: center; padding: 0 6px; color: var(--blue); font-size: 1.5rem; flex: 0 0 auto; }
+  @media (max-width: 720px){
+    .flow { flex-direction: column; }
+    .arrow { transform: rotate(90deg); padding: 4px 0; }
+  }
+  .badge { font-family: var(--mono); font-size: .72rem; padding: 1px 7px; border-radius: 5px; border: 1px solid var(--line); }
+  .b-meta { color: var(--blue); }
+  .b-app  { color: var(--green); }
+  .b-qc   { color: var(--amber); }
+  a { color: var(--blue); }
+  .toc { columns: 2; column-gap: 28px; font-size: .95rem; }
+  @media (max-width: 720px){ .toc { columns: 1; } }
+  .toc a { display: block; padding: 3px 0; color: #c7d2dc; text-decoration: none; }
+  .toc a:hover { color: var(--blue); }
+  footer { text-align: center; color: var(--muted); font-size: .82rem; margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--line); }
+  .keyword { color: var(--purple); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>casetrack</h1>
+  <p class="tag">A manifest-centric case-management CLI that records <em>what has been analyzed</em> — and <em>what remains usable</em> — across a multi-patient, multi-specimen, multi-assay genomics cohort.</p>
+  <div class="pills">
+    <span class="pill">SQLite source-of-truth</span>
+    <span class="pill">3-level hierarchy</span>
+    <span class="pill">QC / censoring</span>
+    <span class="pill">Nextflow-native</span>
+    <span class="pill">SLURM / HPC</span>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="panel">
+    <strong>Contents</strong>
+    <nav class="toc">
+      <a href="#what">1 · The core idea: a tracker, not a scheduler</a>
+      <a href="#hierarchy">2 · The 3-level hierarchy</a>
+      <a href="#meta-vs-append">3 · add-metadata vs append</a>
+      <a href="#schema">4 · Schema = the TOML contract</a>
+      <a href="#three-phase">5 · The 3-phase analysis flow</a>
+      <a href="#cohort-build">6 · Building a cohort from scratch</a>
+      <a href="#queue">7 · The DB as a work queue</a>
+      <a href="#nextflow">8 · Nextflow integration flow</a>
+      <a href="#qc">9 · QC events &amp; censoring</a>
+      <a href="#cohort-art">10 · Cohort-level artifacts</a>
+      <a href="#layout">11 · On-disk layout</a>
+      <a href="#cheat">12 · Command cheatsheet</a>
+    </nav>
+  </div>
+
+  <!-- 1 -->
+  <h2 id="what"><span class="num">1</span> A tracker, not a scheduler</h2>
+  <p class="sub">The single most important mental model.</p>
+  <p>casetrack does <strong>not</strong> run analyses. Your pipelines do — Nextflow, Snakemake, or raw SLURM jobs execute the actual basecalling, alignment, variant calling, and methylation work. casetrack <strong>stores the facts afterward</strong>: which analyses completed, which samples are pending, which are blocked by QC.</p>
+
+  <div class="flow">
+    <div class="step"><div class="ph">Pipelines</div><div class="t">Run the work</div><div class="d">Nextflow / Snakemake / SLURM produce BAMs, VCFs, bedMethyl…</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="ph">casetrack</div><div class="t">Records the facts</div><div class="d">One SQLite DB: who's done, who's pending, who's censored.</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="ph">You / agents</div><div class="t">Query &amp; decide</div><div class="d">Generate the next batch's samplesheet from the DB.</div></div>
+  </div>
+
+  <p>The source of truth is a single <code>casetrack.db</code> (SQLite, WAL-mode). The TSV manifest you may be used to becomes an <em>on-demand export</em>, not the master copy.</p>
+
+  <!-- 2 -->
+  <h2 id="hierarchy"><span class="num">2</span> The 3-level hierarchy</h2>
+  <p class="sub">Everything hangs off a strict, foreign-key-enforced ontology.</p>
+
+  <div class="tree">
+    <div class="node patient">
+      <div class="lvl">patients</div>
+      <div class="desc">clinical / demographic metadata — sex, cohort, timepoint, age, consent…</div>
+    </div>
+    <div class="connector"></div>
+    <div class="node specimen">
+      <div class="lvl">specimens</div>
+      <div class="desc">a biological sample — tumor / normal / cell line. <strong>Most analysis tracking lives here.</strong></div>
+    </div>
+    <div class="connector s2"></div>
+    <div class="node assay">
+      <div class="lvl">assays</div>
+      <div class="desc">an individual sequencing run — per-run basecalling &amp; QC live here.</div>
+    </div>
+  </div>
+
+  <p>Registration order is fixed: <span class="keyword">patient → specimen → assay</span>. A specimen row needs its <code>patient_id</code>; an assay row needs its <code>specimen_id</code>. Each analysis is declared to run at exactly one level:</p>
+
+  <table>
+    <tr><th>Analysis kind</th><th>Level</th><th>Examples</th></tr>
+    <tr><td>Per-run</td><td><code>assay</code></td><td>dorado basecalling, per-run QC</td></tr>
+    <tr><td>Per-sample</td><td><code>specimen</code></td><td>samtools sort, modkit pileup, SV calling, merge</td></tr>
+    <tr><td>Per-patient</td><td><code>patient</code></td><td>cohort summary, family-level SV</td></tr>
+  </table>
+
+  <!-- 3 -->
+  <h2 id="meta-vs-append"><span class="num">3</span> <code>add-metadata</code> vs <code>append</code></h2>
+  <p class="sub">The #1 source of confusion — and silent failures. Internalize this.</p>
+
+  <p>Ask one question: <strong>am I registering an entity, or recording that an analysis ran?</strong></p>
+
+  <div class="grid2">
+    <div class="panel">
+      <span class="badge b-meta">add-metadata</span>
+      <h3 style="margin-top:10px">Builds the cohort</h3>
+      <p>Populates native schema columns on patients / specimens / assays. Use it to <strong>declare who exists</strong>.</p>
+      <ul style="color:#c7d2dc; font-size:.92rem">
+        <li>No <code>--analysis</code> flag</li>
+        <li>Creates new rows with <code>--allow-new --yes</code></li>
+        <li>Columns land as-is</li>
+        <li>Does <strong>not</strong> write a <code>_done</code> timestamp</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <span class="badge b-app">append</span>
+      <h3 style="margin-top:10px">Records analysis results</h3>
+      <p>Fills in the result columns for a tool that already ran. The cohort must already exist.</p>
+      <ul style="color:#c7d2dc; font-size:.92rem">
+        <li>Requires <code>--analysis &lt;name&gt;</code> (must match TOML)</li>
+        <li><strong>Cannot</strong> create new rows</li>
+        <li>Every result column gets a <code>{prefix}_</code></li>
+        <li>Writes <code>{analysis}_done = now()</code></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout danger">
+    <strong>The silent gotcha — <code>--overwrite</code>.</strong> <code>append</code> defaults to <em>fill-only</em>: an existing non-NULL cell is never updated. A rerun with fresh stats silently no-ops at the DB level with no error. <strong>Always pass <code>--overwrite</code> for analysis results.</strong> Fill-only is only correct when backfilling empty cells.
+  </div>
+
+  <!-- 4 -->
+  <h2 id="schema"><span class="num">4</span> Schema = the TOML contract</h2>
+  <p class="sub">Changes flow one way: TOML → DB. Never the reverse.</p>
+
+  <p><code>casetrack.toml</code> declares the schema; the SQLite DB mirrors it. Edit the TOML, then apply — non-destructive <code>ALTER TABLE</code>s run for you.</p>
+
+<pre><span class="c"># after editing [levels.*.columns] or adding [analyses.&lt;name&gt;]:</span>
+<span class="k">casetrack</span> schema apply <span class="f">--project-dir</span> .
+<span class="c"># → "Applied N schema change(s); schema_v X → Y"</span></pre>
+
+  <div class="callout danger">
+    <strong>Never edit <code>casetrack.db</code> directly</strong> and never run ad-hoc <code>ALTER TABLE</code>. The TOML is the source of truth; the DB is a cached materialization. Forgetting <code>schema apply</code> after a TOML edit ⇒ new columns are invisible (<code>no such column</code>).
+  </div>
+
+  <!-- 5 -->
+  <h2 id="three-phase"><span class="num">5</span> The 3-phase analysis flow</h2>
+  <p class="sub">Every analysis — local, SLURM, or Nextflow — follows the same shape.</p>
+
+  <div class="flow">
+    <div class="step"><div class="ph">Phase 1</div><div class="t">Run the tool</div><div class="d">Nextflow / SLURM / local script produces outputs.</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="ph">Phase 2</div><div class="t">Summarize → TSV</div><div class="d">One row per entity at the analysis's level. First column = the level's key.</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="ph">Phase 3</div><div class="t">casetrack append</div><div class="d"><code>--overwrite</code>. Stats land prefixed; <code>_done</code> stamped.</div></div>
+  </div>
+
+  <p>Example — after <code>samtools sort</code> on 6 specimens, with a summary keyed on <code>specimen_id</code>:</p>
+
+<pre><span class="c"># summary.tsv columns:</span>
+<span class="c">#   specimen_id  sorted_bam_path  sorted_bam_size_bytes  n_reads  sort_order</span>
+
+<span class="k">casetrack</span> append <span class="f">--project-dir</span> . \
+  <span class="f">--analysis</span> samtools_sort \
+  <span class="f">--results</span> <span class="s">/tmp/sort_summary.tsv</span> \
+  <span class="f">--overwrite</span>
+
+<span class="c"># prefix "sort" comes from [analyses.samtools_sort].column_prefix in TOML →</span>
+<span class="c"># writes: sort_sorted_bam_path, sort_n_reads, … , samtools_sort_done = now()</span></pre>
+
+  <p>If the summary TSV also carries <code>qc_pass</code> / <code>qc_fail_reason</code> / <code>qc_warn</code> columns, casetrack auto-emits QC events inside the same transaction (v0.4+).</p>
+
+  <!-- 6 -->
+  <h2 id="cohort-build"><span class="num">6</span> Building a cohort from scratch</h2>
+  <p class="sub">The canonical bootstrap sequence.</p>
+
+<pre><span class="c"># 1. create the project</span>
+<span class="k">casetrack</span> init <span class="f">--project-dir</span> /path/cohort_X <span class="f">--project-name</span> cohort_X
+
+<span class="c"># 2. edit cohort_X/casetrack.toml — add columns (sample_id, timepoint, pod5_path…)</span>
+<span class="c">#    and declare analyses: [analyses.&lt;tool&gt;] { level, column_prefix, summary_tsv }</span>
+
+<span class="c"># 3. apply the schema</span>
+<span class="k">casetrack</span> schema apply <span class="f">--project-dir</span> .
+
+<span class="c"># 4–6. register entities — parents first (FK!)</span>
+<span class="k">casetrack</span> add-metadata <span class="f">--project-dir</span> . <span class="f">--level</span> patient  <span class="f">--metadata</span> patients.tsv  <span class="f">--allow-new --yes</span>
+<span class="k">casetrack</span> add-metadata <span class="f">--project-dir</span> . <span class="f">--level</span> specimen <span class="f">--metadata</span> specimens.tsv <span class="f">--allow-new --yes</span>
+<span class="k">casetrack</span> add-metadata <span class="f">--project-dir</span> . <span class="f">--level</span> assay    <span class="f">--metadata</span> assays.tsv    <span class="f">--allow-new --yes</span></pre>
+
+  <div class="callout good">
+    <strong>Add <code>pod5_path</code> to your assay columns.</strong> It's what lets you drive Nextflow samplesheets straight from the DB (§7). Missing it is a common regret.
+  </div>
+
+  <!-- 7 -->
+  <h2 id="queue"><span class="num">7</span> The DB as a work queue</h2>
+  <p class="sub">casetrack already knows what's done and what's pending — so query it to build the next batch.</p>
+
+  <div class="flow">
+    <div class="step"><div class="ph">1</div><div class="t">Query pending</div><div class="d">SELECT samples WHERE <code>{analysis}_done IS NULL</code> AND <code>qc_status='pass'</code>.</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="ph">2</div><div class="t">→ samplesheet</div><div class="d">Pipe to CSV; submit to Nextflow / Snakemake.</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="ph">3</div><div class="t">append --overwrite</div><div class="d">DB stays current; the pending query shrinks next run.</div></div>
+  </div>
+
+<pre><span class="c"># all normals that still need basecalling, excluding censored samples</span>
+<span class="k">casetrack</span> query <span class="f">--project-dir</span> . <span class="f">--sql</span> <span class="s">"
+  SELECT a.assay_id, p.patient_id, s.specimen_id, a.pod5_path, 'hg38' AS genome
+  FROM assays a
+  JOIN specimens s ON a.specimen_id = s.specimen_id
+  JOIN patients  p ON s.patient_id  = p.patient_id
+  WHERE a.condition = 'normal'
+    AND a.qc_status = 'pass'
+    AND a.dorado_basecaller_done IS NULL"</span></pre>
+
+  <p>Resubmit any time: Nextflow <code>-resume</code> skips finished tasks, <code>append --overwrite</code> keeps the DB honest. Prefer the <code>_active</code> view over raw tables — it also cascades parent censoring.</p>
+
+  <!-- 8 -->
+  <h2 id="nextflow"><span class="num">8</span> Nextflow integration flow</h2>
+  <p class="sub">Phase 3 becomes a process: <code>CASETRACK_REGISTER</code>.</p>
+
+  <div class="flow">
+    <div class="step"><div class="ph">process</div><div class="t">TOOL_PROCESS</div><div class="d">runs the tool</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="ph">process</div><div class="t">SUMMARIZE_TOOL</div><div class="d">emits a 1-row TSV</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="ph">process</div><div class="t">CASETRACK_REGISTER</div><div class="d"><code>append --infer-from-path --overwrite</code></div></div>
+  </div>
+
+<pre><span class="k">include</span> { CASETRACK_REGISTER } <span class="k">from</span> <span class="s">'../modules/local/casetrack_register'</span>
+
+<span class="k">workflow</span> FOO_TRACKED {
+    take: inputs
+    main:
+    TOOL_PROCESS(inputs)                                <span class="c">// Phase 1</span>
+    SUMMARIZE_TOOL(TOOL_PROCESS.out.files)              <span class="c">// Phase 2</span>
+    CASETRACK_REGISTER(                                 <span class="c">// Phase 3</span>
+        SUMMARIZE_TOOL.out.summary.map { meta, tsv -&gt;
+            tuple(meta, <span class="s">'samtools_sort'</span>, <span class="s">'samtools_sort_summary.tsv'</span>, tsv)
+        }
+    )
+}</span></pre>
+
+  <p>The tool name, run_tag, patient, specimen and assay_id are recovered from the publish path — no explicit flags. Required params on every run:</p>
+  <table>
+    <tr><th>Param</th><th>Meaning</th></tr>
+    <tr><td><code>--casetrack_project_dir</code></td><td>absolute path, <em>outside</em> the NF work dir</td></tr>
+    <tr><td><code>--run_tag</code></td><td><code>{YYYYMMDD}_{genome}_{description}</code></td></tr>
+    <tr><td><code>--casetrack_level</code></td><td><code>assay | specimen | patient</code></td></tr>
+    <tr><td><code>--casetrack_bin</code></td><td>defaults to <code>casetrack</code></td></tr>
+  </table>
+  <div class="callout">
+    <strong><code>CASETRACK_REGISTER</code> runs on the <code>local</code> executor with <code>maxForks = 1</code>.</strong> SQLite is WAL-mode, but serializing writes keeps the provenance log readable.
+  </div>
+
+  <!-- 9 -->
+  <h2 id="qc"><span class="num">9</span> QC events &amp; censoring</h2>
+  <p class="sub">Append-only audit log. Nothing is ever deleted.</p>
+
+  <div class="flow">
+    <div class="step"><div class="ph">censor</div><div class="t">Open an event</div><div class="d">writes an event + sets <code>qc_status</code>.</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="ph">_active view</div><div class="t">Hides the entity</div><div class="d">excludes it (and cascades parent censoring).</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="ph">uncensor</div><div class="t">Resolve it</div><div class="d">writes <code>resolved_at</code> — never deletes the row.</div></div>
+  </div>
+
+<pre><span class="c"># temporary hold</span>
+<span class="k">casetrack</span> censor <span class="f">--project-dir</span> . <span class="f">--level</span> assay <span class="f">--id</span> &lt;id&gt; \
+  <span class="f">--kind</span> qc_warn <span class="f">--reason</span> <span class="s">"pod5 rsync incomplete 2026-04-21"</span>
+
+<span class="c"># permanent exclusion</span>
+<span class="k">casetrack</span> censor <span class="f">--project-dir</span> . <span class="f">--level</span> assay <span class="f">--id</span> &lt;id&gt; \
+  <span class="f">--kind</span> qc_fail <span class="f">--reason</span> <span class="s">"basecalling accuracy &lt;80%"</span>
+
+<span class="c"># lift the hold</span>
+<span class="k">casetrack</span> uncensor <span class="f">--project-dir</span> . <span class="f">--level</span> assay <span class="f">--id</span> &lt;id&gt; \
+  <span class="f">--reason</span> <span class="s">"pod5 rsync confirmed complete"</span></pre>
+
+  <p><strong>QC kinds:</strong> <code>qc_fail</code>, <code>qc_warn</code>, <code>consent_revoked</code>, <code>sequencing_run_failed</code>, <code>library_prep_failed</code>, <code>basecall_accuracy_low</code>, <code>contamination</code>, <code>protocol_deviation</code>, <code>batch_effect_flagged</code>, <code>superseded</code>, <code>other</code>.</p>
+  <p><strong>Entity <code>qc_status</code>:</strong> <code>pass</code> · <code>warn</code> · <code>fail</code> · <code>censored</code>.</p>
+  <div class="callout danger">
+    <strong><code>consent_revoked</code> is patient-level only</strong> and cascades to all specimens/assays under that patient. Reversing it requires <code>--ethics-override --yes</code> <em>and</em> an IRB reference in the reason.
+  </div>
+
+  <!-- 10 -->
+  <h2 id="cohort-art"><span class="num">10</span> Cohort-level artifacts</h2>
+  <p class="sub">For one output built from <em>many</em> assays — joint VCFs, panels-of-normals, cohort matrices.</p>
+
+  <p>The 3-level hierarchy is biological, single-parent, and static — it can't represent an output that spans dozens of assays. So casetrack adds <strong>two additive sibling tables</strong> (the same pattern as <code>qc_events</code> — the core hierarchy is untouched):</p>
+  <table>
+    <tr><th>Table</th><th>Role</th></tr>
+    <tr><td><code>cohort_artifacts</code></td><td>one row per cohort output, keyed by <code>(analysis, run_tag)</code></td></tr>
+    <tr><td><code>cohort_artifact_inputs</code></td><td>many-to-many lineage to each contributing <code>assay_id</code></td></tr>
+  </table>
+
+  <div class="callout">
+    <strong>Staleness is read-time, not stored.</strong> An artifact is <code>STALE</code> when <em>any</em> contributing assay is currently censored or consent-revoked — derived live from the QC cascade, so it tracks censor/uncensor automatically. Staleness is <em>flagged, not auto-fixed</em>: re-running is the operator's call.
+  </div>
+  <p>Surfaced everywhere: the <code>cohort-artifacts</code> command, <code>status</code>, the <code>_cohort_artifacts</code> DuckDB query view, <code>export --include-cohort-artifacts</code>, the HTML dashboard, and the <code>casetrack_cohort_artifacts</code> MCP tool. (A 4th hierarchy level was explicitly rejected — see proposal 0009 §7.)</p>
+
+  <!-- 11 -->
+  <h2 id="layout"><span class="num">11</span> On-disk layout</h2>
+  <p class="sub">Persistent biological files vs. per-run summaries.</p>
+
+<pre>{project_dir}/
+├── casetrack.toml
+├── casetrack.db
+├── data/processed/{genome}/{patient_id}/{assay_id}/   <span class="c">← persistent biology</span>
+│     {assay_id}.{genome}.sorted.bam
+│     {assay_id}.{genome}.sniffles.vcf.gz
+└── results/{tool}/{run_tag}/{patient_id}/{specimen_id}/{assay_id}/  <span class="c">← summary TSVs</span></pre>
+
+  <p>The DB stores the <code>data/processed/</code> path from each summary TSV, so downstream tools find files <em>by query</em> rather than by filesystem scan. Run-tag convention: <code>{YYYYMMDD}_{genome}_{description}</code>.</p>
+
+  <!-- 12 -->
+  <h2 id="cheat"><span class="num">12</span> Command cheatsheet</h2>
+  <p class="sub">Always use <code>--project-dir</code> (project mode). <code>--manifest</code> is legacy flat mode — avoid it.</p>
+
+<pre><span class="c"># project lifecycle</span>
+<span class="k">casetrack</span> init <span class="f">--project-dir</span> PATH <span class="f">--project-name</span> NAME
+<span class="k">casetrack</span> schema apply <span class="f">--project-dir</span> .
+<span class="k">casetrack</span> schema show  <span class="f">--project-dir</span> .
+
+<span class="c"># entity registration</span>
+<span class="k">casetrack</span> add-metadata <span class="f">--project-dir</span> . <span class="f">--level</span> patient  <span class="f">--metadata</span> p.tsv <span class="f">--allow-new --yes</span>
+<span class="k">casetrack</span> add-metadata <span class="f">--project-dir</span> . <span class="f">--level</span> specimen <span class="f">--metadata</span> s.tsv <span class="f">--allow-new --yes</span>
+<span class="k">casetrack</span> add-metadata <span class="f">--project-dir</span> . <span class="f">--level</span> assay    <span class="f">--metadata</span> a.tsv <span class="f">--allow-new --yes</span>
+
+<span class="c"># analysis tracking (--overwrite, always)</span>
+<span class="k">casetrack</span> append <span class="f">--project-dir</span> . <span class="f">--analysis</span> NAME <span class="f">--results</span> summary.tsv <span class="f">--overwrite</span>
+
+<span class="c"># QC</span>
+<span class="k">casetrack</span> censor   <span class="f">--project-dir</span> . <span class="f">--level</span> LEVEL <span class="f">--id</span> ID <span class="f">--kind</span> qc_warn <span class="f">--reason</span> <span class="s">"…"</span>
+<span class="k">casetrack</span> uncensor <span class="f">--project-dir</span> . <span class="f">--level</span> LEVEL <span class="f">--id</span> ID <span class="f">--reason</span> <span class="s">"…"</span>
+<span class="k">casetrack</span> qc-history <span class="f">--project-dir</span> . <span class="f">--id</span> ID
+
+<span class="c"># querying &amp; health</span>
+<span class="k">casetrack</span> status   <span class="f">--project-dir</span> .
+<span class="k">casetrack</span> query    <span class="f">--project-dir</span> . <span class="f">--sql</span> <span class="s">"SELECT … FROM _active WHERE …"</span>
+<span class="k">casetrack</span> validate <span class="f">--project-dir</span> .
+<span class="k">casetrack</span> doctor   <span class="f">--project-dir</span> .</span></pre>
+
+  <h3>Pitfalls in one glance</h3>
+  <table>
+    <tr><th>Pitfall</th><th>Symptom</th><th>Fix</th></tr>
+    <tr><td>Forgot <code>--overwrite</code></td><td>rerun doesn't update DB</td><td>add it — always</td></tr>
+    <tr><td>Wrong <code>--analysis</code> name</td><td>"no such analysis"</td><td>match <code>[analyses.&lt;name&gt;]</code> in TOML</td></tr>
+    <tr><td>Column not in TOML</td><td><code>no such column</code></td><td>add to TOML → <code>schema apply</code></td></tr>
+    <tr><td>Registration order</td><td>FK constraint error</td><td>patient → specimen → assay</td></tr>
+    <tr><td><code>append</code> for new entities</td><td>"ID not found"</td><td>use <code>add-metadata --allow-new --yes</code></td></tr>
+    <tr><td><code>add-metadata</code> for results</td><td>no <code>_done</code> stamp</td><td>use <code>append --analysis</code></td></tr>
+    <tr><td>Queried raw table</td><td>censored samples appear</td><td>use the <code>_active</code> view</td></tr>
+  </table>
+
+  <footer>
+    casetrack · manifest-centric case management for HPC bioinformatics cohorts ·
+    <a href="https://github.com/sahuno/casetrack">github.com/sahuno/casetrack</a><br>
+    Generated explainer — open in any browser, no internet required.
+  </footer>
+
+</div>
+</body>
+</html>

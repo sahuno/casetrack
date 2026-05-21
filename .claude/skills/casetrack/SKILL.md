@@ -1,6 +1,6 @@
 ---
 name: casetrack
-description: Use this skill whenever the user works with **casetrack** — the manifest-centric bioinformatics case management CLI that tracks which analyses have run across multi-patient, multi-specimen, multi-assay cohorts (cancer genomics, ONT/Illumina WGS, RNA-seq). Trigger it for anything involving casetrack projects, including: initializing a project, registering patients/specimens/assays, running `casetrack init | add-metadata | append | schema apply | query | status | censor | uncensor`, recording analysis results in the cohort database, generating Nextflow or Snakemake samplesheets from the DB, tracking which samples still need basecalling/sort/variant calling/methylation, managing QC events and consent flags, integrating `CASETRACK_REGISTER` into a Nextflow pipeline, or querying a `casetrack.db` via SQL. Trigger even when the user says "cohort database", "sample tracker", "case manifest", "sample manifest", or describes a tumor-normal cohort with per-sample analysis progress — those are all casetrack territory. Do not trigger for generic Snakemake/Nextflow questions, unless they involve casetrack integration.
+description: Use this skill whenever the user works with **casetrack** — the manifest-centric bioinformatics case management CLI that tracks which analyses have run across multi-patient, multi-specimen, multi-assay cohorts (cancer genomics, ONT/Illumina WGS, RNA-seq). Trigger it for anything involving casetrack projects, including: initializing a project, registering patients/specimens/assays, running `casetrack init | add-metadata | append | schema apply | query | status | censor | uncensor`, recording analysis results in the cohort database, generating Nextflow or Snakemake samplesheets from the DB, tracking which samples still need basecalling/sort/variant calling/methylation, managing QC events and consent flags, integrating `CASETRACK_REGISTER` into a Nextflow pipeline, querying a `casetrack.db` via SQL, or registering **cohort-level artifacts** that span many assays (joint-genotyped VCFs, panels-of-normals, cohort matrices) with `append-cohort` / `cohort-artifacts` / `migrate-cohort` and checking their staleness. Trigger even when the user says "cohort database", "sample tracker", "case manifest", "sample manifest", "joint VCF tracking", "panel of normals tracking", "is my cohort matrix stale", or describes a tumor-normal cohort with per-sample analysis progress — those are all casetrack territory. Do not trigger for generic Snakemake/Nextflow questions, unless they involve casetrack integration.
 ---
 
 # casetrack skill
@@ -22,6 +22,9 @@ Ask yourself: am I registering an entity (adding a new patient/specimen/assay ro
 | Record that an analysis ran (fill stats columns) | `casetrack append` | `--analysis <name> --results summary.tsv --overwrite` |
 | Flag a sample with a QC hold | `casetrack censor` | `--level ... --id ... --kind qc_warn --reason "..."` |
 | Lift a QC hold | `casetrack uncensor` | `--level ... --id ... --reason "..."` |
+| Register a cohort-level output (joint VCF, PoN, matrix) | `casetrack append-cohort` | `--analysis ... --run-tag ... --path ... --inputs a,b,c` |
+| List cohort artifacts + staleness | `casetrack cohort-artifacts` | `--project-dir . [--stale-only]` |
+| Add cohort-artifact tables to a pre-0009 project | `casetrack migrate-cohort` | `--project-dir . [--dry-run]` |
 | See overall progress | `casetrack status` | `--project-dir .` |
 | Run arbitrary SQL | `casetrack query` | `--project-dir . --sql "..."` |
 | Inspect current DB schema | `casetrack schema show` | `--project-dir .` |
@@ -44,6 +47,8 @@ Analysis placement:
 - **Per-patient** analyses (cohort-level summary, family-level SV) → `patient` level
 
 Each analysis declared in TOML writes a `{analysis}_done` timestamp + its result columns to the declared level. Check `[analyses.<name>].level` in `casetrack.toml` when in doubt.
+
+An output that spans **many** assays at once (a joint-genotyped VCF, a panel-of-normals, a cohort matrix) does **not** fit this single-parent tree — it has no one owner. Those are tracked separately as **cohort-level artifacts** (§15), not as a 4th hierarchy level.
 
 ## 3. `add-metadata` vs `append` — the core distinction
 
@@ -289,6 +294,9 @@ Run tag convention: `{YYYYMMDD}_{genome}_{description}` (e.g. `20260421_hg38_nor
 | `column_prefix = ""` in TOML | Validation error | Prefix must be a non-empty identifier |
 | Wrong `--level` flag | Command operates on wrong table | Level must match the entity's parent FK shape |
 | Forgot to `schema apply` | New TOML columns invisible in DB | Run `schema apply` after every TOML edit |
+| Tried to track a joint VCF / PoN / cohort matrix at a level | No single owning patient/specimen/assay | Use `append-cohort` (§15), not `append` |
+| `append-cohort` on a pre-0009 project | "no such table: cohort_artifacts" | Run `casetrack migrate-cohort` once first |
+| Reused `run_tag` for a re-genotyping run | New artifact overwrites/clashes with the old | Give each run a distinct `--run-tag`; both coexist in the audit trail |
 
 ## 14. Key command cheatsheet
 
@@ -311,6 +319,12 @@ casetrack censor    --project-dir . --level LEVEL --id ID --kind qc_warn --reaso
 casetrack uncensor  --project-dir . --level LEVEL --id ID --reason "..."
 casetrack qc-history --project-dir . --id ID
 
+# Cohort-level artifacts (proposal 0009)
+casetrack migrate-cohort   --project-dir .                       # once, on pre-0009 projects
+casetrack append-cohort    --project-dir . --analysis joint_genotype \
+  --run-tag 20260521_hg38_jointgt --path cohort.vcf.gz --inputs assayA,assayB,assayC
+casetrack cohort-artifacts --project-dir . [--stale-only]
+
 # Queries
 casetrack status --project-dir .
 casetrack query  --project-dir . --sql "SELECT ... FROM _active WHERE ..."
@@ -320,11 +334,64 @@ casetrack validate --project-dir .
 casetrack doctor   --project-dir .
 ```
 
-## 15. When to read the references
+## 15. Cohort-level artifacts (proposal 0009)
+
+Some outputs are built from **many** assays at once and have no single owning entity: a joint-genotyped VCF, a panel-of-normals, a cohort methylation/expression matrix. The three-level hierarchy (§2) can't represent these — a level is biological, single-parent, and static. So casetrack adds **two additive sibling tables** (the same pattern as `qc_events`; the three-level core is untouched):
+
+- `cohort_artifacts` — one row per cohort output, keyed by `(analysis, run_tag)`.
+- `cohort_artifact_inputs` — many-to-many lineage to each contributing `assay_id`.
+
+A 4th hierarchy level was **explicitly rejected** (proposal 0009 §7). When a user asks to track a joint VCF / PoN / cohort matrix, reach for these commands — never try to wedge it into a patient/specimen/assay row.
+
+### Registering an artifact
+
+`(analysis, run_tag)` is the unique key, so a re-genotyping run uses a **new** `run_tag` and coexists with the prior artifact in the audit trail — never overwrites it.
+
+```bash
+# One-time on a project created before 0009 (additive; safe; --dry-run to preview):
+casetrack migrate-cohort --project-dir .
+
+# Register a joint-genotyped VCF built from three assays:
+casetrack append-cohort --project-dir . \
+  --analysis joint_genotype \
+  --run-tag 20260521_hg38_jointgt \
+  --path data/processed/hg38/cohort/joint.vcf.gz \
+  --inputs assayA,assayB,assayC \
+  --stats stats.json \           # optional: JSON of cohort-level summary numbers
+  --checksum sha256:...          # optional
+# --inputs-from FILE  accepts one assay_id per line (an 'assay_id' header + extra TSV columns are tolerated)
+```
+
+### Staleness is read-time, not stored
+
+An artifact is **`STALE`** when *any* contributing assay is currently censored or consent-revoked — derived live from the QC/consent cascade (§10, proposal 0002 §4.4). There is no stored flag, so it tracks `censor` / `uncensor` automatically. Staleness is **flagged, not auto-fixed**: re-running is the operator's call.
+
+```bash
+casetrack cohort-artifacts --project-dir .              # list all, with a fresh/STALE flag
+casetrack cohort-artifacts --project-dir . --stale-only # only artifacts with a censored input
+casetrack cohort-artifacts --project-dir . --fmt json   # table | tsv | json
+```
+
+Staleness is surfaced in every read path, so you rarely need a bespoke query:
+
+- `casetrack status` — appends a cohort-artifact section (count + per-artifact fresh/STALE).
+- `casetrack query` — exposes a `_cohort_artifacts` DuckDB view with the derived staleness column.
+- `casetrack export --include-cohort-artifacts` — adds them to the TSV/JSON export.
+- The HTML dashboard — a dedicated section.
+- MCP — `mcp__casetrack__casetrack_cohort_artifacts(project_id="<slug>", stale_only=False)`.
+
+### Nextflow
+
+The cohort equivalent of `CASETRACK_REGISTER` is the `casetrack_append_cohort` process, wrapped by the `COHORT_ARTIFACT_TRACKED` subworkflow (`examples/nextflow/subworkflows/local/cohort_artifact_tracked.nf`). Stats are optional — the process drops `--stats` when handed `[]`; there's no `{}` placeholder file. Same `local` / `maxForks = 1` discipline as `CASETRACK_REGISTER`.
+
+See `references/cohort-artifacts.md` for the full table schema, the staleness cascade in detail, and the Nextflow wiring.
+
+## 16. When to read the references
 
 Default to handling requests directly from this SKILL.md. Read reference files when:
 
 - User wants a fully-worked TOML for a new project → `references/toml-example.md`
 - User wants to integrate casetrack into a Nextflow pipeline → `references/nextflow-integration.md`
 - User needs a specific SQL query (cohort progress matrix, samplesheet generation, QC timeline) → `references/common-queries.md`
+- User is registering or troubleshooting **cohort-level artifacts** (joint VCFs, PoNs, matrices, staleness) → `references/cohort-artifacts.md`
 - User hits an error not in §13 — full deep-dive patterns file → `references/patterns.md`
