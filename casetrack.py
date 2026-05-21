@@ -7790,22 +7790,22 @@ def cmd_validate_project(args):
                                 f"artifact_derivation: dangling node-ref {node!r} "
                                 f"(no matching artifact/reference/entity)")
 
-            # acyclicity: DFS from each node over up edges
+            # acyclicity: DFS from each node over up edges. Always colour BLACK on
+            # exit (no early return) so a node that merely points INTO a cycle is
+            # not itself reported — only the actual back-edge (GREY hit) is flagged.
             WHITE, GREY, BLACK = 0, 1, 2
             color: dict = {}
 
-            def _dfs(node: str) -> bool:
+            def _dfs(node: str) -> None:
                 color[node] = GREY
                 for up in _upstream_nodes(conn, node):
                     c = color.get(up, WHITE)
                     if c == GREY:
                         issues.append(
                             f"artifact_derivation: cycle through {node!r} -> {up!r}")
-                        return True
-                    if c == WHITE and _dfs(up):
-                        return True
+                    elif c == WHITE:
+                        _dfs(up)
                 color[node] = BLACK
-                return False
 
             for (dn,) in conn.execute("SELECT DISTINCT down_node FROM artifact_derivation"):
                 if color.get(dn, WHITE) == WHITE:

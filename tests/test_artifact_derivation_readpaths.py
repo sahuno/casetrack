@@ -374,3 +374,31 @@ def test_validate_flags_cycle(tmp_path):
     assert "cycle" in out.lower(), (
         f"Expected 'cycle' in validate output; got:\n{out}"
     )
+
+
+def test_validate_cycle_no_false_positive_for_external_pointer(tmp_path):
+    """A node that merely points INTO a cycle must NOT be reported as a cycle.
+
+    Guards the DFS grey-node fix: with a 2-node cycle (joint<->annot) plus an
+    external edge (extra -> annot) pointing into it, exactly ONE cycle issue
+    should be emitted, not a spurious second one for `extra`.
+    """
+    p = _proj(tmp_path)  # has annot@v1 <- joint@v1
+    conn = casetrack.open_project_db(p / "casetrack.db")
+    _add_cohort(conn, "extra", "v1", ["A1"])  # a real cohort artifact (resolves)
+    conn.executemany(
+        "INSERT OR IGNORE INTO artifact_derivation"
+        "(down_node, up_node, recorded_at, transaction_id) VALUES (?,?,?,?)",
+        [
+            ("cohort:joint@v1", "cohort:annot@v1", "2026-01-01T00:00:00", "raw"),  # close cycle
+            ("cohort:extra@v1", "cohort:annot@v1", "2026-01-01T00:00:00", "raw"),  # points in
+        ],
+    )
+    conn.commit()
+    conn.close()
+    r = _run(["validate", "--project-dir", str(p)])
+    out = r.stdout + r.stderr
+    n_cycle_issues = out.lower().count("cycle through")
+    assert n_cycle_issues == 1, (
+        f"expected exactly 1 cycle issue, got {n_cycle_issues}:\n{out}"
+    )
