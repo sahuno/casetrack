@@ -132,3 +132,34 @@ def test_no_track_references_skips_capture(tmp_path):
                             entity_id="S1", analysis="clair3")
     assert s["state"] == "untracked"
     conn.close()
+
+
+def test_references_command_lists_and_filters_stale(tmp_path):
+    pdir = _init_project(tmp_path)
+    toml = pdir / "casetrack.toml"
+    toml.write_text(toml.read_text() +
+        '\n[references.genome]\npath="/db/hg38.fa"\nversion="hg38_v0"\nkind="genome"\n'
+        '\n[analyses.clair3]\nlevel="specimen"\ncolumn_prefix="clair3"\nuses=["genome"]\n')
+    subprocess.run([sys.executable, "-m", "casetrack", "schema", "apply",
+                    "--project-dir", str(pdir)], check=True, capture_output=True, text=True)
+    _bootstrap_one_specimen(pdir)
+    summary = pdir / "clair3_summary.tsv"; summary.write_text("specimen_id\tn_snv\nS1\t1\n")
+    subprocess.run([sys.executable, "-m", "casetrack", "append", "--project-dir",
+                    str(pdir), "--analysis", "clair3", "--level", "specimen",
+                    "--results", str(summary), "--overwrite"],
+                   check=True, capture_output=True, text=True)
+
+    # list: genome present
+    r = subprocess.run([sys.executable, "-m", "casetrack", "references",
+                        "--project-dir", str(pdir), "--fmt", "json"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and "genome" in r.stdout
+
+    # bump version -> S1 becomes stale
+    toml.write_text(toml.read_text().replace("hg38_v0", "hg38_v1"))
+    subprocess.run([sys.executable, "-m", "casetrack", "schema", "apply",
+                    "--project-dir", str(pdir)], check=True, capture_output=True, text=True)
+    r2 = subprocess.run([sys.executable, "-m", "casetrack", "references",
+                         "--project-dir", str(pdir), "--stale-only"],
+                        capture_output=True, text=True)
+    assert "S1" in r2.stdout and "STALE" in r2.stdout

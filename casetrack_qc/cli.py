@@ -17,7 +17,7 @@ from casetrack_qc.cohort_artifacts_cli import (
     cmd_migrate_cohort,
 )
 from casetrack_qc.migrate import cmd_migrate_qc
-from casetrack_qc.reference_artifacts_cli import cmd_migrate_references
+from casetrack_qc.reference_artifacts_cli import cmd_migrate_references, cmd_references
 
 
 def build_qc_subparsers(subparsers) -> None:
@@ -181,6 +181,16 @@ def build_qc_subparsers(subparsers) -> None:
     p_migr.add_argument("--dry-run", action="store_true",
                         help="Print the plan, make no changes")
 
+    # ── references ── (proposal 0010)
+    p_refs = subparsers.add_parser(
+        "references",
+        help="[v0.8] List reference artifacts + ref-staleness",
+    )
+    p_refs.add_argument("--project-dir", required=True)
+    p_refs.add_argument("--fmt", choices=["table", "tsv", "json"], default="table")
+    p_refs.add_argument("--stale-only", dest="stale_only", action="store_true",
+                        help="Show only outputs whose used reference version is stale")
+
 
 def qc_command_dispatch() -> dict:
     """Command-name → function map that ``casetrack.main()`` merges into its own."""
@@ -194,4 +204,5 @@ def qc_command_dispatch() -> dict:
         "migrate-cohort": cmd_migrate_cohort,
         "cohort-artifacts": cmd_cohort_artifacts,
         "migrate-references": cmd_migrate_references,
+        "references": cmd_references,
     }
