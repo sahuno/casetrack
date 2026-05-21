@@ -440,3 +440,73 @@ def test_dashboard_derivation_escapes_node_refs(tmp_path):
     html_text = out.read_text()
     assert "<script>" not in html_text       # raw tag must NOT appear
     assert "&lt;script&gt;" in html_text      # escaped form must appear
+
+
+# ── Task 13: MCP casetrack_derivation tool (0011 §6.5) ───────────────────────
+
+
+def test_mcp_derivation_tool(tmp_path):
+    """``derivation_tool`` returns derived-stale nodes via the MCP resolver.
+
+    Mirrors the test_mcp_references_tool pattern from
+    tests/test_reference_artifacts_readpaths.py: register the project via
+    the CLI, resolve the slug via list_projects_tool, then call the tool.
+    """
+    p = _proj(tmp_path)
+    # censor an input to joint@v1 so annot@v1 becomes derived-stale via the edge
+    conn = casetrack.open_project_db(p / "casetrack.db")
+    conn.execute("UPDATE assays SET qc_status='censored' WHERE assay_id='A2'")
+    conn.commit()
+    conn.close()
+
+    # register the project so the MCP slug resolver can find it
+    _run(["projects", "register", "--project-dir", str(p)])
+
+    from casetrack_mcp import tools
+
+    # resolve the slug from the registry (same pattern as test_mcp_references_tool)
+    projs = tools.list_projects_tool()["projects"]
+    slug = [entry["project_id"] for entry in projs if str(p) in entry["path"]][0]
+
+    payload = tools.derivation_tool(slug, stale_only=True)
+
+    # basic shape
+    assert payload["project_id"] == slug
+    assert "project_path" in payload
+    assert "edges" in payload
+    assert "derived_stale_outputs" in payload
+    assert "outputs" in payload
+
+    # annot@v1 is derived-stale: it derives from joint@v1 whose input A2 is censored
+    nodes = {r["node"] for r in payload["derived_stale_outputs"]}
+    assert "cohort:annot@v1" in nodes, (
+        f"Expected 'cohort:annot@v1' in derived_stale_outputs; got {nodes!r}"
+    )
+
+    # with stale_only=True, fresh nodes must NOT appear in outputs
+    assert all(r["state"] == "STALE" for r in payload["outputs"]), (
+        "stale_only=True must filter outputs to STALE only"
+    )
+
+
+def test_mcp_derivation_tool_pre_0011_project(tmp_path):
+    """``derivation_tool`` returns empty lists on a project without the
+    artifact_derivation table (pre-0011 migration)."""
+    p = _proj(tmp_path)
+    # simulate a pre-0011 project by dropping the table
+    conn = casetrack.open_project_db(p / "casetrack.db")
+    conn.execute("DROP TABLE IF EXISTS artifact_derivation")
+    conn.commit()
+    conn.close()
+
+    _run(["projects", "register", "--project-dir", str(p)])
+
+    from casetrack_mcp import tools
+    projs = tools.list_projects_tool()["projects"]
+    slug = [entry["project_id"] for entry in projs if str(p) in entry["path"]][0]
+
+    payload = tools.derivation_tool(slug)
+
+    assert payload["edges"] == []
+    assert payload["derived_stale_outputs"] == []
+    assert payload["outputs"] == []

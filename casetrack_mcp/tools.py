@@ -296,6 +296,49 @@ def references_tool(project_id: str, *, stale_only: bool = False) -> dict:
     }
 
 
+def derivation_tool(project_id: str, *, stale_only: bool = False) -> dict:
+    """Return artifact-to-artifact lineage edges + derived-staleness (proposal 0011).
+
+    A node is ``derived_stale`` when any upstream artifact it derives from is
+    stale by any cause (0009 input / 0010 ref / 0011 transitive). Agent-facing
+    companion to the `casetrack derivation` CLI command.
+
+    Returns ``{project_id, project_path, edges:[...], derived_stale_outputs:[...],
+    outputs:[...]}`` where ``derived_stale_outputs`` is the subset of tracked
+    down_nodes whose derived state is STALE and ``outputs`` is the full list (or
+    just the stale subset when ``stale_only`` is True).
+
+    On a pre-0011 project (no ``artifact_derivation`` table), all lists are empty.
+    """
+    from casetrack_qc.artifact_derivation import (
+        derivation_schema_exists as _deriv_exists,
+        list_edges as _list_edges,
+        all_derived_stale as _all_derived_stale,
+    )
+
+    resolved, conn = _resolve_and_open(project_id)
+    try:
+        edges: list[dict] = []
+        stale: list[dict] = []
+        tracked: list[dict] = []
+        if _deriv_exists(conn):
+            edges = _list_edges(conn)
+            all_outputs = _all_derived_stale(conn)
+            stale = [r for r in all_outputs if r["state"] == "STALE"]
+            tracked = stale if stale_only else all_outputs
+    finally:
+        conn.close()
+
+    casetrack.registry_touch(project_id)
+    return {
+        "project_id": project_id,
+        "project_path": str(resolved),
+        "edges": edges,
+        "derived_stale_outputs": stale,
+        "outputs": tracked,
+    }
+
+
 def cohort_artifacts_tool(project_id: str, *, stale_only: bool = False) -> dict:
     """Return cohort-level artifacts (proposal 0009) with read-time staleness.
 
