@@ -5901,6 +5901,12 @@ def _prepare_v03_query_connection(db_path: Path):
     # no-op on v0.3-only DBs that don't have qc_status/consent_status columns.
     from casetrack_qc.reader import install_active_views as _install_active_views
     _install_active_views(con)
+    # Proposal 0009: `_cohort_artifacts` view with derived staleness. No-op on
+    # pre-0009 DBs without the cohort-artifact tables.
+    from casetrack_qc.reader import (
+        install_cohort_artifact_view as _install_cohort_artifact_view,
+    )
+    _install_cohort_artifact_view(con)
     return con
 
 
@@ -6156,6 +6162,36 @@ def cmd_export_project(args):
                     out_path = output / f"{extra_table}{ext}"
                 _write_df(df_extra, out_path)
                 written.append((extra_table, out_path, len(df_extra)))
+
+        # Proposal 0009: cohort-artifact tables, with derived staleness columns
+        # on cohort_artifacts. Auto-enabled for XLSX (multi-sheet) like lineage.
+        include_cohort = getattr(args, "include_cohort_artifacts", False) or (
+            ext == ".xlsx" and not args.sql and shape != "joined"
+        )
+        if include_cohort:
+            from casetrack_qc.cohort_artifacts import (
+                artifact_staleness as _artifact_staleness,
+                cohort_artifacts_schema_exists as _ca_schema_exists,
+            )
+            if _ca_schema_exists(conn):
+                df_ca = pd.read_sql_query("SELECT * FROM cohort_artifacts", conn)
+                if not df_ca.empty:
+                    stale_map = _artifact_staleness(conn)
+                    df_ca["n_censored_inputs"] = df_ca["artifact_id"].map(
+                        lambda i: len(stale_map.get(i, []))
+                    )
+                    df_ca["stale"] = df_ca["n_censored_inputs"] > 0
+                for tbl, df_x in (
+                    ("cohort_artifacts", df_ca),
+                    ("cohort_artifact_inputs",
+                     pd.read_sql_query("SELECT * FROM cohort_artifact_inputs", conn)),
+                ):
+                    if prefix_mode:
+                        out_path = Path(f"{prefix_base}.{tbl}{ext}")
+                    else:
+                        out_path = output / f"{tbl}{ext}"
+                    _write_df(df_x, out_path)
+                    written.append((tbl, out_path, len(df_x)))
     finally:
         conn.close()
 
@@ -6768,6 +6804,42 @@ def cmd_status_project(args):
             _emit_lineage_section(conn3)
         finally:
             conn3.close()
+
+    # Proposal 0009: surface cohort-artifact staleness in the human status view.
+    if args.fmt in (None, "table"):
+        conn4 = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            _emit_cohort_artifacts_section(conn4)
+        finally:
+            conn4.close()
+
+
+def _emit_cohort_artifacts_section(conn: sqlite3.Connection) -> None:
+    """Print a cohort-artifact summary with staleness, when any exist.
+
+    Mirrors the lineage section: a self-contained block appended to the human
+    status view. Staleness is read-time (proposal 0009 §6.2).
+    """
+    from casetrack_qc.cohort_artifacts import (
+        artifact_staleness as _artifact_staleness,
+        cohort_artifacts_schema_exists as _ca_schema_exists,
+        list_artifacts as _list_artifacts,
+    )
+    if not _ca_schema_exists(conn):
+        return
+    arts = _list_artifacts(conn)
+    if not arts:
+        return
+    stale_map = _artifact_staleness(conn)
+    n_stale = sum(1 for a in arts if stale_map.get(a.artifact_id))
+    print(f"\nCohort artifacts: {len(arts)} ({n_stale} STALE)")
+    for a in arts:
+        censored = stale_map.get(a.artifact_id, [])
+        flag = "STALE" if censored else "fresh"
+        line = f"  [{flag}] {a.analysis}/{a.run_tag}  inputs={a.n_inputs}"
+        if censored:
+            line += f"  censored: {', '.join(censored)}"
+        print(line)
 
 
 def _status_counts_by_level(
@@ -7807,6 +7879,12 @@ Examples:
     p_export.add_argument(
         "--include-lineage", action="store_true",
         help="[v0.6] Also export assay_sources and batches tables "
+             "(auto-enabled for XLSX multi-sheet output)",
+    )
+    p_export.add_argument(
+        "--include-cohort-artifacts", action="store_true",
+        help="[v0.7] Also export cohort_artifacts (with derived stale / "
+             "n_censored_inputs columns) and cohort_artifact_inputs "
              "(auto-enabled for XLSX multi-sheet output)",
     )
 

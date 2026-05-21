@@ -234,10 +234,10 @@ durable design.
 
 1. ~~Land §6.1 schema as an additive migration (`migrate-cohort`), no three-level change.~~ **Done** (`casetrack_qc/cohort_artifacts.py`; `init` + `migrate-cohort`).
 2. ~~Implement `append-cohort` + provenance logging.~~ **Done** (`casetrack_qc/cohort_artifacts_cli.py`).
-3. Add read-time staleness to `status` / `query` / `export` / `cohort`. **Partial** — `cohort-artifacts` surfaces staleness today (`artifact_staleness`); folding it into the other read paths is still open.
+3. ~~Add read-time staleness to `status` / `query` / `export` / `cohort`.~~ **Done** — `cohort-artifacts` command, plus: `status` appends a cohort-artifact section, `query` exposes the `_cohort_artifacts` DuckDB view (derived `n_censored_inputs` / `stale`), and `export --include-cohort-artifacts` writes both tables with the derived columns.
 4. ~~`CASETRACK_COHORT_ARTIFACT` subworkflow + a joint-genotyping worked example in `examples/`.~~ **Done** — `casetrack_append_cohort` process in `examples/nextflow/casetrack.nf` + `examples/giab_chr21/run_cohort_demo.sh` (mock + bcftools engines).
 
 ### Still open
-- Surface cohort-artifact staleness inside `status` / `export` / `query` (item 3 above), not just the dedicated `cohort-artifacts` command.
 - Dashboard / MCP panel for cohort artifacts (§8.4).
 - `--stats`-less `append-cohort` ergonomics (currently a `{}` file is the idiom).
+- The Nextflow deliverable is a `casetrack_append_cohort` *process* + documented gather pattern, not a packaged `subworkflows/local/*.nf` file.

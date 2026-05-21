@@ -25,6 +25,12 @@ samples (joint-genotyped VCFs, panels-of-normals, cohort matrices). See
   an artifact is flagged `STALE` when any contributing assay is currently
   censored or consent-revoked, derived live from the QC/consent cascade
   (proposal 0002 §4.4) with no stored flag. `--stale-only`, `--fmt table|tsv|json`.
+- **Staleness surfaced in the existing read paths** (proposal 0009 §4):
+  `casetrack status` appends a cohort-artifact section (count + per-artifact
+  fresh/STALE) in the human view; `casetrack query` exposes a `_cohort_artifacts`
+  DuckDB view with derived `n_censored_inputs` / `stale` columns; `casetrack
+  export --include-cohort-artifacts` writes the `cohort_artifacts` (with those
+  derived columns) and `cohort_artifact_inputs` tables (auto-enabled for XLSX).
 - **`casetrack migrate-cohort`** — additive migration to create the two tables on
   a pre-0009 project (`--dry-run` supported).
 - **`casetrack_append_cohort` Nextflow process** (`examples/nextflow/casetrack.nf`)
