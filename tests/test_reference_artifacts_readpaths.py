@@ -143,3 +143,36 @@ def test_query_cohort_artifacts_still_works_without_reference_tables(tmp_path):
     )
     assert r.returncode == 0, f"cohort_artifacts query failed:\nstdout: {r.stdout}\nstderr: {r.stderr}"
     assert "joint_vc" in r.stdout, f"joint_vc not in output:\n{r.stdout}"
+
+
+def test_status_shows_reference_section(tmp_path):
+    pdir = _stale_setup(tmp_path)
+    r = subprocess.run([sys.executable, "-m", "casetrack", "status",
+                        "--project-dir", str(pdir)], capture_output=True, text=True)
+    assert r.returncode == 0
+    # Assert on the real section content, not a substring the tmp_path could leak.
+    assert "References (" in r.stdout  # the section heading "References (N declared; …)"
+    assert "genome" in r.stdout       # the declared ref_key is listed
+
+
+def test_export_include_references(tmp_path):
+    pdir = _stale_setup(tmp_path)
+    out = pdir / "export.xlsx"
+    r = subprocess.run([sys.executable, "-m", "casetrack", "export",
+                        "--project-dir", str(pdir), "--include-references",
+                        "--output", str(out)], capture_output=True, text=True)
+    assert r.returncode == 0 and out.exists()
+
+
+def test_validate_flags_orphan_usage(tmp_path):
+    pdir = _stale_setup(tmp_path)
+    # orphan: a usage row whose ref_key isn't in reference_artifacts
+    conn = sqlite3.connect(pdir / casetrack.PROJECT_DB_NAME)
+    conn.execute("INSERT INTO reference_usage (scope, entity_level, entity_id, "
+                 "analysis, ref_key, version_used, recorded_at) VALUES "
+                 "('analysis','specimen','S1','modkit','ghostref','v',datetime('now'))")
+    conn.commit(); conn.close()
+    r = subprocess.run([sys.executable, "-m", "casetrack", "validate",
+                        "--project-dir", str(pdir)], capture_output=True, text=True)
+    # Assert on the real signal — the orphan ref_key — not the path-leaked "orphan".
+    assert "ghostref" in (r.stdout + r.stderr)

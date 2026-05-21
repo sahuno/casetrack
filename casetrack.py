@@ -6343,6 +6343,25 @@ def cmd_export_project(args):
                         out_path = output / f"{tbl}{ext}"
                     _write_df(df_x, out_path)
                     written.append((tbl, out_path, len(df_x)))
+
+        # Proposal 0010: reference_artifacts + reference_usage tables.
+        # Auto-enabled for XLSX (multi-sheet) like cohort artifacts.
+        include_refs = getattr(args, "include_references", False) or (
+            ext == ".xlsx" and not args.sql and shape != "joined"
+        )
+        if include_refs:
+            from casetrack_qc.reference_artifacts import (
+                reference_schema_exists as _ref_schema_exists,
+            )
+            if _ref_schema_exists(conn):
+                for tbl in ("reference_artifacts", "reference_usage"):
+                    df_ref = pd.read_sql_query(f"SELECT * FROM {tbl}", conn)
+                    if prefix_mode:
+                        out_path = Path(f"{prefix_base}.{tbl}{ext}")
+                    else:
+                        out_path = output / f"{tbl}{ext}"
+                    _write_df(df_ref, out_path)
+                    written.append((tbl, out_path, len(df_ref)))
     finally:
         conn.close()
 
@@ -6964,6 +6983,42 @@ def cmd_status_project(args):
         finally:
             conn4.close()
 
+    # Proposal 0010: surface reference declarations + stale outputs.
+    if args.fmt in (None, "table"):
+        conn5 = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            _emit_references_section(conn5)
+        finally:
+            conn5.close()
+
+
+def _emit_references_section(conn: sqlite3.Connection) -> None:
+    """Print a references summary with staleness, when any exist (proposal 0010 §6.4).
+
+    Mirrors _emit_cohort_artifacts_section: a self-contained block appended to
+    the human status view. No-ops on pre-0010 projects.
+    """
+    from casetrack_qc.reference_artifacts import (
+        all_stale_outputs as _all_stale_outputs,
+        list_references as _list_references,
+        reference_schema_exists as _ref_schema_exists,
+    )
+    if not _ref_schema_exists(conn):
+        return
+    refs = _list_references(conn)
+    if not refs:
+        return
+    stale = [o for o in _all_stale_outputs(conn) if o["state"] == "STALE"]
+    print(f"\nReferences ({len(refs)} declared; {len(stale)} stale output(s)):")
+    for r in refs:
+        print(f"  {r.ref_key}  version={r.version}  kind={r.kind}")
+    for o in stale:
+        if o["scope"] == "analysis":
+            who = (f"{o['entity_level']}:{o['entity_id']}/{o['analysis']}")
+        else:
+            who = f"cohort_artifact:{o['artifact_id']}"
+        print(f"  [STALE] {who}  ({'; '.join(o['reasons'])})")
+
 
 def _emit_cohort_artifacts_section(conn: sqlite3.Connection) -> None:
     """Print a cohort-artifact summary with staleness, when any exist.
@@ -7505,6 +7560,23 @@ def cmd_validate_project(args):
                 issues.append(
                     f"assays: assay {aid!r} has batch_id {bid!r} not in batches table"
                 )
+
+        # 6. Proposal 0010: orphan reference_usage rows — ref_key with no matching
+        # reference_artifacts row (happens when a ref is removed from [references]).
+        from casetrack_qc.reference_artifacts import (
+            reference_schema_exists as _ref_schema_exists,
+        )
+        if _ref_schema_exists(conn):
+            orphan_refs = conn.execute(
+                "SELECT DISTINCT u.ref_key FROM reference_usage u "
+                "LEFT JOIN reference_artifacts r ON r.ref_key = u.ref_key "
+                "WHERE r.ref_key IS NULL"
+            ).fetchall()
+            for (ref_key,) in orphan_refs:
+                issues.append(
+                    f"reference_usage references unknown ref_key {ref_key!r} "
+                    f"(removed from [references]?)"
+                )
     finally:
         conn.close()
 
@@ -8041,6 +8113,11 @@ Examples:
         "--include-cohort-artifacts", action="store_true",
         help="[v0.7] Also export cohort_artifacts (with derived stale / "
              "n_censored_inputs columns) and cohort_artifact_inputs "
+             "(auto-enabled for XLSX multi-sheet output)",
+    )
+    p_export.add_argument(
+        "--include-references", action="store_true",
+        help="[v0.8] Also export reference_artifacts + reference_usage tables "
              "(auto-enabled for XLSX multi-sheet output)",
     )
 
