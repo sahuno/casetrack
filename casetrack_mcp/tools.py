@@ -257,6 +257,45 @@ def _resolve_and_open(project_id: str):
     return resolved, conn
 
 
+def references_tool(project_id: str, *, stale_only: bool = False) -> dict:
+    """Return reference artifacts + ref-staleness for a project (proposal 0010).
+
+    An output is ``stale`` when the reference version used at analysis time no
+    longer matches the current declared version. This is the agent-facing
+    companion to the `casetrack references` CLI.
+
+    Returns ``{project_id, project_path, references:[...], stale_outputs:[...], outputs:[...]}``.
+    On a pre-0010 project (no reference tables), all lists are empty.
+    """
+    from casetrack_qc.reference_artifacts import (
+        reference_schema_exists as _ref_schema_exists,
+        list_references as _list_references,
+        all_stale_outputs as _all_stale_outputs,
+    )
+
+    resolved, conn = _resolve_and_open(project_id)
+    try:
+        refs: list[dict] = []
+        stale: list[dict] = []
+        tracked: list[dict] = []
+        if _ref_schema_exists(conn):
+            refs = [r.to_dict() for r in _list_references(conn)]
+            all_outputs = _all_stale_outputs(conn)
+            stale = [o for o in all_outputs if o["state"] == "STALE"]
+            tracked = stale if stale_only else all_outputs
+    finally:
+        conn.close()
+
+    casetrack.registry_touch(project_id)
+    return {
+        "project_id": project_id,
+        "project_path": str(resolved),
+        "references": refs,
+        "stale_outputs": stale,
+        "outputs": tracked,
+    }
+
+
 def cohort_artifacts_tool(project_id: str, *, stale_only: bool = False) -> dict:
     """Return cohort-level artifacts (proposal 0009) with read-time staleness.
 

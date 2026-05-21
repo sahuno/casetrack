@@ -93,7 +93,7 @@ SQLITE_BUSY_TIMEOUT_MS = 30000
 # Casetrack version stamped into project_meta.casetrack_version on init
 # (proposal 0005 Part B). Reflects the release that created the row, so
 # future schema migrations can decide whether the row needs touch-ups.
-_CASETRACK_VERSION = "0.7.0"
+_CASETRACK_VERSION = "0.8.0"
 
 # project_meta DDL — proposal 0005 §6.1. CHECK constraint mirrors the
 # Python-side _PROJECT_ID_PATTERN so a hand-edit of the SQLite file can't
@@ -448,8 +448,11 @@ def validate_schema(schema: dict) -> None:
     # that write into it — consumed by `casetrack append --infer-from-path`.
     if "layout" in schema:
         _validate_layout(schema["layout"])
+    references = schema.get("references", {})
+    if references:
+        _validate_references(references)
     if "analyses" in schema:
-        _validate_analyses(schema["analyses"])
+        _validate_analyses(schema["analyses"], references=references)
 
 
 def _validate_layout(layout: dict) -> None:
@@ -497,7 +500,7 @@ def _validate_layout(layout: dict) -> None:
             )
 
 
-def _validate_analyses(analyses: dict) -> None:
+def _validate_analyses(analyses: dict, references: dict | None = None) -> None:
     if not isinstance(analyses, dict):
         raise SchemaError("[analyses] must be a table")
     import re as _re
@@ -531,6 +534,46 @@ def _validate_analyses(analyses: dict) -> None:
                 raise SchemaError(
                     f"[analyses.{tool}] summary_tsv must be a non-empty string"
                 )
+        uses = spec.get("uses")
+        if uses is not None:
+            if not isinstance(uses, list) or not all(isinstance(u, str) for u in uses):
+                raise SchemaError(
+                    f"[analyses.{tool}] uses must be a list of reference keys"
+                )
+            known = set((references or {}).keys())
+            for ref_key in uses:
+                if known and ref_key not in known:
+                    raise SchemaError(
+                        f"[analyses.{tool}] uses references unknown ref_key "
+                        f"{ref_key!r}; declare it under [references.{ref_key}]"
+                    )
+
+
+def _validate_references(references: dict) -> None:
+    if not isinstance(references, dict):
+        raise SchemaError("[references] must be a table")
+    import re as _re
+    from casetrack_qc.reference_artifacts import REFERENCE_KINDS
+    key_re = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    for ref_key, spec in references.items():
+        if not key_re.match(ref_key):
+            raise SchemaError(
+                f"[references.{ref_key}] key must be a valid identifier"
+            )
+        if not isinstance(spec, dict):
+            raise SchemaError(f"[references.{ref_key}] must be an inline table")
+        for required in ("path", "version"):
+            val = spec.get(required)
+            if not isinstance(val, str) or not val:
+                raise SchemaError(
+                    f"[references.{ref_key}] missing/invalid required key: {required}"
+                )
+        kind = spec.get("kind")
+        if kind is not None and kind not in REFERENCE_KINDS:
+            raise SchemaError(
+                f"[references.{ref_key}] kind={kind!r} must be one of "
+                f"{list(REFERENCE_KINDS)}"
+            )
 
 
 def _validate_level(level: str, spec: dict) -> None:
@@ -1505,6 +1548,9 @@ def cmd_init_project(args):
     from casetrack_qc.cohort_artifacts import (
         ensure_cohort_artifacts_schema as _ensure_cohort_artifacts_schema,
     )
+    from casetrack_qc.reference_artifacts import (
+        ensure_reference_schema as _ensure_reference_schema,
+    )
 
     conn = open_project_db(db_path)
     qc_ddl: list[str] = []
@@ -1515,6 +1561,8 @@ def cmd_init_project(args):
             # Proposal 0009: cohort-artifact sibling tables, created in the same
             # init transaction so fresh projects can record joint VCFs / PoNs.
             _ensure_cohort_artifacts_schema(conn)
+            # Proposal 0010: reference-artifact sibling tables, same init txn.
+            _ensure_reference_schema(conn)
             # v0.6 Part B: write the project_meta row in the same
             # transaction as the QC schema so init is atomic.
             write_project_meta(
@@ -4517,6 +4565,16 @@ def cmd_append_project(args):
                     transaction_id=txn_id,
                     source="slurm",
                 )
+            if not getattr(args, "no_track_references", False):
+                from casetrack_qc.reference_artifacts_cli import capture_reference_usage
+                _override = None
+                if getattr(args, "uses_references", None):
+                    _override = [s.strip() for s in args.uses_references.split(",") if s.strip()]
+                capture_reference_usage(
+                    conn, schema=schema, analysis=analysis, level=level,
+                    entity_ids=list(tsv_keys), transaction_id=txn_id,
+                    override_refs=_override,
+                )
     except _MissingKeys as e:
         conn.close()
         preview = sorted(e.missing)[:5]
@@ -4733,56 +4791,80 @@ def _is_analysis_column(prov_path: Path, col: str) -> bool:
 def _schema_apply(project_dir: Path, schema: dict, issues: list[dict]) -> None:
     """Apply `missing_in_db` drift via ALTER TABLE ADD COLUMN. Bump schema_v."""
     to_add = [i for i in issues if i["kind"] == "missing_in_db"]
-    if not to_add:
+    if to_add:
+        conn = open_project_db(project_dir / PROJECT_DB_NAME)
+        executed_sql: list[str] = []
+        try:
+            with begin_immediate(conn):
+                for i in to_add:
+                    ddl = (
+                        f"ALTER TABLE {_quote_ident(i['table'])} "
+                        f"ADD COLUMN {_quote_ident(i['column'])} {i['type']}"
+                    )
+                    conn.execute(ddl)
+                    executed_sql.append(ddl)
+        finally:
+            conn.close()
+
+        # Bump schema_v in the TOML.
+        toml_path = project_dir / PROJECT_TOML_NAME
+        old_v = schema["project"].get("schema_v", 1)
+        new_v = old_v + 1
+        toml_text = toml_path.read_text()
+        # Simple line-level substitution — the templates write schema_v on its
+        # own line. If this fails we fall back to leaving the file alone; the
+        # provenance entry still records the intended version.
+        import re
+        patched = re.sub(
+            r"(?m)^schema_v\s*=\s*\d+\s*$",
+            f"schema_v = {new_v}",
+            toml_text,
+            count=1,
+        )
+        if patched != toml_text:
+            toml_path.write_text(patched)
+
+        log_project_provenance(project_dir, {
+            "action": "schema_apply",
+            "transaction_id": _new_transaction_id(),
+            "columns_added": [(i["table"], i["column"], i["type"]) for i in to_add],
+            "sql": executed_sql,
+            "schema_v_before": old_v,
+            "schema_v_after": new_v,
+        })
+
+        print(
+            f"Applied {len(to_add)} schema change(s); schema_v {old_v} → {new_v}."
+        )
+        for i in to_add:
+            print(f"  + {i['table']}.{i['column']} {i['type']}")
+    else:
         print("Schema up to date; nothing to apply.")
-        return
 
-    conn = open_project_db(project_dir / PROJECT_DB_NAME)
-    executed_sql: list[str] = []
-    try:
-        with begin_immediate(conn):
-            for i in to_add:
-                ddl = (
-                    f"ALTER TABLE {_quote_ident(i['table'])} "
-                    f"ADD COLUMN {_quote_ident(i['column'])} {i['type']}"
-                )
-                conn.execute(ddl)
-                executed_sql.append(ddl)
-    finally:
-        conn.close()
-
-    # Bump schema_v in the TOML.
-    toml_path = project_dir / PROJECT_TOML_NAME
-    old_v = schema["project"].get("schema_v", 1)
-    new_v = old_v + 1
-    toml_text = toml_path.read_text()
-    # Simple line-level substitution — the templates write schema_v on its
-    # own line. If this fails we fall back to leaving the file alone; the
-    # provenance entry still records the intended version.
-    import re
-    patched = re.sub(
-        r"(?m)^schema_v\s*=\s*\d+\s*$",
-        f"schema_v = {new_v}",
-        toml_text,
-        count=1,
-    )
-    if patched != toml_text:
-        toml_path.write_text(patched)
-
-    log_project_provenance(project_dir, {
-        "action": "schema_apply",
-        "transaction_id": _new_transaction_id(),
-        "columns_added": [(i["table"], i["column"], i["type"]) for i in to_add],
-        "sql": executed_sql,
-        "schema_v_before": old_v,
-        "schema_v_after": new_v,
-    })
-
-    print(
-        f"Applied {len(to_add)} schema change(s); schema_v {old_v} → {new_v}."
-    )
-    for i in to_add:
-        print(f"  + {i['table']}.{i['column']} {i['type']}")
+    # Proposal 0010: materialize [references] into reference_artifacts and
+    # record version moves to provenance (the event that flips outputs stale).
+    references = schema.get("references", {})
+    if references:
+        from casetrack_qc.reference_artifacts import (
+            ensure_reference_schema, sync_references_from_toml,
+        )
+        txn_id = _new_transaction_id()
+        conn = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            with begin_immediate(conn):
+                ensure_reference_schema(conn)
+                ref_changes = sync_references_from_toml(conn, references)
+        finally:
+            conn.close()
+        for ch in ref_changes:
+            if ch["old_version"] is not None:  # version move, not first insert
+                log_project_provenance(project_dir, {
+                    "action": "reference_version_change",
+                    "ref_key": ch["ref_key"],
+                    "old_version": ch["old_version"],
+                    "new_version": ch["new_version"],
+                    "transaction_id": txn_id,
+                })
 
 
 def _dump_schema_from_db(conn: sqlite3.Connection, project_name: str, schema_v: int) -> str:
@@ -5578,6 +5660,19 @@ def cmd_dashboard_project(args):
                 }
                 for a in _ca_list(conn)
             ]
+
+        # Proposal 0010: reference-artifact section with ref-staleness badge.
+        # Degrades silently when absent (pre-0010 / no [references] in TOML).
+        from casetrack_qc.reference_artifacts import (
+            reference_schema_exists as _ra_exists,
+            list_references as _ra_list,
+            all_stale_outputs as _ra_stale,
+        )
+        if _ra_exists(conn):
+            qc_info["references"] = [r.to_dict() for r in _ra_list(conn)]
+            qc_info["reference_stale"] = [
+                o for o in _ra_stale(conn) if o["state"] == "STALE"
+            ]
     finally:
         conn.close()
 
@@ -5817,6 +5912,8 @@ def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
 
   {_cohort_artifacts_html(qc_info)}
 
+  {_references_html(qc_info)}
+
   <h2>Patients</h2>
   {"".join(body_sections) if body_sections
      else '<p class="muted">No patients registered yet.</p>'}
@@ -5879,6 +5976,44 @@ def _cohort_artifacts_html(qc_info: dict | None) -> str:
         "<table><thead><tr>"
         "<th>analysis</th><th>run_tag</th><th>inputs</th>"
         "<th>status</th><th>censored inputs</th>"
+        "</tr></thead><tbody>"
+        f"{''.join(rows)}</tbody></table>"
+    )
+
+
+def _references_html(qc_info: dict | None) -> str:
+    """Render the references section (proposal 0010) with ref-stale badge.
+
+    Returns "" when no references are declared so pre-0010 projects render
+    identically to before.
+    """
+    if not qc_info:
+        return ""
+    refs = qc_info.get("references") or []
+    if not refs:
+        return ""
+    esc = html.escape
+    stale = qc_info.get("reference_stale") or []
+    n_stale = len(stale)
+    rows = []
+    for r in refs:
+        rows.append(
+            "<tr>"
+            f"<td>{esc(r['ref_key'])}</td>"
+            f"<td class='id'>{esc(r['version'])}</td>"
+            f"<td>{esc(r.get('kind') or '')}</td>"
+            "</tr>"
+        )
+    if n_stale:
+        badge = f'<span class="qc-chip qc-chip-amber">{n_stale} STALE output(s)</span>'
+    else:
+        badge = '<span class="qc-chip qc-chip-grey">all fresh</span>'
+    return (
+        f"<h2>References <span class='muted'>({len(refs)} declared, "
+        f"{n_stale} stale output(s))</span></h2>"
+        f"{badge}"
+        "<table><thead><tr>"
+        "<th>ref_key</th><th>version</th><th>kind</th>"
         "</tr></thead><tbody>"
         f"{''.join(rows)}</tbody></table>"
     )
@@ -5966,11 +6101,16 @@ def _prepare_v03_query_connection(db_path: Path):
     from casetrack_qc.reader import install_active_views as _install_active_views
     _install_active_views(con)
     # Proposal 0009: `_cohort_artifacts` view with derived staleness. No-op on
-    # pre-0009 DBs without the cohort-artifact tables.
+    # pre-0009 DBs without the cohort-artifact tables. Proposal 0010 extends
+    # the view with `ref_stale`; falls back to 0009 view on pre-0010 projects.
     from casetrack_qc.reader import (
         install_cohort_artifact_view as _install_cohort_artifact_view,
+        install_reference_usage_view as _install_reference_usage_view,
     )
     _install_cohort_artifact_view(con)
+    # Proposal 0010: `_reference_usage` view with derived current_version /
+    # is_stale. No-op on pre-0010 projects.
+    _install_reference_usage_view(con)
     return con
 
 
@@ -6256,6 +6396,25 @@ def cmd_export_project(args):
                         out_path = output / f"{tbl}{ext}"
                     _write_df(df_x, out_path)
                     written.append((tbl, out_path, len(df_x)))
+
+        # Proposal 0010: reference_artifacts + reference_usage tables.
+        # Auto-enabled for XLSX (multi-sheet) like cohort artifacts.
+        include_refs = getattr(args, "include_references", False) or (
+            ext == ".xlsx" and not args.sql and shape != "joined"
+        )
+        if include_refs:
+            from casetrack_qc.reference_artifacts import (
+                reference_schema_exists as _ref_schema_exists,
+            )
+            if _ref_schema_exists(conn):
+                for tbl in ("reference_artifacts", "reference_usage"):
+                    df_ref = pd.read_sql_query(f"SELECT * FROM {tbl}", conn)
+                    if prefix_mode:
+                        out_path = Path(f"{prefix_base}.{tbl}{ext}")
+                    else:
+                        out_path = output / f"{tbl}{ext}"
+                    _write_df(df_ref, out_path)
+                    written.append((tbl, out_path, len(df_ref)))
     finally:
         conn.close()
 
@@ -6877,6 +7036,42 @@ def cmd_status_project(args):
         finally:
             conn4.close()
 
+    # Proposal 0010: surface reference declarations + stale outputs.
+    if args.fmt in (None, "table"):
+        conn5 = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            _emit_references_section(conn5)
+        finally:
+            conn5.close()
+
+
+def _emit_references_section(conn: sqlite3.Connection) -> None:
+    """Print a references summary with staleness, when any exist (proposal 0010 §6.4).
+
+    Mirrors _emit_cohort_artifacts_section: a self-contained block appended to
+    the human status view. No-ops on pre-0010 projects.
+    """
+    from casetrack_qc.reference_artifacts import (
+        all_stale_outputs as _all_stale_outputs,
+        list_references as _list_references,
+        reference_schema_exists as _ref_schema_exists,
+    )
+    if not _ref_schema_exists(conn):
+        return
+    refs = _list_references(conn)
+    if not refs:
+        return
+    stale = [o for o in _all_stale_outputs(conn) if o["state"] == "STALE"]
+    print(f"\nReferences ({len(refs)} declared; {len(stale)} stale output(s)):")
+    for r in refs:
+        print(f"  {r.ref_key}  version={r.version}  kind={r.kind}")
+    for o in stale:
+        if o["scope"] == "analysis":
+            who = (f"{o['entity_level']}:{o['entity_id']}/{o['analysis']}")
+        else:
+            who = f"cohort_artifact:{o['artifact_id']}"
+        print(f"  [STALE] {who}  ({'; '.join(o['reasons'])})")
+
 
 def _emit_cohort_artifacts_section(conn: sqlite3.Connection) -> None:
     """Print a cohort-artifact summary with staleness, when any exist.
@@ -7418,6 +7613,23 @@ def cmd_validate_project(args):
                 issues.append(
                     f"assays: assay {aid!r} has batch_id {bid!r} not in batches table"
                 )
+
+        # 6. Proposal 0010: orphan reference_usage rows — ref_key with no matching
+        # reference_artifacts row (happens when a ref is removed from [references]).
+        from casetrack_qc.reference_artifacts import (
+            reference_schema_exists as _ref_schema_exists,
+        )
+        if _ref_schema_exists(conn):
+            orphan_refs = conn.execute(
+                "SELECT DISTINCT u.ref_key FROM reference_usage u "
+                "LEFT JOIN reference_artifacts r ON r.ref_key = u.ref_key "
+                "WHERE r.ref_key IS NULL"
+            ).fetchall()
+            for (ref_key,) in orphan_refs:
+                issues.append(
+                    f"reference_usage references unknown ref_key {ref_key!r} "
+                    f"(removed from [references]?)"
+                )
     finally:
         conn.close()
 
@@ -7645,6 +7857,11 @@ Examples:
         action="store_true",
         help="[v0.7] Allow mutations on an archived project (requires --yes)",
     )
+    p_append.add_argument("--uses-references", dest="uses_references", default=None,
+        help="[v0.8] Comma-separated reference keys this run consumed "
+             "(overrides [analyses.<tool>].uses)")
+    p_append.add_argument("--no-track-references", dest="no_track_references",
+        action="store_true", help="[v0.8] Skip reference-usage capture for this append")
     p_append.add_argument(
         "--infer-from-path",
         nargs="?",
@@ -7949,6 +8166,11 @@ Examples:
         "--include-cohort-artifacts", action="store_true",
         help="[v0.7] Also export cohort_artifacts (with derived stale / "
              "n_censored_inputs columns) and cohort_artifact_inputs "
+             "(auto-enabled for XLSX multi-sheet output)",
+    )
+    p_export.add_argument(
+        "--include-references", action="store_true",
+        help="[v0.8] Also export reference_artifacts + reference_usage tables "
              "(auto-enabled for XLSX multi-sheet output)",
     )
 

@@ -17,6 +17,7 @@ from casetrack_qc.cohort_artifacts_cli import (
     cmd_migrate_cohort,
 )
 from casetrack_qc.migrate import cmd_migrate_qc
+from casetrack_qc.reference_artifacts_cli import cmd_migrate_references, cmd_references
 
 
 def build_qc_subparsers(subparsers) -> None:
@@ -150,6 +151,9 @@ def build_qc_subparsers(subparsers) -> None:
     p_appc.add_argument("--checksum", help="Artifact checksum (e.g. sha256)")
     p_appc.add_argument("--created-by", dest="created_by",
                         help="Override the recorded actor (default: manual:$USER)")
+    p_appc.add_argument("--uses-references", dest="uses_references", default=None,
+                        help="[v0.8] Comma-separated reference keys this cohort "
+                             "output consumed (e.g. genome,dbsnp)")
 
     # ── migrate-cohort ──
     p_migc = subparsers.add_parser(
@@ -171,6 +175,25 @@ def build_qc_subparsers(subparsers) -> None:
     p_calist.add_argument("--stale-only", dest="stale_only", action="store_true",
                          help="Show only artifacts with one or more censored inputs")
 
+    # ── migrate-references ── (proposal 0010)
+    p_migr = subparsers.add_parser(
+        "migrate-references",
+        help="[v0.8] Additive: create reference-artifact tables on a pre-0010 project",
+    )
+    p_migr.add_argument("--project-dir", required=True)
+    p_migr.add_argument("--dry-run", action="store_true",
+                        help="Print the plan, make no changes")
+
+    # ── references ── (proposal 0010)
+    p_refs = subparsers.add_parser(
+        "references",
+        help="[v0.8] List reference artifacts + ref-staleness",
+    )
+    p_refs.add_argument("--project-dir", required=True)
+    p_refs.add_argument("--fmt", choices=["table", "tsv", "json"], default="table")
+    p_refs.add_argument("--stale-only", dest="stale_only", action="store_true",
+                        help="Show only outputs whose used reference version is stale")
+
 
 def qc_command_dispatch() -> dict:
     """Command-name → function map that ``casetrack.main()`` merges into its own."""
@@ -183,4 +206,6 @@ def qc_command_dispatch() -> dict:
         "append-cohort": cmd_append_cohort,
         "migrate-cohort": cmd_migrate_cohort,
         "cohort-artifacts": cmd_cohort_artifacts,
+        "migrate-references": cmd_migrate_references,
+        "references": cmd_references,
     }

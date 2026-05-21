@@ -193,7 +193,8 @@ def test_module_declares_cohort_process():
 
 def test_cohort_process_inputs_outputs():
     """`casetrack_append_cohort` takes the (analysis, run_tag, artifact,
-    inputs_tsv, stats_json) fan-in tuple and re-emits (analysis, run_tag)."""
+    inputs_tsv, stats_json, uses_references) fan-in tuple and re-emits
+    (analysis, run_tag)."""
     src = (NF_DIR / "casetrack.nf").read_text()
     m = re.search(
         r"process\s+casetrack_append_cohort\s*\{(?P<body>.*?)^\}",
@@ -203,7 +204,7 @@ def test_cohort_process_inputs_outputs():
     body = m.group("body")
     assert re.search(
         r"tuple\s+val\(analysis\),\s*val\(run_tag\),\s*path\(artifact\),"
-        r"\s*path\(inputs_tsv\),\s*path\(stats_json\)",
+        r"\s*path\(inputs_tsv\),\s*path\(stats_json\),\s*val\(uses_references\)",
         body,
     )
     assert re.search(r"output:\s*\n\s*tuple\s+val\(analysis\),\s*val\(run_tag\)", body)
@@ -211,6 +212,7 @@ def test_cohort_process_inputs_outputs():
     assert "errorStrategy 'retry'" in body
     assert "append-cohort" in body
     assert "--inputs-from" in body
+    assert "--uses-references" in body
 
 
 def _extract_script(src: str, process_name: str) -> str:
@@ -268,6 +270,8 @@ def test_nextflow_cohort_command_runs_end_to_end(tmp_path: Path):
         # the static renderer can't run Groovy, so we substitute the resolved
         # value the way Nextflow would when a stats file is present.
         "stats_arg":                    f"--stats '{stats_json}'",
+        # uses_references_arg: no refs in this test — empty resolves to no flag.
+        "uses_references_arg":          "",
     })
     remaining = re.findall(r"\$\{[^}]+\}", rendered)
     assert not remaining, f"unsubstituted placeholders: {remaining}"
@@ -326,6 +330,7 @@ def test_nextflow_cohort_command_stats_optional(tmp_path: Path):
         "artifact":                     str(artifact),
         "inputs_tsv":                   str(inputs_tsv),
         "stats_arg":                    "",   # no stats → no --stats flag
+        "uses_references_arg":          "",   # no refs → no --uses-references flag
     })
     remaining = re.findall(r"\$\{[^}]+\}", rendered)
     assert not remaining, f"unsubstituted placeholders: {remaining}"

@@ -290,8 +290,53 @@ and exact SQL.
 | `append-cohort`  | **v0.7** — register a cohort-level artifact (joint VCF, PoN, matrix) + its assay lineage (proposal 0009) |
 | `cohort-artifacts`| **v0.7** — list cohort-level artifacts with read-time staleness (`--stale-only`) |
 | `migrate-cohort` | **v0.7** — additive: create the cohort-artifact tables on a pre-0009 project   |
+| `references`     | **v0.8** — list reference artifacts + read-time ref-staleness (`--stale-only`, `--fmt`) (proposal 0010) |
+| `migrate-references` | **v0.8** — additive: create the reference-artifact tables on a pre-0010 project |
 
 `casetrack <cmd> --help` for the full option list on any subcommand.
+
+### Reference artifacts (v0.8, proposal 0010)
+
+Declare versioned external inputs once in `casetrack.toml`, and each analysis
+names the references it consumes:
+
+```toml
+[references.genome]
+path = "/data1/greenbab/database/hg38/v0/Homo_sapiens_assembly38.fasta"
+version = "hg38_v0"          # changing this version flags downstream outputs stale
+kind = "genome"              # genome | annotation | known_variants | repeats | intervals | other
+
+[references.dbsnp]
+path = ".../dbsnp_b156.vcf.gz"
+version = "dbsnp_b156"
+kind = "known_variants"
+
+[analyses.clair3]
+level = "specimen"
+column_prefix = "clair3"
+uses = ["genome", "dbsnp"]   # append auto-snapshots each ref's current version
+```
+
+`casetrack append` records which reference version each output consumed.
+When a reference is bumped, every output that used the old version reads `STALE`:
+
+```bash
+# 1. analysis ran against hg38_v0 — output is fresh
+casetrack append --project-dir . --analysis clair3 --results clair3_summary.tsv
+
+# 2. bump the genome version in casetrack.toml (hg38_v0 -> hg38_v1), then:
+casetrack schema apply --project-dir .          # syncs [references], logs the move
+
+# 3. the clair3 output is now ref-stale
+casetrack references --project-dir . --stale-only
+#   [STALE] specimen:S1/clair3  (genome: hg38_v0 -> hg38_v1)
+```
+
+Staleness is read-time and reversible: revert the version and outputs read
+`fresh` again. It is orthogonal to cohort-artifact input-staleness (0009) — a
+cohort artifact can be input-stale, ref-stale, both, or neither. Override the
+declared refs per run with `--uses-references genome,dbsnp`, or skip capture with
+`--no-track-references`. For cohort outputs, `append-cohort --uses-references …`.
 
 ### Representative examples
 
@@ -441,6 +486,8 @@ Upgrade-path commands (`migrate-qc`, `migrate-project-id`, `recover`) bypass the
 |---|---|---|
 | `casetrack_list_projects` | (none) | JSON summary of the local registry |
 | `casetrack_query` | `project_id`, `sql` (SELECT / WITH only) | Rows as JSON |
+| `casetrack_cohort_artifacts` | `project_id`, `stale_only?` | Cohort artifacts + input-staleness (proposal 0009) |
+| `casetrack_references` | `project_id`, `stale_only?` | Reference artifacts + ref-staleness (proposal 0010) |
 
 Install the optional dependency + wire it into Claude Desktop:
 

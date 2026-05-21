@@ -195,7 +195,7 @@ process casetrack_append_cohort {
     maxRetries 2
 
     input:
-      tuple val(analysis), val(run_tag), path(artifact), path(inputs_tsv), path(stats_json)
+      tuple val(analysis), val(run_tag), path(artifact), path(inputs_tsv), path(stats_json), val(uses_references)
 
     output:
       tuple val(analysis), val(run_tag)
@@ -204,6 +204,9 @@ process casetrack_append_cohort {
     // stats_json is optional: when the caller passes `[]`, Nextflow stages
     // nothing and `stats_json` is falsy, so we drop the --stats flag entirely.
     def stats_arg = stats_json ? "--stats '${stats_json}'" : ''
+    // uses_references is optional: pass `[]` (or empty string) when not needed;
+    // when non-empty, the value is a comma-joined list of reference keys.
+    def uses_references_arg = uses_references ? "--uses-references '${uses_references}'" : ''
     """
     ${params.casetrack_bin} append-cohort \\
         --project-dir '${params.casetrack_project_dir}' \\
@@ -211,7 +214,7 @@ process casetrack_append_cohort {
         --run-tag '${run_tag}' \\
         --path '${artifact}' \\
         --inputs-from '${inputs_tsv}' \\
-        ${stats_arg} ${params.casetrack_extra}
+        ${stats_arg} ${uses_references_arg} ${params.casetrack_extra}
     """
 }
 

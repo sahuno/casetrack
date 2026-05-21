@@ -190,12 +190,17 @@ def install_active_views(duckdb_con) -> None:
 
 
 def install_cohort_artifact_view(duckdb_con) -> None:
-    """Attach a ``_cohort_artifacts`` DuckDB view (proposal 0009).
+    """Attach a ``_cohort_artifacts`` DuckDB view (proposal 0009 + 0010).
 
-    Exposes each cohort artifact with two derived columns:
+    Exposes each cohort artifact with derived columns:
       - ``n_censored_inputs`` — contributing assays currently excluded by the
         §4.4 cascade (QC fail/censored or consent-revoked).
-      - ``stale`` — boolean, true when ``n_censored_inputs > 0``.
+      - ``stale`` — boolean, true when ``n_censored_inputs > 0`` (input-stale;
+        distinct from ``ref_stale``).
+      - ``ref_stale`` — boolean (proposal 0010), true when any cohort-scope
+        reference-usage row for this artifact has a stale version. Present only
+        on 0010+ projects; absent on pre-0010 projects (view still created
+        without the column so ``query`` continues to work).
 
     Silent no-op on projects without the cohort-artifact tables (pre-0009).
     """
@@ -216,7 +221,29 @@ def install_cohort_artifact_view(duckdb_con) -> None:
           WHERE ci.artifact_id = ca.artifact_id
             AND ci.assay_id NOT IN ({active_sql}))
     """
-    sql = f"""
+    # Proposal 0010: ref_stale subquery. True when any cohort-scope usage row
+    # for this artifact references a version that no longer matches
+    # reference_artifacts.version. Distinct from input `stale`.
+    ref_stale_subquery = """
+        EXISTS (
+            SELECT 1
+            FROM proj.reference_usage ru
+            LEFT JOIN proj.reference_artifacts rr ON rr.ref_key = ru.ref_key
+            WHERE ru.scope = 'cohort'
+              AND ru.artifact_id = ca.artifact_id
+              AND (rr.version IS NULL OR rr.version <> ru.version_used)
+        )
+    """
+    sql_with_ref_stale = f"""
+        CREATE VIEW "_cohort_artifacts" AS
+        SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
+               ca.n_inputs, ca.stats_json, ca.created_at,
+               {censored_count} AS n_censored_inputs,
+               ({censored_count} > 0) AS stale,
+               {ref_stale_subquery} AS ref_stale
+        FROM proj.cohort_artifacts ca
+    """
+    sql_without_ref_stale = f"""
         CREATE VIEW "_cohort_artifacts" AS
         SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
                ca.n_inputs, ca.stats_json, ca.created_at,
@@ -225,9 +252,48 @@ def install_cohort_artifact_view(duckdb_con) -> None:
         FROM proj.cohort_artifacts ca
     """
     try:
+        duckdb_con.execute(sql_with_ref_stale)
+    except Exception:
+        # Pre-0010 projects lack reference_usage/reference_artifacts — fall
+        # back to the original view without ref_stale.
+        try:
+            duckdb_con.execute(sql_without_ref_stale)
+        except Exception:
+            # Pre-0009 DBs lack the cohort-artifact tables — skip so `query`
+            # still works.
+            pass
+
+
+def install_reference_usage_view(duckdb_con) -> None:
+    """Attach a ``_reference_usage`` DuckDB view (proposal 0010).
+
+    Exposes every usage edge with two derived columns:
+      - ``current_version`` — the current version in ``reference_artifacts``
+        (NULL when the ref_key has been removed from the TOML).
+      - ``is_stale`` — boolean, true when ``current_version`` is NULL or
+        differs from ``version_used``.
+
+    Silent no-op on projects without the reference tables (pre-0010).
+    """
+    sql = """
+        CREATE VIEW "_reference_usage" AS
+        SELECT u.usage_id, u.scope, u.entity_level, u.entity_id,
+               u.analysis, u.artifact_id, u.ref_key,
+               u.version_used, u.recorded_at,
+               r.version AS current_version,
+               CASE
+                   WHEN r.version IS NULL THEN TRUE
+                   WHEN r.version <> u.version_used THEN TRUE
+                   ELSE FALSE
+               END AS is_stale
+        FROM proj.reference_usage u
+        LEFT JOIN proj.reference_artifacts r ON r.ref_key = u.ref_key
+    """
+    try:
         duckdb_con.execute(sql)
     except Exception:
-        # Pre-0009 DBs lack the tables — skip so `query` still works.
+        # Pre-0010 projects lack reference_usage/reference_artifacts — skip so
+        # `query` still works on pre-0010 projects.
         pass
 
 
@@ -241,4 +307,5 @@ __all__ = [
     "exclusion_breakdown",
     "install_active_views",
     "install_cohort_artifact_view",
+    "install_reference_usage_view",
 ]

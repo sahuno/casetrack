@@ -86,6 +86,18 @@ def cmd_append_cohort(args) -> None:
                     created_by=created_by,
                 )
                 ca.add_artifact_inputs(conn, art_id, inputs)
+                refs = getattr(args, "uses_references", None)
+                if refs:
+                    from casetrack_qc import reference_artifacts as _ra
+                    _ra.ensure_reference_schema(conn)
+                    current = {r.ref_key: r.version
+                               for r in _ra.list_references(conn)}
+                    for ref_key in [s.strip() for s in refs.split(",") if s.strip()]:
+                        if ref_key in current:
+                            _ra.record_usage(
+                                conn, scope="cohort", artifact_id=art_id,
+                                ref_key=ref_key, version_used=current[ref_key],
+                                transaction_id=txn_id)
         except ca.CohortArtifactError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(2)
