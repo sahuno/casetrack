@@ -23,6 +23,7 @@ import pytest
 import casetrack
 from casetrack_mcp.tools import (
     MCPToolError,
+    cohort_artifacts_tool,
     list_projects_tool,
     query_tool,
 )
@@ -105,6 +106,79 @@ def test_query_unknown_project_id_when_empty(tmp_path: Path):
 def test_query_rejects_bad_project_id(bad_input, expected):
     with pytest.raises(MCPToolError, match=expected):
         query_tool(bad_input, "SELECT 1")
+
+
+# ── cohort_artifacts_tool (proposal 0009) ────────────────────────────────────
+
+
+def _project_with_cohort_artifact(tmp_path: Path, *, censor: bool) -> str:
+    """Init a registered project, seed 2 assays, register a cohort artifact,
+    optionally censor one input. Returns the project_id."""
+    from casetrack_qc.cohort_artifacts_cli import cmd_append_cohort
+
+    proj = tmp_path / "project-cohort"
+    casetrack.cmd_init(_init_ns(proj))
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        with casetrack.begin_immediate(conn):
+            conn.executescript(
+                "INSERT INTO patients (patient_id) VALUES ('P1'), ('P2');"
+                "INSERT INTO specimens (specimen_id, patient_id) VALUES "
+                "  ('P1-t', 'P1'), ('P2-t', 'P2');"
+                "INSERT INTO assays (assay_id, specimen_id, assay_type) VALUES "
+                "  ('P1-t-ONT', 'P1-t', 'ONT'), ('P2-t-ONT', 'P2-t', 'ONT');"
+            )
+    finally:
+        conn.close()
+    cmd_append_cohort(argparse.Namespace(
+        project_dir=str(proj), analysis="joint_genotype", run_tag="run1",
+        path="/cohort.vcf.gz", inputs="P1-t-ONT,P2-t-ONT", inputs_from=None,
+        stats=None, checksum=None, created_by=None,
+    ))
+    if censor:
+        conn = casetrack.open_project_db(proj / "casetrack.db")
+        try:
+            with casetrack.begin_immediate(conn):
+                conn.execute(
+                    "UPDATE assays SET qc_status='censored' "
+                    "WHERE assay_id='P1-t-ONT'"
+                )
+        finally:
+            conn.close()
+    return "project-cohort"
+
+
+def test_cohort_artifacts_tool_unknown_project(populated_project: Path):
+    with pytest.raises(MCPToolError) as exc:
+        cohort_artifacts_tool("never-heard-of-it")
+    assert "not in the casetrack registry" in str(exc.value)
+
+
+def test_cohort_artifacts_tool_fresh(tmp_path: Path):
+    pid = _project_with_cohort_artifact(tmp_path, censor=False)
+    payload = cohort_artifacts_tool(pid)
+    assert payload["n_artifacts"] == 1
+    assert payload["n_stale"] == 0
+    art = payload["artifacts"][0]
+    assert art["run_tag"] == "run1"
+    assert art["stale"] is False
+    assert art["n_censored_inputs"] == 0
+
+
+def test_cohort_artifacts_tool_flags_stale(tmp_path: Path):
+    pid = _project_with_cohort_artifact(tmp_path, censor=True)
+    payload = cohort_artifacts_tool(pid)
+    assert payload["n_stale"] == 1
+    art = payload["artifacts"][0]
+    assert art["stale"] is True
+    assert art["censored_inputs"] == ["P1-t-ONT"]
+
+
+def test_cohort_artifacts_tool_stale_only(tmp_path: Path):
+    pid = _project_with_cohort_artifact(tmp_path, censor=False)
+    payload = cohort_artifacts_tool(pid, stale_only=True)
+    assert payload["n_artifacts"] == 0
+    assert payload["artifacts"] == []
 
 
 def test_query_rejects_empty_sql(populated_project: Path):

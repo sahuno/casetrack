@@ -5557,6 +5557,27 @@ def cmd_dashboard_project(args):
                 "SELECT level, entity_id, kind, reason, source, created_at "
                 "FROM qc_events WHERE resolved_at IS NULL ORDER BY id"
             ).fetchall()
+
+        # Proposal 0009: cohort-artifact section with read-time staleness.
+        # Gathered independently of the QC gate (the tables can exist on their
+        # own); degrades silently when absent.
+        from casetrack_qc.cohort_artifacts import (
+            artifact_staleness as _ca_staleness,
+            cohort_artifacts_schema_exists as _ca_exists,
+            list_artifacts as _ca_list,
+        )
+        if _ca_exists(conn):
+            _stale_map = _ca_staleness(conn)
+            qc_info["cohort_artifacts"] = [
+                {
+                    "analysis": a.analysis,
+                    "run_tag": a.run_tag,
+                    "n_inputs": a.n_inputs,
+                    "stale": bool(_stale_map.get(a.artifact_id)),
+                    "censored": _stale_map.get(a.artifact_id, []),
+                }
+                for a in _ca_list(conn)
+            ]
     finally:
         conn.close()
 
@@ -5794,6 +5815,8 @@ def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
 
   {_qc_excluded_html(qc_info)}
 
+  {_cohort_artifacts_html(qc_info)}
+
   <h2>Patients</h2>
   {"".join(body_sections) if body_sections
      else '<p class="muted">No patients registered yet.</p>'}
@@ -5818,6 +5841,47 @@ def _qc_chips_html(qc_info: dict | None) -> str:
     if not parts:
         return ""
     return f'<div class="qc-chips">{"".join(parts)}</div>'
+
+
+def _cohort_artifacts_html(qc_info: dict | None) -> str:
+    """Render the cohort-artifact section (proposal 0009) with staleness badges.
+
+    Returns "" when there are no cohort artifacts so pre-0009 / per-sample-only
+    projects render identically to before.
+    """
+    if not qc_info:
+        return ""
+    arts = qc_info.get("cohort_artifacts") or []
+    if not arts:
+        return ""
+    esc = html.escape
+    n_stale = sum(1 for a in arts if a["stale"])
+    rows = []
+    for a in arts:
+        if a["stale"]:
+            badge = '<span class="qc-chip qc-chip-amber">STALE</span>'
+            detail = esc(", ".join(a["censored"]))
+        else:
+            badge = '<span class="qc-chip qc-chip-grey">fresh</span>'
+            detail = ""
+        rows.append(
+            "<tr>"
+            f"<td>{esc(a['analysis'])}</td>"
+            f"<td class='id'>{esc(a['run_tag'])}</td>"
+            f"<td>{a['n_inputs']}</td>"
+            f"<td>{badge}</td>"
+            f"<td class='id'>{detail}</td>"
+            "</tr>"
+        )
+    return (
+        f"<h2>Cohort artifacts <span class='muted'>({len(arts)} total, "
+        f"{n_stale} STALE)</span></h2>"
+        "<table><thead><tr>"
+        "<th>analysis</th><th>run_tag</th><th>inputs</th>"
+        "<th>status</th><th>censored inputs</th>"
+        "</tr></thead><tbody>"
+        f"{''.join(rows)}</tbody></table>"
+    )
 
 
 def _qc_excluded_html(qc_info: dict | None) -> str:

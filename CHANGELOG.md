@@ -33,6 +33,12 @@ samples (joint-genotyped VCFs, panels-of-normals, cohort matrices). See
   derived columns) and `cohort_artifact_inputs` tables (auto-enabled for XLSX).
 - **`casetrack migrate-cohort`** — additive migration to create the two tables on
   a pre-0009 project (`--dry-run` supported).
+- **Dashboard** — `casetrack dashboard` renders a "Cohort artifacts" section with
+  per-artifact `fresh`/`STALE` badges and the censored inputs behind each STALE.
+- **MCP** — new `casetrack_cohort_artifacts` tool surfaces artifacts + derived
+  staleness to AI agents (companion to the CLI command), so an agent doesn't have
+  to hand-write the cascade SQL. The `casetrack_query` schema now points at the
+  `cohort_artifacts` / `cohort_artifact_inputs` tables.
 - **`casetrack_append_cohort` Nextflow process** (`examples/nextflow/casetrack.nf`)
   — the fan-in companion to `casetrack_append_project`; registers a cohort
   artifact + its assay lineage (passed as a `collectFile` inputs manifest).

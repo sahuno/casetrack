@@ -110,6 +110,22 @@ def _export_ns(proj, output, **kw):
     return argparse.Namespace(**base)
 
 
+# ── dashboard: cohort-artifacts section ─────────────────────────────────────
+
+
+def test_dashboard_shows_cohort_artifacts_section(tmp_path):
+    proj = _project_with_stale_artifact(tmp_path)
+    out = tmp_path / "dash.html"
+    casetrack.cmd_dashboard_project(argparse.Namespace(
+        project_dir=str(proj), project=None, output=str(out),
+    ))
+    html_text = out.read_text()
+    assert "Cohort artifacts" in html_text
+    assert "STALE" in html_text
+    assert "run1" in html_text
+    assert "P1-t-ONT" in html_text  # the censored input is named
+
+
 def test_export_includes_cohort_artifacts_with_stale_column(tmp_path):
     import pandas as pd
     proj = _project_with_stale_artifact(tmp_path)

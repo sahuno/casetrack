@@ -237,7 +237,8 @@ durable design.
 3. ~~Add read-time staleness to `status` / `query` / `export` / `cohort`.~~ **Done** — `cohort-artifacts` command, plus: `status` appends a cohort-artifact section, `query` exposes the `_cohort_artifacts` DuckDB view (derived `n_censored_inputs` / `stale`), and `export --include-cohort-artifacts` writes both tables with the derived columns.
 4. ~~`CASETRACK_COHORT_ARTIFACT` subworkflow + a joint-genotyping worked example in `examples/`.~~ **Done** — `casetrack_append_cohort` process in `examples/nextflow/casetrack.nf` + `examples/giab_chr21/run_cohort_demo.sh` (mock + bcftools engines).
 
+5. ~~Dashboard / MCP surfacing of cohort artifacts (§8.4).~~ **Done** — `dashboard` renders a Cohort-artifacts section with fresh/STALE badges; `casetrack_cohort_artifacts` MCP tool surfaces artifacts + staleness to agents.
+
 ### Still open
-- Dashboard / MCP panel for cohort artifacts (§8.4).
 - `--stats`-less `append-cohort` ergonomics (currently a `{}` file is the idiom).
 - The Nextflow deliverable is a `casetrack_append_cohort` *process* + documented gather pattern, not a packaged `subworkflows/local/*.nf` file.
