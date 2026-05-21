@@ -162,7 +162,7 @@ _DERIVATION_SCHEMA: dict[str, Any] = {
 
 
 def _build_server() -> "Server":
-    """Register the two tool handlers against a fresh Server instance."""
+    """Register the tool handlers against a fresh Server instance."""
     if not _MCP_AVAILABLE:
         raise RuntimeError(
             "The `mcp` package is not installed. Run "
