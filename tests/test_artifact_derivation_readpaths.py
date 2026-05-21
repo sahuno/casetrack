@@ -237,6 +237,19 @@ def test_artifact_derivation_view_cycle_safe(tmp_path):
 # ── Backward-compatibility regression (0011 Task 8 review) ──────────────────
 
 
+def test_status_shows_derivation_section(tmp_path):
+    """``status`` emits a Derivation section and names derived-stale nodes."""
+    p = _proj(tmp_path)
+    conn = casetrack.open_project_db(p / "casetrack.db")
+    conn.execute("UPDATE assays SET qc_status='censored' WHERE assay_id='A2'")
+    conn.commit()
+    conn.close()
+    r = _run(["status", "--project-dir", str(p)])
+    assert r.returncode == 0, r.stderr
+    assert "Derivation" in r.stdout
+    assert "cohort:annot@v1" in r.stdout
+
+
 def test_cohort_view_ref_stale_survives_without_derivation_table(tmp_path):
     """Regression: _cohort_artifacts.ref_stale is preserved on 0010-era DBs
     that lack artifact_derivation (not yet migrated to 0011).

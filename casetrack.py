@@ -7114,6 +7114,14 @@ def cmd_status_project(args):
         finally:
             conn5.close()
 
+    # Proposal 0011: surface derivation edges + derived-stale outputs.
+    if args.fmt in (None, "table"):
+        conn6 = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            _emit_derivation_section(conn6)
+        finally:
+            conn6.close()
+
 
 def _emit_references_section(conn: sqlite3.Connection) -> None:
     """Print a references summary with staleness, when any exist (proposal 0010 §6.4).
@@ -7141,6 +7149,29 @@ def _emit_references_section(conn: sqlite3.Connection) -> None:
         else:
             who = f"cohort_artifact:{o['artifact_id']}"
         print(f"  [STALE] {who}  ({'; '.join(o['reasons'])})")
+
+
+def _emit_derivation_section(conn: sqlite3.Connection) -> None:
+    """Print a derivation summary with derived-staleness (proposal 0011 §6.5).
+
+    Self-contained block appended to the human status view. No-ops on pre-0011
+    projects.
+    """
+    from casetrack_qc.artifact_derivation import (
+        derivation_schema_exists as _deriv_exists,
+        list_edges as _list_edges,
+        all_derived_stale as _all_derived_stale,
+    )
+    if not _deriv_exists(conn):
+        return
+    edges = _list_edges(conn)
+    if not edges:
+        return
+    stale = [r for r in _all_derived_stale(conn) if r["state"] == "STALE"]
+    print("\n=== Derivation (proposal 0011) ===")
+    print(f"  {len(edges)} edge(s); {len(stale)} derived-stale output(s)")
+    for r in stale:
+        print(f"  [STALE] {r['node']}  ({'; '.join(r['reasons'])})")
 
 
 def _emit_cohort_artifacts_section(conn: sqlite3.Connection) -> None:
