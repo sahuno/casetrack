@@ -4781,56 +4781,80 @@ def _is_analysis_column(prov_path: Path, col: str) -> bool:
 def _schema_apply(project_dir: Path, schema: dict, issues: list[dict]) -> None:
     """Apply `missing_in_db` drift via ALTER TABLE ADD COLUMN. Bump schema_v."""
     to_add = [i for i in issues if i["kind"] == "missing_in_db"]
-    if not to_add:
+    if to_add:
+        conn = open_project_db(project_dir / PROJECT_DB_NAME)
+        executed_sql: list[str] = []
+        try:
+            with begin_immediate(conn):
+                for i in to_add:
+                    ddl = (
+                        f"ALTER TABLE {_quote_ident(i['table'])} "
+                        f"ADD COLUMN {_quote_ident(i['column'])} {i['type']}"
+                    )
+                    conn.execute(ddl)
+                    executed_sql.append(ddl)
+        finally:
+            conn.close()
+
+        # Bump schema_v in the TOML.
+        toml_path = project_dir / PROJECT_TOML_NAME
+        old_v = schema["project"].get("schema_v", 1)
+        new_v = old_v + 1
+        toml_text = toml_path.read_text()
+        # Simple line-level substitution — the templates write schema_v on its
+        # own line. If this fails we fall back to leaving the file alone; the
+        # provenance entry still records the intended version.
+        import re
+        patched = re.sub(
+            r"(?m)^schema_v\s*=\s*\d+\s*$",
+            f"schema_v = {new_v}",
+            toml_text,
+            count=1,
+        )
+        if patched != toml_text:
+            toml_path.write_text(patched)
+
+        log_project_provenance(project_dir, {
+            "action": "schema_apply",
+            "transaction_id": _new_transaction_id(),
+            "columns_added": [(i["table"], i["column"], i["type"]) for i in to_add],
+            "sql": executed_sql,
+            "schema_v_before": old_v,
+            "schema_v_after": new_v,
+        })
+
+        print(
+            f"Applied {len(to_add)} schema change(s); schema_v {old_v} → {new_v}."
+        )
+        for i in to_add:
+            print(f"  + {i['table']}.{i['column']} {i['type']}")
+    else:
         print("Schema up to date; nothing to apply.")
-        return
 
-    conn = open_project_db(project_dir / PROJECT_DB_NAME)
-    executed_sql: list[str] = []
-    try:
-        with begin_immediate(conn):
-            for i in to_add:
-                ddl = (
-                    f"ALTER TABLE {_quote_ident(i['table'])} "
-                    f"ADD COLUMN {_quote_ident(i['column'])} {i['type']}"
-                )
-                conn.execute(ddl)
-                executed_sql.append(ddl)
-    finally:
-        conn.close()
-
-    # Bump schema_v in the TOML.
-    toml_path = project_dir / PROJECT_TOML_NAME
-    old_v = schema["project"].get("schema_v", 1)
-    new_v = old_v + 1
-    toml_text = toml_path.read_text()
-    # Simple line-level substitution — the templates write schema_v on its
-    # own line. If this fails we fall back to leaving the file alone; the
-    # provenance entry still records the intended version.
-    import re
-    patched = re.sub(
-        r"(?m)^schema_v\s*=\s*\d+\s*$",
-        f"schema_v = {new_v}",
-        toml_text,
-        count=1,
-    )
-    if patched != toml_text:
-        toml_path.write_text(patched)
-
-    log_project_provenance(project_dir, {
-        "action": "schema_apply",
-        "transaction_id": _new_transaction_id(),
-        "columns_added": [(i["table"], i["column"], i["type"]) for i in to_add],
-        "sql": executed_sql,
-        "schema_v_before": old_v,
-        "schema_v_after": new_v,
-    })
-
-    print(
-        f"Applied {len(to_add)} schema change(s); schema_v {old_v} → {new_v}."
-    )
-    for i in to_add:
-        print(f"  + {i['table']}.{i['column']} {i['type']}")
+    # Proposal 0010: materialize [references] into reference_artifacts and
+    # record version moves to provenance (the event that flips outputs stale).
+    references = schema.get("references", {})
+    if references:
+        from casetrack_qc.reference_artifacts import (
+            ensure_reference_schema, sync_references_from_toml,
+        )
+        txn_id = _new_transaction_id()
+        conn = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            with begin_immediate(conn):
+                ensure_reference_schema(conn)
+                ref_changes = sync_references_from_toml(conn, references)
+        finally:
+            conn.close()
+        for ch in ref_changes:
+            if ch["old_version"] is not None:  # version move, not first insert
+                log_project_provenance(project_dir, {
+                    "action": "reference_version_change",
+                    "ref_key": ch["ref_key"],
+                    "old_version": ch["old_version"],
+                    "new_version": ch["new_version"],
+                    "transaction_id": txn_id,
+                })
 
 
 def _dump_schema_from_db(conn: sqlite3.Connection, project_name: str, schema_v: int) -> str:

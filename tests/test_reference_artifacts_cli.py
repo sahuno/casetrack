@@ -43,3 +43,32 @@ def test_migrate_references_is_idempotent(tmp_path):
          "--project-dir", str(pdir)], capture_output=True, text=True)
     assert r2.returncode == 0
     assert "No migration needed" in r2.stdout
+
+
+def test_schema_apply_syncs_references_and_logs_version_change(tmp_path):
+    pdir = _init_project(tmp_path)
+    toml = pdir / "casetrack.toml"
+    text = toml.read_text()
+    text += (
+        '\n[references.genome]\n'
+        'path = "/db/hg38.fa"\nversion = "hg38_v0"\nkind = "genome"\n'
+    )
+    toml.write_text(text)
+    subprocess.run([sys.executable, "-m", "casetrack", "schema", "apply",
+                    "--project-dir", str(pdir)], check=True,
+                   capture_output=True, text=True)
+    conn = sqlite3.connect(pdir / casetrack.PROJECT_DB_NAME)
+    assert ra.get_reference(conn, "genome").version == "hg38_v0"
+    conn.close()
+
+    # bump the version and re-apply
+    toml.write_text(text.replace("hg38_v0", "hg38_v1"))
+    subprocess.run([sys.executable, "-m", "casetrack", "schema", "apply",
+                    "--project-dir", str(pdir)], check=True,
+                   capture_output=True, text=True)
+    conn = sqlite3.connect(pdir / casetrack.PROJECT_DB_NAME)
+    assert ra.get_reference(conn, "genome").version == "hg38_v1"
+    conn.close()
+    prov = (pdir / "provenance.jsonl").read_text()
+    assert "reference_version_change" in prov
+    assert "hg38_v0" in prov and "hg38_v1" in prov
