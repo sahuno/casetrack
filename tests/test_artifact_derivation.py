@@ -41,12 +41,21 @@ def test_record_edge_idempotent(tmp_path):
     assert len(rows) == 1
     assert rows[0]["down_node"] == "cohort:annot@v1"
     assert rows[0]["up_node"] == "cohort:joint@v1"
+    assert rows[0]["transaction_id"] == "t1"  # first-write-wins; the second is IGNORE'd
+
+
+def test_list_edges_empty(tmp_path):
+    conn = _project(tmp_path)
+    assert ad.list_edges(conn) == []
 
 
 def test_record_edge_validates_node_refs(tmp_path):
     conn = _project(tmp_path)
     with pytest.raises(ad.DerivationError):
         ad.record_edge(conn, down="bogus:x", up="cohort:j@v1", transaction_id="t")
+    # the up argument is validated symmetrically
+    with pytest.raises(ad.DerivationError):
+        ad.record_edge(conn, down="cohort:j@v1", up="bogus:x", transaction_id="t")
 
 
 def test_cycle_refused_direct(tmp_path):

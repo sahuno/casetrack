@@ -15,11 +15,11 @@ Author: Samuel Ahuno (ekwame001@gmail.com)
 """
 from __future__ import annotations
 
-import datetime  # noqa: F401  used by record_edge (Task 2)
+import datetime
 import sqlite3
 from dataclasses import dataclass
 
-TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S"  # used by record_edge (Task 2)
+TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S"
 NODE_SCOPES = ("cohort", "reference", "analysis")
 
 
@@ -156,6 +156,11 @@ def record_edge(conn: sqlite3.Connection, *, down: str, up: str,
 
     Validates both node-refs and refuses an edge that would create a cycle in
     the artifact_derivation graph (0011 §6.4).
+
+    The cycle check (read) and the insert (write) are not atomic. Callers MUST
+    wrap this in ``casetrack.begin_immediate(conn)`` so two concurrent callers
+    cannot both pass the check and together close a cycle. Module functions do
+    not own transactions — that is the CLI layer's job (proposal 0001).
     """
     LineageNode.parse(down)  # validate
     LineageNode.parse(up)
