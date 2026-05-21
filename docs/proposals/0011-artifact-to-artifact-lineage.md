@@ -14,7 +14,7 @@ Settled during design; not re-litigated below:
 
 1. **0011 is the recursive edge.** 0009 (assay → cohort artifact) and 0010 (output → reference) each give a *single hop*. 0011 adds a generic **`derived-from`** edge between any two lineage nodes, making the lineage a multi-hop DAG and making staleness **transitive**. This is the whole point — neither existing table can express "an artifact derived from another artifact."
 2. **Both endpoints fully polymorphic over three node types** — `cohort:<analysis>@<run_tag>`, `reference:<ref_key>`, `analysis:<entity_level>/<entity_id>/<analysis>`. The three driving cases (cohort→cohort, reference→cohort, sample-output→cohort) plus the deferred-no-more reference→reference and sample-output→sample-output all fall out of one symmetric edge.
-3. **One additive sibling table** (`artifact_derivation`), mirroring the 0009/0010 ethos. The three-level core, the 0009 tables, and the 0010 tables are untouched. (§7 records the rejected alternatives.)
+3. **One additive sibling table** (`artifact_derivation`), mirroring the 0009/0010 ethos. The three-level core, the 0009 tables, and the 0010 tables are untouched. (§7 records the rejected alternatives.) Code lives in `casetrack_qc/` (like `cohort_artifacts.py` / `reference_artifacts.py`), **not** a new top-level package — the name `casetrack_lineage` is already taken by proposal 0006 (assay-merge lineage: `batches` / `assay_sources` / `add-batch` / `link-sources`), a distinct subsystem. The inspect command is therefore `derivation` and the MCP tool `casetrack_derivation`, not `lineage`.
 4. **Canonical node-ref strings, not wide polymorphic columns.** Each endpoint is one TEXT column holding a canonical id; a shared `LineageNode` helper is the single home for parse/format/resolve. (§7.3 records why not wide columns.)
 5. **`derived_stale` is a third orthogonal flag**, alongside 0009's `stale` and 0010's `ref_stale` — consistent with 0010's "never collapse into one flag" decision. A node can be any combination of the three. Its reason names the upstream culprit *and* that culprit's root cause.
 6. **The walk traverses the 0010 `reference_usage` edge too.** A reference that is *derived* from a stale cohort artifact (a PoN whose input was censored) must propagate to everything that `uses` it — even with no TOML version bump. This is the connective tissue that closes the loop between 0009, 0010 and 0011.
@@ -48,7 +48,7 @@ Encode the upstream artifact's identity into a result column on the downstream o
 - A `LineageNode` helper: the single, tested home for canonical node-ref parse/format and resolution to existing staleness params.
 - Read-time **transitive `derived_stale`** for cohort artifacts, references, and sample-level outputs, with a root-cause-naming reason, derived by a memoized cycle-guarded walk over all three edge tables.
 - Capture: a generic `derived-from` command, `--derived-from` convenience on `append`/`append-cohort`, and a declarative TOML `derived_from` on references.
-- Surfacing in every existing read path (`status`, `query`, `export`, `dashboard`, MCP, `validate`) plus a new `lineage` command.
+- Surfacing in every existing read path (`status`, `query`, `export`, `dashboard`, MCP, `validate`) plus a new `derivation` inspect command.
 - Cycle prevention at write time and a `validate` acyclicity invariant.
 - Zero change to the three-level core, the 0009 tables, and the 0010 tables; additive migration for existing projects.
 
@@ -153,15 +153,15 @@ derived_stale(node) = ANY( is_stale(u) for u in upstream(node) )                
 - **`casetrack append-cohort --derived-from <up-node>,…`** *(extended)* — convenience: downstream is the cohort artifact just created.
 - **TOML `[references.<key>] derived_from = ["cohort:make_pon@cohort147_v1", …]`** *(extended)* — declarative; materialized into `artifact_derivation` (downstream `reference:<key>`) on `schema apply`, mirroring `uses`.
 - **`casetrack migrate-derivation --project-dir . [--dry-run]`** *(new)* — additive table creation (mirrors `migrate-references`); `init` creates the table by default going forward.
-- **`casetrack lineage --project-dir . [--node <ref>] [--stale-only] [--fmt table|tsv|json]`** *(new)* — lists edges with per-node `derived_stale`; `--node X` shows X's immediate up/downstream neighbours and the full root-cause chain; `--stale-only` drills into derived-stale outputs.
+- **`casetrack derivation --project-dir . [--node <ref>] [--stale-only] [--fmt table|tsv|json]`** *(new)* — lists edges with per-node `derived_stale`; `--node X` shows X's immediate up/downstream neighbours and the full root-cause chain; `--stale-only` drills into derived-stale outputs. (Named `derivation`, not `lineage`, to avoid the 0006 collision — §0.3.)
 
 ### 6.5 Read-path integration
 
 - **`casetrack status`** — a "Lineage / derived" section (edge count + derived-stale tally); `derived_stale` flagged inline on artifacts alongside `stale` / `ref_stale`.
 - **`casetrack query`** — a `_artifact_derivation` DuckDB view (edges + resolved endpoint kinds + per-down-node `derived_stale`); a `derived_stale` column added to `_cohort_artifacts` (beside `stale` and `ref_stale`) and to `_reference_usage`.
 - **`casetrack export --include-derivation`** — emits `artifact_derivation` with derived-staleness; auto-enabled for XLSX.
-- **`casetrack dashboard`** — a "Lineage" section + `derived-stale` badges on outputs.
-- **MCP** — a `casetrack_lineage` tool (companion to the CLI): edges + derived-stale outputs with their root-cause chains.
+- **`casetrack dashboard`** — a "Derivation" section + `derived-stale` badges on outputs.
+- **MCP** — a `casetrack_derivation` tool (companion to the CLI): edges + derived-stale outputs with their root-cause chains.
 - **`casetrack validate`** — new invariants: (a) every `artifact_derivation` endpoint resolves to a live node, else flag a **dangling edge**; (b) the derivation graph (union with the traversed `reference_usage` edges) is **acyclic**, else flag the cycle.
 
 ### 6.6 Nextflow
@@ -194,8 +194,8 @@ A unified `nodes` + `edges` graph that absorbs `cohort_artifacts`, `reference_ar
 1. Schema module `casetrack_qc/artifact_derivation.py`: DDL + idempotent `ensure_derivation_schema` (mirrors `reference_artifacts.py`); `LineageNode` parse/format/resolve; `record_edge` + write-time cycle check.
 2. Read-time `derived_staleness` walk (memoized, cycle-guarded, traversing all three edge tables) + `all_derived_stale`.
 3. Capture: `derived-from` command; `append` / `append-cohort` `--derived-from`; TOML `[references].derived_from` materialized on `schema apply`; `artifact_derivation_link` provenance.
-4. Read paths: `_artifact_derivation` view; `derived_stale` column on `_cohort_artifacts` and `_reference_usage`; `status` section; `export --include-derivation`; `dashboard`; `lineage` CLI; `validate` (dangling + acyclic).
-5. MCP `casetrack_lineage` tool.
+4. Read paths: `_artifact_derivation` view; `derived_stale` column on `_cohort_artifacts` and `_reference_usage`; `status` section; `export --include-derivation`; `dashboard`; `derivation` CLI; `validate` (dangling + acyclic).
+5. MCP `casetrack_derivation` tool.
 6. Nextflow: `CASETRACK_REGISTER` `--derived-from` passthrough; `casetrack_append_cohort` `derived_from` input.
 7. Migration `migrate-derivation`; `init` creates the table going forward.
 8. Tests (§10); docs (README, CLAUDE.md, casetrack skill, CHANGELOG); version bump.
@@ -213,6 +213,6 @@ A unified `nodes` + `edges` graph that absorbs `cohort_artifacts`, `reference_ar
   - **Orthogonality**: a node that is `derived_stale` but not `stale`/`ref_stale`, and every other independent combination, including a node fresh on all three.
   - `derived_stale = False` for a leaf cohort artifact with no derivation edges (not "untracked").
   - Cycle-guard: the read walk terminates and returns a sensible result even if a back-edge slips into the table.
-- Read paths: `lineage` CLI (table/tsv/json + `--node` + `--stale-only`); `status` section; `_artifact_derivation` view + `derived_stale` on `_cohort_artifacts` / `_reference_usage`; `export --include-derivation`; `validate` dangling + acyclic invariants; MCP tool.
+- Read paths: `derivation` CLI (table/tsv/json + `--node` + `--stale-only`); `status` section; `_artifact_derivation` view + `derived_stale` on `_cohort_artifacts` / `_reference_usage`; `export --include-derivation`; `validate` dangling + acyclic invariants; MCP tool.
 - Nextflow: `casetrack_append_cohort derived_from []` drops the flag; `CASETRACK_REGISTER --derived-from` passthrough.
 - Migration: `migrate-derivation` additive on a 0010-era DB; `--dry-run`.
