@@ -491,7 +491,7 @@ Upgrade-path commands (`migrate-qc`, `migrate-project-id`, `recover`) bypass the
 | `casetrack_query` | `project_id`, `sql` (SELECT / WITH only) | Rows as JSON |
 | `casetrack_cohort_artifacts` | `project_id`, `stale_only?` | Cohort artifacts + input-staleness (proposal 0009) |
 | `casetrack_references` | `project_id`, `stale_only?` | Reference artifacts + ref-staleness (proposal 0010) |
-| `casetrack_derivation` | `project_id`, `node?`, `stale_only?` | Derivation graph + derived-staleness (proposal 0011) |
+| `casetrack_derivation` | `project_id`, `stale_only?` | Derivation graph + derived-staleness (proposal 0011) |
 
 Install the optional dependency + wire it into Claude Desktop:
 

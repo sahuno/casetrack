@@ -39,7 +39,7 @@ See [proposal 0011](docs/proposals/0011-artifact-to-artifact-lineage.md).
 - **`derived_stale` — third orthogonal staleness flag**: a node is
   `derived_stale` when any upstream node it derives from is stale by *any*
   cause (input-stale, ref-stale, or derived-stale — recursively). Computed
-  at read time with memoization and a cycle guard; stored flag never written.
+  at read time via visited-set traversal with a cycle guard; stored flag never written.
   A node can be any combination of `stale` / `ref_stale` / `derived_stale`.
 - **`_artifact_derivation` DuckDB view** — exposed in `casetrack query` for
   SQL-level lineage exploration.

@@ -67,7 +67,7 @@ Each `[analyses.<tool>]` declares `uses = [...]`; `append` auto-snapshots the cu
 
 - `artifact_derivation` — `(down_node, up_node, note, recorded_at)` where each endpoint is a canonical node-ref string over the three node types.
 
-**`derived_stale` is a third orthogonal flag**: a node is derived-stale when any upstream node it derives from is stale by *any* cause (input-stale, ref-stale, or derived-stale — recursively). Computed at read-time with memoization and a cycle guard (`casetrack_qc/artifact_derivation.py`). Surfaced in `derived-from` + `derivation` + `migrate-derivation` commands, `status` (section), `query` (`_artifact_derivation` view + `derived_stale` on `_cohort_artifacts`), `export --include-derivation`, the dashboard, `validate` (dangling + acyclic invariants), and the `casetrack_derivation` MCP tool. Edges declared in TOML via `[references.<key>].derived_from` or at registration time via `--derived-from` on `append`/`append-cohort`. History in `provenance.jsonl` (`artifact_derivation_link`); the table holds only current edges. The `derivation` command name was chosen because `lineage` is taken by proposal 0006 (assay-merge subsystem). Code: `casetrack_qc/artifact_derivation.py` (+ `_cli.py`); Nextflow `casetrack_append_cohort`/`casetrack_append_project` gain an optional `derived_from` input.
+**`derived_stale` is a third orthogonal flag**: a node is derived-stale when any upstream node it derives from is stale by *any* cause (input-stale, ref-stale, or derived-stale — recursively). Computed at read-time via visited-set traversal with a cycle guard (`casetrack_qc/artifact_derivation.py`). Surfaced in `derived-from` + `derivation` + `migrate-derivation` commands, `status` (section), `query` (`_artifact_derivation` view + `derived_stale` on `_cohort_artifacts`), `export --include-derivation`, the dashboard, `validate` (dangling + acyclic invariants), and the `casetrack_derivation` MCP tool. Edges declared in TOML via `[references.<key>].derived_from` or at registration time via `--derived-from` on `append`/`append-cohort`. History in `provenance.jsonl` (`artifact_derivation_link`); the table holds only current edges. The `derivation` command name was chosen because `lineage` is taken by proposal 0006 (assay-merge subsystem). Code: `casetrack_qc/artifact_derivation.py` (+ `_cli.py`); Nextflow `casetrack_append_cohort`/`casetrack_append_project` gain an optional `derived_from` input.
 
 ## Commands
 
@@ -118,7 +118,7 @@ Still all valid. Three levels hardcoded, strict FK, WAL + busy_timeout Tier-1 co
 
 ## Test suite
 
-522 pytest tests across 27 files (~2 min full run). Run with `python3 -m pytest tests/ -q`.
+940 pytest tests (~10 min full run on a loaded node). Run with `python3 -m pytest tests/ -q`.
 
 Tests cover: every subcommand, smart-merge correctness, 5000-sample perf regression, concurrent appends via multiprocessing, git provenance capture, Nextflow module shell contract, Claude Code hook, DuckDB query paths, **every v0.4 QC path (schema, events CRUD, censor/uncensor/qc-history CLI, autoflag, strict-refuse, rerun/status/export filters, validate invariants, ethics override, recover round-trip, migrate-qc, cohort + pair-by)**.
 
@@ -140,6 +140,10 @@ casetrack/
 │   ├── cohort.py             # cmd_cohort + pair-by N-partition (readiness view)
 │   ├── cohort_artifacts.py   # 0009: sibling-table DDL/CRUD + read-time staleness
 │   ├── cohort_artifacts_cli.py # 0009: append-cohort / migrate-cohort / cohort-artifacts
+│   ├── reference_artifacts.py # 0010: reference DDL/CRUD + ref-staleness
+│   ├── reference_artifacts_cli.py # 0010: references / migrate-references
+│   ├── artifact_derivation.py # 0011: derived-from edges + transitive derived-staleness
+│   ├── artifact_derivation_cli.py # 0011: derived-from / derivation / migrate-derivation
 │   ├── migrate.py            # cmd_migrate_qc
 │   ├── recover.py            # replay helpers for QC actions
 │   └── cli.py                # argparse wiring helpers
@@ -153,7 +157,7 @@ casetrack/
 │   ├── MIGRATION_v0.2_to_v0.3.md
 │   ├── MIGRATION_v0.3_to_v0.4.md   # ← new
 │   └── proposals/
-│       └── 0001 … 0009  (0009 = cohort-level artifacts)
+│       └── 0001 … 0011  (0009 = cohort artifacts, 0010 = reference artifacts, 0011 = artifact-to-artifact lineage)
 ├── examples/
 │   ├── run_modkit.sh
 │   ├── scripts/
@@ -162,7 +166,7 @@ casetrack/
 │   └── giab_chr21/           # run_cohort_demo.sh (mock + bcftools engines)
 ├── scripts/
 │   └── generate_demo_dashboard.py
-├── tests/                    # 865 tests (incl. cohort-artifacts: schema/CRUD/staleness/CLI/read-paths/nf)
+├── tests/                    # 940 tests (incl. cohort/reference/derivation artifacts: schema/CRUD/staleness/CLI/read-paths/nf)
 └── sandbox/
 ```
 
