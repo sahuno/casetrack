@@ -27,6 +27,12 @@ samples (joint-genotyped VCFs, panels-of-normals, cohort matrices). See
   (proposal 0002 §4.4) with no stored flag. `--stale-only`, `--fmt table|tsv|json`.
 - **`casetrack migrate-cohort`** — additive migration to create the two tables on
   a pre-0009 project (`--dry-run` supported).
+- **`casetrack_append_cohort` Nextflow process** (`examples/nextflow/casetrack.nf`)
+  — the fan-in companion to `casetrack_append_project`; registers a cohort
+  artifact + its assay lineage (passed as a `collectFile` inputs manifest).
+- **`examples/giab_chr21/run_cohort_demo.sh`** — runnable cohort demo with two
+  cheap engines (`--engine mock` zero-compute; `--engine bcftools` real
+  multi-sample merge), ending on the censor → STALE cascade punchline.
 
 ## [0.5.0] — 2026-04-18
 

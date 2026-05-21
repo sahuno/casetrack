@@ -127,6 +127,45 @@ casetrack query --project-dir /path/to/project "
 You should see four rows with mapped_pct > 90% (real chr21 BAMs), non-zero
 mean_meth if modkit ran successfully, and a few hundred SVs if sniffles ran.
 
+## Cohort-level artifacts demo (`run_cohort_demo.sh`)
+
+The per-assay demos above attach one result per assay. A *cohort* artifact is the
+opposite shape: **one** output derived from **many** assays — a joint-genotyped
+multi-sample VCF, a panel-of-normals, a cohort matrix (proposal 0009).
+
+```bash
+# Zero-compute, runs anywhere in ~15 s:
+bash run_cohort_demo.sh --engine mock /tmp/giab_cohort
+
+# Real tool — bcftools merge of tiny per-sample chr21 VCFs into a real
+# multi-sample VCF (needs bcftools + bgzip + tabix on PATH, or an htslib SIF):
+bash run_cohort_demo.sh --engine bcftools /tmp/giab_cohort
+```
+
+Both engines end on the same punchline that a flat sample sheet can't express:
+
+```
+=== 4. cohort-artifacts — fresh (all inputs pass) ===
+[fresh] joint_genotype/20260520_hg38_chr21_joint  id=1  inputs=4
+
+=== 5. Censor ONE contributing assay (simulate a QC failure) ===
+=== 6. cohort-artifacts — now STALE (an input is censored) ===
+[STALE] joint_genotype/..._joint  id=1  inputs=4  censored=1 (HG002_PAW70337)
+```
+
+The joint VCF on disk never changed — casetrack flags it **STALE** because the
+QC state of one of its recorded inputs changed. Re-genotype with a new
+`--run-tag` to supersede it; the old artifact stays in the audit trail. The
+three commands the demo leans on:
+
+```bash
+casetrack append-cohort   --project-dir P --analysis joint_genotype \
+    --run-tag 20260520_hg38_chr21_joint --path cohort.vcf.gz \
+    --inputs-from inputs.txt --stats stats.json
+casetrack cohort-artifacts --project-dir P            # list + staleness
+casetrack cohort-artifacts --project-dir P --stale-only
+```
+
 ## Troubleshooting
 
 | Symptom | Fix |

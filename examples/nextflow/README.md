@@ -144,6 +144,39 @@ nextflow run example_pipeline.nf -profile test \
     --casetrack_manifest $PWD/manifest.tsv
 ```
 
+## Cohort-level artifacts (`casetrack_append_cohort`, proposal 0009)
+
+The processes above are per-sample (fan-out). A cohort artifact — a joint VCF, a
+panel-of-normals, a cohort matrix — is the fan-**in** shape: many per-assay
+channels collect into one process whose single output is registered with
+`casetrack append-cohort`. The lineage (which assays fed the artifact) is passed
+as a one-assay-id-per-line file, which Nextflow builds cheaply with
+`collectFile`:
+
+```groovy
+include { casetrack_append_cohort } from './casetrack.nf'
+
+workflow {
+    gvcfs = call_gvcf(assays_ch)              // per-assay: tuple(assay_id, gvcf)
+
+    // gather: the inputs manifest + all gVCFs into one joint process
+    inputs_tsv = gvcfs.map { it[0] }
+                      .collectFile(name: 'inputs.txt', newLine: true)
+    joint = joint_genotype(gvcfs.map { it[1] }.collect())   // → tuple(vcf, stats_json)
+
+    casetrack_append_cohort(
+        joint.map { vcf, stats ->
+            tuple('joint_genotype', params.run_tag, vcf, inputs_tsv, stats)
+        }
+    )
+}
+```
+
+`(analysis, run_tag)` is the unique key — a re-genotyping run uses a new
+`run_tag` and coexists with the prior artifact. See
+`../giab_chr21/run_cohort_demo.sh` for a runnable, no-cluster version of this
+flow (mock or real `bcftools merge`).
+
 ## Integration with Claude Code (item 9 in synopsis)
 
 At the end of a pipeline you can chain `casetrack_append.out` into a
