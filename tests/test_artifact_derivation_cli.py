@@ -9,7 +9,6 @@ Author: Samuel Ahuno (ekwame001@gmail.com)
 import argparse
 import subprocess
 import sys
-import pytest
 
 import casetrack
 from casetrack_qc import cohort_artifacts as ca
@@ -99,7 +98,10 @@ def test_derived_from_records_edge(tmp_path):
     )
     assert r.returncode == 0, r.stderr
     conn = casetrack.open_project_db(p / "casetrack.db")
-    assert len(ad.list_edges(conn)) == 1
+    try:
+        assert len(ad.list_edges(conn)) == 1
+    finally:
+        conn.close()
 
 
 def test_derived_from_refuses_cycle(tmp_path):

@@ -135,6 +135,17 @@ def upstream_nodes(conn: sqlite3.Connection, node: str) -> list[str]:
     ).fetchall()]
 
 
+def downstream_nodes(conn: sqlite3.Connection, node: str) -> list[str]:
+    """Direct artifact_derivation downstreams of *node* (one hop, 0011 edges only).
+
+    The mirror of :func:`upstream_nodes`; uses the ``idx_deriv_up`` index rather
+    than a full-table scan + Python filter.
+    """
+    return [d for (d,) in conn.execute(
+        "SELECT down_node FROM artifact_derivation WHERE up_node = ?", (node,)
+    ).fetchall()]
+
+
 def _reaches(conn: sqlite3.Connection, start: str, target: str) -> bool:
     """True if *target* is reachable walking upstream from *start*.
 
@@ -356,6 +367,6 @@ __all__ = [
     "artifact_derivation_ddl", "artifact_derivation_indexes",
     "derivation_schema_exists", "ensure_derivation_schema",
     "LineageNode",
-    "list_edges", "upstream_nodes", "record_edge",
+    "list_edges", "upstream_nodes", "downstream_nodes", "record_edge",
     "derived_staleness", "all_derived_stale",
 ]

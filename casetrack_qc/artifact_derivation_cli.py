@@ -136,9 +136,8 @@ def cmd_derivation(args) -> None:
                 for u in ad.upstream_nodes(conn, node)
             ]
             rows += [
-                {"node": node, "direction": "downstream", "other": e["down_node"]}
-                for e in ad.list_edges(conn)
-                if e["up_node"] == node
+                {"node": node, "direction": "downstream", "other": d}
+                for d in ad.downstream_nodes(conn, node)
             ]
             staleness = ad.derived_staleness(conn, node)
             payload = {"node": node, "edges": rows, **staleness}
