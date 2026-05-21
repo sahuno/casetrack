@@ -250,6 +250,15 @@ def test_status_shows_derivation_section(tmp_path):
     assert "cohort:annot@v1" in r.stdout
 
 
+def test_status_derivation_section_all_fresh(tmp_path):
+    """Edges present but nothing censored: section still shows, 0 derived-stale."""
+    p = _proj(tmp_path)  # has the annot<-joint edge, no censoring
+    r = _run(["status", "--project-dir", str(p)])
+    assert r.returncode == 0, r.stderr
+    assert "Derivation" in r.stdout
+    assert "0 derived-stale" in r.stdout
+
+
 def test_cohort_view_ref_stale_survives_without_derivation_table(tmp_path):
     """Regression: _cohort_artifacts.ref_stale is preserved on 0010-era DBs
     that lack artifact_derivation (not yet migrated to 0011).
