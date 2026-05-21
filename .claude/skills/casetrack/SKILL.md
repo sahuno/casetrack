@@ -1,6 +1,6 @@
 ---
 name: casetrack
-description: Use this skill whenever the user works with **casetrack** — the manifest-centric bioinformatics case management CLI that tracks which analyses have run across multi-patient, multi-specimen, multi-assay cohorts (cancer genomics, ONT/Illumina WGS, RNA-seq). Trigger it for anything involving casetrack projects, including: initializing a project, registering patients/specimens/assays, running `casetrack init | add-metadata | append | schema apply | query | status | censor | uncensor`, recording analysis results in the cohort database, generating Nextflow or Snakemake samplesheets from the DB, tracking which samples still need basecalling/sort/variant calling/methylation, managing QC events and consent flags, integrating `CASETRACK_REGISTER` into a Nextflow pipeline, querying a `casetrack.db` via SQL, or registering **cohort-level artifacts** that span many assays (joint-genotyped VCFs, panels-of-normals, cohort matrices) with `append-cohort` / `cohort-artifacts` / `migrate-cohort` and checking their staleness. Trigger even when the user says "cohort database", "sample tracker", "case manifest", "sample manifest", "joint VCF tracking", "panel of normals tracking", "is my cohort matrix stale", or describes a tumor-normal cohort with per-sample analysis progress — those are all casetrack territory. Do not trigger for generic Snakemake/Nextflow questions, unless they involve casetrack integration.
+description: Use this skill whenever the user works with **casetrack** — the manifest-centric bioinformatics case management CLI that tracks which analyses have run across multi-patient, multi-specimen, multi-assay cohorts (cancer genomics, ONT/Illumina WGS, RNA-seq). Trigger it for anything involving casetrack projects, including: initializing a project, registering patients/specimens/assays, running `casetrack init | add-metadata | append | schema apply | query | status | censor | uncensor`, recording analysis results in the cohort database, generating Nextflow or Snakemake samplesheets from the DB, tracking which samples still need basecalling/sort/variant calling/methylation, managing QC events and consent flags, integrating `CASETRACK_REGISTER` into a Nextflow pipeline, querying a `casetrack.db` via SQL, or registering **cohort-level artifacts** that span many assays (joint-genotyped VCFs, panels-of-normals, cohort matrices) with `append-cohort` / `cohort-artifacts` / `migrate-cohort` and checking their staleness. Trigger also when the user asks about **reference artifacts** (proposal 0010): declaring versioned genome/annotation/dbSNP/interval references in TOML, bumping a reference version, checking whether an output is stale after a reference update, running `casetrack references` / `migrate-references`, or asking "is my VCF stale after the genome update", "reference version changed", "genome bumped to hg38_v1", "GTF or dbSNP version tracking". Trigger even when the user says "cohort database", "sample tracker", "case manifest", "sample manifest", "joint VCF tracking", "panel of normals tracking", "is my cohort matrix stale", "reference artifact", or describes a tumor-normal cohort with per-sample analysis progress — those are all casetrack territory. Do not trigger for generic Snakemake/Nextflow questions, unless they involve casetrack integration.
 ---
 
 # casetrack skill
@@ -25,6 +25,8 @@ Ask yourself: am I registering an entity (adding a new patient/specimen/assay ro
 | Register a cohort-level output (joint VCF, PoN, matrix) | `casetrack append-cohort` | `--analysis ... --run-tag ... --path ... --inputs a,b,c` |
 | List cohort artifacts + staleness | `casetrack cohort-artifacts` | `--project-dir . [--stale-only]` |
 | Add cohort-artifact tables to a pre-0009 project | `casetrack migrate-cohort` | `--project-dir . [--dry-run]` |
+| List reference artifacts + staleness (v0.8 / proposal 0010) | `casetrack references` | `--project-dir . [--stale-only] [--fmt table\|tsv\|json]` |
+| Add reference-artifact tables to a pre-0010 project (v0.8 / proposal 0010) | `casetrack migrate-references` | `--project-dir . [--dry-run]` |
 | See overall progress | `casetrack status` | `--project-dir .` |
 | Run arbitrary SQL | `casetrack query` | `--project-dir . --sql "..."` |
 | Inspect current DB schema | `casetrack schema show` | `--project-dir .` |
@@ -297,6 +299,9 @@ Run tag convention: `{YYYYMMDD}_{genome}_{description}` (e.g. `20260421_hg38_nor
 | Tried to track a joint VCF / PoN / cohort matrix at a level | No single owning patient/specimen/assay | Use `append-cohort` (§15), not `append` |
 | `append-cohort` on a pre-0009 project | "no such table: cohort_artifacts" | Run `casetrack migrate-cohort` once first |
 | Reused `run_tag` for a re-genotyping run | New artifact overwrites/clashes with the old | Give each run a distinct `--run-tag`; both coexist in the audit trail |
+| Output shows `STALE` after bumping a reference version | Expected — reference version changed | Re-run the analysis with a new `run_tag` once references are stable |
+| Bumped reference content but not the `version` string | Staleness not detected | Staleness keys on version string only; bump `version` in TOML to trigger detection |
+| `casetrack references` on a pre-0010 project | "no such table: reference_artifacts" | Run `casetrack migrate-references` once first |
 
 ## 14. Key command cheatsheet
 
@@ -324,6 +329,38 @@ casetrack migrate-cohort   --project-dir .                       # once, on pre-
 casetrack append-cohort    --project-dir . --analysis joint_genotype \
   --run-tag 20260521_hg38_jointgt --path cohort.vcf.gz --inputs assayA,assayB,assayC
 casetrack cohort-artifacts --project-dir . [--stale-only]
+
+# Reference artifacts (proposal 0010)
+# 1. Declare in casetrack.toml:
+#   [references]
+#   genome   = { path = "/data/hg38_v1/genome.fa",   version = "hg38_v1" }
+#   dbsnp    = { path = "/data/hg38_v1/dbsnp155.vcf", version = "155" }
+#   [analyses.variant_call]
+#   uses = ["genome", "dbsnp"]
+#
+# 2. Apply schema (materialises reference_artifacts table from TOML):
+casetrack schema apply --project-dir .
+#
+# 3. Append records the references used automatically from TOML:
+casetrack append --project-dir . --analysis variant_call --results summary.tsv --overwrite
+# Override which refs were used at call time:
+casetrack append --project-dir . --analysis variant_call --results summary.tsv --overwrite \
+  --uses-references genome,dbsnp
+# Opt out of reference tracking entirely:
+casetrack append --project-dir . --analysis variant_call --results summary.tsv --overwrite \
+  --no-track-references
+# Cohort artifact with reference tracking:
+casetrack append-cohort --project-dir . --analysis joint_genotype \
+  --run-tag 20260521_hg38_jointgt --path cohort.vcf.gz --inputs assayA,assayB \
+  --uses-references genome
+#
+# 4. Check for reference staleness:
+casetrack references --project-dir .              # list all, with fresh/STALE/untracked flag
+casetrack references --project-dir . --stale-only # only outputs with a changed reference
+casetrack references --project-dir . --fmt json   # table (default) | tsv | json
+#
+# 5. Migrate a pre-0010 project:
+casetrack migrate-references --project-dir . [--dry-run]
 
 # Queries
 casetrack status --project-dir .
@@ -386,7 +423,108 @@ The cohort equivalent of `CASETRACK_REGISTER` is the `casetrack_append_cohort` p
 
 See `references/cohort-artifacts.md` for the full table schema, the staleness cascade in detail, and the Nextflow wiring.
 
-## 16. When to read the references
+## 16. Reference artifacts (proposal 0010)
+
+Some analyses depend on **external versioned inputs**: a genome FASTA, a GTF annotation, a dbSNP VCF, a repeat-masker BED, an interval list. These aren't outputs of the pipeline — they're inputs. When the reference version changes (hg38_v0 → hg38_v1, dbsnp154 → dbsnp155), any existing output that used the old version is no longer reproducible against the new reference. casetrack 0010 tracks this with **two additive sibling tables** (`reference_artifacts` + `reference_usage`) so that bumping a version in TOML + running `schema apply` immediately marks downstream outputs as stale.
+
+### How it works — TOML contract
+
+References are declared in a `[references]` block; each analysis declares which refs it uses:
+
+```toml
+[references]
+genome   = { path = "/data/hg38_v1/genome.fa",    version = "hg38_v1" }
+dbsnp    = { path = "/data/hg38_v1/dbsnp155.vcf", version = "155" }
+intervals = { path = "/data/hg38_v1/wgs.intervals.bed", version = "hg38_v1_wgs" }
+
+[analyses.variant_call]
+level          = "specimen"
+column_prefix  = "vc"
+summary_tsv    = "variant_call_summary.tsv"
+uses           = ["genome", "dbsnp"]
+```
+
+`casetrack schema apply` **materialises** the `[references]` block into the `reference_artifacts` table (one row per `ref_key`). Staleness is keyed on the `version` string: if the `version` in TOML no longer matches the `version_used` recorded in `reference_usage`, the output is `STALE`.
+
+### The two sibling tables
+
+- `reference_artifacts` — one row per declared reference key (`ref_key`); carries `path`, `version`, `updated_at`. This is the **canonical current set**, materialized from TOML on every `schema apply`. It never accumulates history — `schema apply` is idempotent (upsert by `ref_key`).
+- `reference_usage` — the many-to-many edge: which analysis output used which reference at which `version_used`. `scope` is `'analysis'` (per assay/specimen/patient row) or `'cohort'` (cohort artifact). One row per `(output_id, ref_key, scope)` — written by `append` / `append-cohort`.
+
+### Three-state staleness (read-time, not stored)
+
+Every output tracked in `reference_usage` carries one of three states, derived live:
+
+| State | Meaning |
+|---|---|
+| `fresh` | All referenced `version_used` strings match the current `reference_artifacts.version` |
+| `STALE` | At least one `version_used` no longer matches — includes the reason, e.g. `genome: hg38_v0 -> hg38_v1` |
+| `untracked` | The output was registered without reference tracking (pre-0010 project, or `--no-track-references`) |
+
+The staleness reason names the specific reference(s) that changed (`genome: hg38_v0 -> hg38_v1`) or were removed entirely (`reference removed: dbsnp`). There is no stored flag — staleness is recomputed on every read, so reverting a version bump in TOML + `schema apply` restores outputs to `fresh` automatically.
+
+### Bump → STALE → revert flow
+
+```
+1. Bump version in TOML:  genome.version = "hg38_v0"  →  "hg38_v1"
+2. casetrack schema apply  →  reference_artifacts.version updated to "hg38_v1"
+3. casetrack references --stale-only  →  outputs that used hg38_v0 appear as STALE
+4. Re-run the analysis with the new reference  →  append records version_used = "hg38_v1"
+5. casetrack references  →  those outputs now show fresh
+```
+
+### Orthogonality with 0009
+
+A cohort artifact (0009) can have **two independent staleness flags**:
+
+- `input_stale` (0009) — a contributing assay was censored or consent-revoked.
+- `ref_stale` (0010) — a reference version changed since the artifact was built.
+
+Both are derived live; both appear in `casetrack cohort-artifacts` output and the `_cohort_artifacts` DuckDB view. An artifact can be `input_stale`, `ref_stale`, both, or neither — they don't interact.
+
+### Capture paths
+
+| Scenario | How references are captured |
+|---|---|
+| Normal `append` (analysis has `uses` in TOML) | Auto-captured from TOML — no extra flags needed |
+| Override which refs to record at call time | `--uses-references genome,dbsnp` |
+| Opt out entirely | `--no-track-references` (records `untracked`) |
+| Cohort artifact via `append-cohort` | Same auto-capture from `[analyses.<name>].uses`; override with `--uses-references genome` |
+
+### Read-path surfacing
+
+Staleness is visible in every read path:
+
+| Surface | How |
+|---|---|
+| `casetrack references [--stale-only] [--fmt table\|tsv\|json]` | Primary command — lists all outputs with their ref state + staleness reason |
+| `casetrack status` | Reference-artifacts section (count fresh/STALE/untracked) |
+| `casetrack query` | `_reference_usage` DuckDB view with derived state; `_cohort_artifacts` gains `ref_stale` column |
+| `casetrack export --include-references` | Adds reference usage rows to TSV/JSON export |
+| HTML dashboard | Dedicated reference-artifacts section |
+| MCP (Claude Code) | `mcp__casetrack__casetrack_references(project_id="<slug>", stale_only=False)` |
+| `casetrack validate` | Reports orphan `reference_usage` rows (ref_key in usage but absent from `reference_artifacts`) |
+
+### Migration
+
+Projects created before 0010 need a one-time migration:
+
+```bash
+casetrack migrate-references --project-dir .            # create the two tables + indexes
+casetrack migrate-references --project-dir . --dry-run  # print the plan, change nothing
+```
+
+Projects created by a current `casetrack init` already have the tables (no migrate needed).
+
+### Documented limitations
+
+- **Staleness keys on the version string only.** If the reference file changes on disk but the `version` string in TOML is not bumped, staleness is not detected. A future `casetrack doctor --references` command will compare checksums, but checksumming is not in 0010.
+- **Content drift without a version bump fires nothing** — documented in proposal 0010 §6.2.
+- **Orphan rows** accumulate if a `ref_key` is removed from TOML entirely (the `reference_artifacts` row is deleted by the next `schema apply`, but `reference_usage` rows pointing to that key become orphans). `validate` reports them; `doctor` will prune them in a future release.
+
+See `references/reference-artifacts.md` for the full table schema, the staleness algorithm in detail, and worked examples. Proposal: `docs/proposals/0010-reference-artifacts.md` (§6.2 staleness, §7 rejected alternatives).
+
+## 17. When to read the references
 
 Default to handling requests directly from this SKILL.md. Read reference files when:
 
@@ -394,4 +532,5 @@ Default to handling requests directly from this SKILL.md. Read reference files w
 - User wants to integrate casetrack into a Nextflow pipeline → `references/nextflow-integration.md`
 - User needs a specific SQL query (cohort progress matrix, samplesheet generation, QC timeline) → `references/common-queries.md`
 - User is registering or troubleshooting **cohort-level artifacts** (joint VCFs, PoNs, matrices, staleness) → `references/cohort-artifacts.md`
+- User is declaring/bumping/checking **reference artifacts** (genome, GTF, dbSNP, intervals) → `references/reference-artifacts.md`
 - User hits an error not in §13 — full deep-dive patterns file → `references/patterns.md`

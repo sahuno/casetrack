@@ -4,6 +4,62 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-05-21
+
+Reference artifacts — versioned, per-file external inputs (genome, annotation,
+known-variant sets, repeats, intervals) with read-time downstream staleness:
+bump a reference's version and every output that consumed the old version reads
+`STALE`. The mirror image of cohort-artifact staleness (0009 cascades *up* from
+censored samples; 0010 cascades *down* from changed references). See
+[proposal 0010](docs/proposals/0010-reference-artifacts.md).
+
+### Added
+
+- **`reference_artifacts` + `reference_usage` tables** — two additive sibling
+  tables (the `qc_events` / 0009 pattern), created by `casetrack init`; the
+  three-level core and the 0009 tables are untouched. `reference_artifacts` is
+  the canonical "current" set, materialized from a new TOML `[references]`
+  block on `schema apply`; `reference_usage` is the edge recording which output
+  (sample-level analysis result or cohort artifact) consumed which reference at
+  which version. The 4th-hierarchy-level and full-version-history alternatives
+  were rejected (proposal 0010 §7).
+- **TOML `[references]` block + `[analyses.<tool>].uses`** — declare each
+  reference once (`path` / `version` / optional `kind` / optional `checksum`);
+  each analysis declares the `ref_key`s it consumes. `append` auto-snapshots the
+  current version of each at production time.
+- **Read-time three-state staleness** — `fresh` / `STALE` / `untracked`, derived
+  live with a named reason (`genome: hg38_v0 -> hg38_v1`, or `reference removed:
+  dbsnp`). No stored flag — flip a version in TOML + `schema apply` and outputs
+  read `STALE`; revert and they read `fresh` again. Orthogonal to 0009's
+  input-staleness: a cohort artifact can be input-stale, ref-stale, both, or
+  neither (the `_cohort_artifacts` view gains a distinct `ref_stale` column).
+- **`casetrack migrate-references`** — additive, idempotent retrofit of the two
+  tables onto a pre-0010 project (mirrors `migrate-cohort`).
+- **`casetrack references [--fmt table|tsv|json] [--stale-only]`** — list the
+  canonical reference set; `--stale-only` drills into which outputs are stale
+  against which references (`used -> current`).
+- **`append` / `append-cohort` capture** — `append` auto-records usage from
+  `[analyses.<tool>].uses`; `--uses-references genome,dbsnp` overrides for ad-hoc
+  runs and `--no-track-references` opts out. `append-cohort --uses-references`
+  records cohort-scope usage (cohort analyses aren't always in `[analyses]`).
+- **Read-path surfacing** — a "References" section in `status` and the HTML
+  `dashboard`; a `_reference_usage` DuckDB view (with derived `current_version` /
+  `is_stale`) in `query`; `export --include-references` (auto-enabled for XLSX);
+  a `validate` invariant flagging orphan usage rows; and the `casetrack_references`
+  MCP tool.
+- **Nextflow** — `casetrack_append_cohort` and the `COHORT_ARTIFACT_TRACKED`
+  subworkflow gain an optional `uses_references` input (the `[]`-means-none
+  pattern, mirroring the `stats` slot).
+
+### Notes
+
+- `schema apply` writes a `reference_version_change` provenance entry on every
+  version/path move — the audit of reference evolution lives in
+  `provenance.jsonl`, not the DB (`reference_artifacts` holds only current).
+- Staleness keys on the `version` string only; bumping a file's content without
+  bumping its `version` fires no staleness (a future `doctor --references` will
+  compare the stored `checksum`).
+
 ## [0.7.0] — 2026-05-21
 
 Cohort-level artifacts — a first-class home for analysis outputs that span many

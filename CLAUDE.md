@@ -6,14 +6,15 @@ Manifest-centric case management CLI for bioinformatics pipelines on HPC (SLURM)
 
 - **Repo**: https://github.com/sahuno/casetrack (private)
 - **Author**: Samuel Ahuno (ekwame001@gmail.com / sahuno@mskcc.org)
-- **Current release**: v0.4.2 — full project-tree scaffold on `casetrack init` (proposal 0003)
-- **Next release**: v0.5.x (assay-level `batch_id`) → v1.0 (flat-mode removal)
+- **Current release**: v0.8.0 — reference artifacts + downstream ref-staleness (proposal 0010)
+- **Next release**: 0011 (artifact-to-artifact lineage) → v1.0 (flat-mode removal)
 - **HPC target**: IRIS @ MSKCC (SLURM, WekaFS shared storage, Apptainer containers)
 
 ## Key context files (read these to resume work)
 
 | File | What it tells you |
 |---|---|
+| `docs/proposals/0010-reference-artifacts.md` | **The shipped reference-artifacts design.** Versioned upstream inputs (genome, GTF, dbSNP) with read-time downstream staleness via two additive sibling tables. §6.2 = three-state staleness + orthogonality to 0009; §7 = why no 4th level / no version-history table. |
 | `docs/proposals/0009-cohort-level-artifacts.md` | **The shipped cohort-artifacts design.** One output from many assays (joint VCFs, PoNs, cohort matrices) via two additive sibling tables. §7 records *why a 4th hierarchy level was rejected* (Option A vs B). §9 = nothing open; fully implemented. |
 | `docs/proposals/0003-init-scaffold.md` | **The shipped v0.4.2 design.** `casetrack init` now scaffolds 16 leaf directories + expanded .gitignore. `--bare` opts out. |
 | `docs/proposals/0002-qc-events-and-censoring.md` | **The shipped v0.4 design.** QC events, cascade semantics, consent rules, cohort `--pair-by`. §0 has the 13 locked-in decisions. |
@@ -54,6 +55,13 @@ v0.4 lives in `casetrack_qc/` (a new subpackage alongside `casetrack.py`). The m
 
 **Staleness is read-time, not stored**: an artifact is `STALE` when any contributing assay is currently censored / consent-revoked, derived live from the §4.4 cascade (`cohort_artifacts.artifact_staleness`). Surfaced everywhere — the `cohort-artifacts` command, `status` (section), `query` (`_cohort_artifacts` DuckDB view), `export --include-cohort-artifacts`, the HTML dashboard, and the `casetrack_cohort_artifacts` MCP tool. The 4th-hierarchy-level alternative was **rejected** (cohort artifacts are derived / many-to-many / dynamically-membered; a level is biological / single-parent / static — see proposal 0009 §7). Code lives in `casetrack_qc/cohort_artifacts.py` (+ `_cli.py`); Nextflow side is `casetrack_append_cohort` + the `COHORT_ARTIFACT_TRACKED` subworkflow.
 
+**Reference artifacts (proposal 0010)**: the mirror image of cohort artifacts — **upstream** versioned external inputs (genome, annotation, known-variant sets, repeats, intervals) whose version changes cascade *down* to invalidate the outputs that consumed them (0009 cascades *up* from censored samples). Two more **additive sibling tables**:
+
+- `reference_artifacts` — the canonical "current" set, keyed by `ref_key`, materialized from a new TOML `[references]` block on `schema apply`.
+- `reference_usage` — the edge: which output (sample-level analysis result, `scope='analysis'`; or cohort artifact, `scope='cohort'`) consumed which `ref_key` at which `version_used`.
+
+Each `[analyses.<tool>]` declares `uses = [...]`; `append` auto-snapshots the current version of each. **Ref-staleness is read-time, three-state** (`fresh`/`STALE`/`untracked`) with a named reason, derived live in `casetrack_qc/reference_artifacts.py` (`output_staleness` / `all_stale_outputs`) — **orthogonal** to 0009's input-staleness (a cohort artifact carries both a `stale` and a distinct `ref_stale` flag). Surfaced in `references` + `migrate-references` commands, `status` (section), `query` (`_reference_usage` view + `_cohort_artifacts.ref_stale`), `export --include-references`, the dashboard, `validate` (orphan-usage), and the `casetrack_references` MCP tool. Version history lives in `provenance.jsonl` (`reference_version_change`), not the DB. The 4th-level and full-version-history alternatives were **rejected** (proposal 0010 §7). Code: `casetrack_qc/reference_artifacts.py` (+ `_cli.py`); Nextflow `casetrack_append_cohort` gains an optional `uses_references` input.
+
 ## Commands
 
 | Group | Subcommands |
@@ -62,6 +70,7 @@ v0.4 lives in `casetrack_qc/` (a new subpackage alongside `casetrack.py`). The m
 | v0.4 QC | `censor`, `uncensor`, `qc-history`, `migrate-qc`, `cohort` (readiness view) |
 | later | `migrate-lineage`, `add-batch`, `link-sources`, `project`, `migrate-status` |
 | cohort artifacts (0009) | `append-cohort`, `cohort-artifacts`, `migrate-cohort` |
+| reference artifacts (0010) | `references`, `migrate-references` (+ `append`/`append-cohort` `--uses-references`) |
 
 Note: `cohort` (v0.4) is the paired-design *readiness* view; `cohort-artifacts` (0009) lists cohort-level *output artifacts* with staleness — different things.
 
@@ -165,3 +174,5 @@ casetrack/
 > Read `docs/proposals/0002-qc-events-and-censoring.md` (§0 has the locked decisions) and `docs/MIGRATION_v0.3_to_v0.4.md`. The v0.4 QC code lives in `casetrack_qc/`. Integration points in `casetrack.py`: `cmd_init_project`, `cmd_append_project`, `cmd_rerun_project`, `cmd_status_project`, `cmd_export_project`, `cmd_validate_project`, `cmd_recover_project`, `cmd_dashboard_project`, plus the argparse dispatch in `main()`.
 >
 > For cohort-level artifacts: read `docs/proposals/0009-cohort-level-artifacts.md` (§7 = why no 4th level; §9 = nothing open). Code is `casetrack_qc/cohort_artifacts.py` (+ `_cli.py`); `casetrack_mcp/` has the agent-facing tool. casetrack.py read-path hooks: `cmd_dashboard_project` (section), `_prepare_v03_query_connection` (`_cohort_artifacts` view), `cmd_status_project` + `cmd_export_project`. The Nextflow process/subworkflow live in `examples/nextflow/`.
+>
+> For reference artifacts: read `docs/proposals/0010-reference-artifacts.md` (§6.2 = three-state staleness + orthogonality to 0009; §7 = rejected alternatives). Code is `casetrack_qc/reference_artifacts.py` (+ `_cli.py`); the `_reference_usage` view + `_cohort_artifacts.ref_stale` live in `casetrack_qc/reader.py`. casetrack.py hooks: init schema in `cmd_init_project`, sync in `_schema_apply`, capture in `cmd_append_project` (`capture_reference_usage`), `_emit_references_section` (status), export `--include-references`, dashboard `_references_html`, validate orphan check. MCP tool `casetrack_references` in `casetrack_mcp/`. The version contract is TOML `[references]` → `reference_artifacts`; bump a `version` + `schema apply` to flip outputs stale.
