@@ -4,7 +4,7 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] — 2026-05-21
 
 Cohort-level artifacts — a first-class home for analysis outputs that span many
 samples (joint-genotyped VCFs, panels-of-normals, cohort matrices). See
@@ -52,6 +52,60 @@ samples (joint-genotyped VCFs, panels-of-normals, cohort matrices). See
 - **`examples/giab_chr21/run_cohort_demo.sh`** — runnable cohort demo with two
   cheap engines (`--engine mock` zero-compute; `--engine bcftools` real
   multi-sample merge), ending on the censor → STALE cascade punchline.
+
+## [0.6.1] — 2026-04-20
+
+Completes proposal
+[0006](docs/proposals/0006-assay-lineage-and-batch-tracking.md) (steps 4–6):
+the lineage tables added in 0.6.0 now flow through the read paths.
+
+### Added
+
+- **Lineage-aware reads.** `casetrack rerun` resolves a derived assay's pending
+  work back through its `assay_sources` so contributing source assays are visible
+  to the scan; `casetrack status` surfaces per-entity lineage; `casetrack export
+  --include-lineage` writes the `assay_sources` + `batches` tables (auto-enabled
+  for XLSX as additional sheets).
+
+## [0.6.0] — 2026-04-20
+
+Project identity, hierarchy-ID enforcement, an MCP server, assay lineage, and
+project lifecycle status. Implements proposals
+[0005](docs/proposals/0005-id-format-and-project-identity.md),
+[0006](docs/proposals/0006-assay-lineage-and-batch-tracking.md), and
+[0007](docs/proposals/0007-project-lifecycle-status.md).
+
+### Added
+
+- **Project identity (proposal 0005 Part B).** Every project gets a stable
+  `project_id` (DNS-slug form, e.g. `project-17424`), persisted in a `project_meta`
+  row and recorded in a user-level registry at `~/.casetrack/registry.json`.
+  `casetrack projects` gains `scan` / `list` / `register` / `deregister`
+  subactions. `casetrack migrate-project-id` brings legacy v0.5 projects into the
+  scheme; a hard-error gate refuses end-user commands on un-migrated projects
+  (env-var bypass during the alpha rollout).
+- **Hierarchy ID format enforcement (proposal 0005 Part A).** patient / specimen /
+  assay IDs are validated against a declared pattern at registration; `[project]
+  allow_unicode_ids` and `allow_case_variants` opt out. `casetrack doctor
+  --id-format` scans an existing project for non-conforming IDs.
+- **MCP server `casetrack_mcp/` (proposal 0005 §5.6).** A stdio server exposing
+  `casetrack_list_projects` and `casetrack_query` tools to AI agents, installed via
+  the optional `mcp` extra.
+- **Assay lineage + batch tracking (proposal 0006 steps 1–3).** New `assay_sources`
+  (many-to-many source → derived assay links) and `batches` tables model
+  pre-merge flowcell/lane runs feeding a merged specimen-level assay, populated by
+  `casetrack migrate-lineage`, `add-batch`, and `link-sources` (in the
+  `casetrack_lineage` subpackage). The lineage-aware read paths follow in 0.6.1.
+- **Project lifecycle status (proposal 0007).** The `casetrack_lifecycle` subpackage
+  adds a `casetrack project` command (with `set-status` / `status`) tracking each
+  project as `active` / `complete` / `archived`, plus `casetrack migrate-status` to
+  backfill the lifecycle state on existing projects; `casetrack projects --status`
+  filters the cross-project list by lifecycle state.
+
+### Changed
+
+- `setup.py` advertises the optional `casetrack-mcp` stdio entry point (requires
+  the `mcp` extra).
 
 ## [0.5.0] — 2026-04-18
 
