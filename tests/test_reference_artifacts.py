@@ -50,3 +50,49 @@ def test_record_usage_is_idempotent_per_output_and_ref():
         "SELECT version_used FROM reference_usage WHERE entity_id='S1'"
     ).fetchall()
     assert rows == [("v2",)]
+
+
+def test_staleness_three_states_and_reason():
+    conn = _conn()
+    ra.sync_references_from_toml(conn, {
+        "genome": {"path": "/p", "version": "hg38_v1"},
+        "gtf": {"path": "/p", "version": "v47"},
+    })
+    # fresh: used current version
+    ra.record_usage(conn, scope="analysis", entity_level="specimen",
+                    entity_id="S_fresh", analysis="clair3", ref_key="genome",
+                    version_used="hg38_v1", transaction_id="t")
+    # stale: used an old version
+    ra.record_usage(conn, scope="analysis", entity_level="specimen",
+                    entity_id="S_stale", analysis="clair3", ref_key="genome",
+                    version_used="hg38_v0", transaction_id="t")
+
+    s_fresh = ra.output_staleness(conn, scope="analysis",
+                                  entity_level="specimen", entity_id="S_fresh",
+                                  analysis="clair3")
+    assert s_fresh["state"] == "fresh" and s_fresh["reasons"] == []
+
+    s_stale = ra.output_staleness(conn, scope="analysis",
+                                  entity_level="specimen", entity_id="S_stale",
+                                  analysis="clair3")
+    assert s_stale["state"] == "STALE"
+    assert s_stale["reasons"] == ["genome: hg38_v0 -> hg38_v1"]
+
+    # untracked: an output with no usage rows
+    s_unk = ra.output_staleness(conn, scope="analysis", entity_level="specimen",
+                                entity_id="S_none", analysis="modkit")
+    assert s_unk["state"] == "untracked"
+
+
+def test_staleness_removed_ref_key_is_stale():
+    conn = _conn()
+    ra.sync_references_from_toml(conn, {"dbsnp": {"path": "/p", "version": "b156"}})
+    ra.record_usage(conn, scope="analysis", entity_level="specimen",
+                    entity_id="S1", analysis="clair3", ref_key="dbsnp",
+                    version_used="b156", transaction_id="t")
+    # remove dbsnp from the canonical set
+    conn.execute("DELETE FROM reference_artifacts WHERE ref_key='dbsnp'")
+    s = ra.output_staleness(conn, scope="analysis", entity_level="specimen",
+                            entity_id="S1", analysis="clair3")
+    assert s["state"] == "STALE"
+    assert s["reasons"] == ["reference removed: dbsnp"]

@@ -201,6 +201,66 @@ def record_usage(conn: sqlite3.Connection, *, scope: str, ref_key: str,
     )
 
 
+def _current_versions(conn) -> dict[str, str]:
+    return {r.ref_key: r.version for r in list_references(conn)}
+
+
+def output_staleness(conn, *, scope: str, entity_level: str | None = None,
+                     entity_id: str | None = None, analysis: str | None = None,
+                     artifact_id: int | None = None) -> dict:
+    """Return {'state': fresh|STALE|untracked, 'reasons': [str]} for one output.
+
+    STALE when any usage row's version_used != current canonical version, or the
+    ref_key was removed from the canonical set. untracked when no usage rows.
+    Derived purely at read time (0010 §6.2).
+    """
+    if scope == "analysis":
+        rows = conn.execute(
+            "SELECT ref_key, version_used FROM reference_usage WHERE "
+            "scope='analysis' AND entity_level=? AND entity_id=? AND analysis=?",
+            (entity_level, entity_id, analysis),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT ref_key, version_used FROM reference_usage WHERE "
+            "scope='cohort' AND artifact_id=?", (artifact_id,),
+        ).fetchall()
+    if not rows:
+        return {"state": "untracked", "reasons": []}
+    current = _current_versions(conn)
+    reasons: list[str] = []
+    for ref_key, version_used in rows:
+        if ref_key not in current:
+            reasons.append(f"reference removed: {ref_key}")
+        elif current[ref_key] != version_used:
+            reasons.append(f"{ref_key}: {version_used} -> {current[ref_key]}")
+    return {"state": "STALE" if reasons else "fresh", "reasons": sorted(reasons)}
+
+
+def all_stale_outputs(conn) -> list[dict]:
+    """Every output with >=1 usage row, annotated with its staleness state.
+
+    Used by the `references --stale-only` CLI and read paths.
+    """
+    out: list[dict] = []
+    # analysis-scope outputs (distinct entity+analysis)
+    for level, eid, analysis in conn.execute(
+        "SELECT DISTINCT entity_level, entity_id, analysis FROM reference_usage "
+        "WHERE scope='analysis'"
+    ).fetchall():
+        s = output_staleness(conn, scope="analysis", entity_level=level,
+                             entity_id=eid, analysis=analysis)
+        out.append({"scope": "analysis", "entity_level": level, "entity_id": eid,
+                    "analysis": analysis, "artifact_id": None, **s})
+    for (aid,) in conn.execute(
+        "SELECT DISTINCT artifact_id FROM reference_usage WHERE scope='cohort'"
+    ).fetchall():
+        s = output_staleness(conn, scope="cohort", artifact_id=aid)
+        out.append({"scope": "cohort", "entity_level": None, "entity_id": None,
+                    "analysis": None, "artifact_id": aid, **s})
+    return out
+
+
 __all__ = [
     "TIMESTAMP_FMT", "REFERENCE_KINDS",
     "reference_artifacts_ddl", "reference_usage_ddl", "reference_usage_indexes",
@@ -208,4 +268,5 @@ __all__ = [
     "ReferenceError", "ReferenceArtifact",
     "get_reference", "list_references",
     "sync_references_from_toml", "record_usage",
+    "output_staleness", "all_stale_outputs",
 ]
