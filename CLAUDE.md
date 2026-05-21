@@ -14,6 +14,7 @@ Manifest-centric case management CLI for bioinformatics pipelines on HPC (SLURM)
 
 | File | What it tells you |
 |---|---|
+| `docs/proposals/0009-cohort-level-artifacts.md` | **The shipped cohort-artifacts design.** One output from many assays (joint VCFs, PoNs, cohort matrices) via two additive sibling tables. §7 records *why a 4th hierarchy level was rejected* (Option A vs B). §9 = nothing open; fully implemented. |
 | `docs/proposals/0003-init-scaffold.md` | **The shipped v0.4.2 design.** `casetrack init` now scaffolds 16 leaf directories + expanded .gitignore. `--bare` opts out. |
 | `docs/proposals/0002-qc-events-and-censoring.md` | **The shipped v0.4 design.** QC events, cascade semantics, consent rules, cohort `--pair-by`. §0 has the 13 locked-in decisions. |
 | `docs/proposals/0001-sqlite-normalized-backend.md` | **The shipped v0.3 design.** Three-level hierarchy, SQLite backend, concurrency strategy. |
@@ -46,13 +47,23 @@ python3 -m pytest tests/ -q
 
 v0.4 lives in `casetrack_qc/` (a new subpackage alongside `casetrack.py`). The monolith stays untouched except for integration hooks in `init` / `append` / `rerun` / `status` / `export` / `validate` / `recover` / `dashboard` and the argparse dispatch in `main()`.
 
+**Cohort-level artifacts (proposal 0009)**: a first-class home for analysis outputs that span **many** assays (joint-genotyped VCFs, panels-of-normals, cohort matrices) — which the three-level hierarchy can't represent. Two **additive sibling tables** (the `qc_events` pattern; the three-level core is untouched):
+
+- `cohort_artifacts` — one row per cohort output, keyed by `(analysis, run_tag)`.
+- `cohort_artifact_inputs` — many-to-many lineage to contributing `assay_id`s.
+
+**Staleness is read-time, not stored**: an artifact is `STALE` when any contributing assay is currently censored / consent-revoked, derived live from the §4.4 cascade (`cohort_artifacts.artifact_staleness`). Surfaced everywhere — the `cohort-artifacts` command, `status` (section), `query` (`_cohort_artifacts` DuckDB view), `export --include-cohort-artifacts`, the HTML dashboard, and the `casetrack_cohort_artifacts` MCP tool. The 4th-hierarchy-level alternative was **rejected** (cohort artifacts are derived / many-to-many / dynamically-membered; a level is biological / single-parent / static — see proposal 0009 §7). Code lives in `casetrack_qc/cohort_artifacts.py` (+ `_cli.py`); Nextflow side is `casetrack_append_cohort` + the `COHORT_ARTIFACT_TRACKED` subworkflow.
+
 ## Commands
 
-20 subcommands total (16 from v0.3 + 4 new in v0.4):
-
-| v0.3 | v0.4 |
+| Group | Subcommands |
 |---|---|
-| `init`, `append`, `status`, `validate`, `log`, `schema`, `rerun`, `dashboard`, `add-metadata`, `projects`, `query`, `export`, `migrate`, `register`, `doctor`, `recover` | `censor`, `uncensor`, `qc-history`, `migrate-qc`, `cohort` |
+| v0.3 | `init`, `append`, `status`, `validate`, `log`, `schema`, `rerun`, `dashboard`, `add-metadata`, `projects`, `query`, `export`, `migrate`, `register`, `doctor`, `recover` |
+| v0.4 QC | `censor`, `uncensor`, `qc-history`, `migrate-qc`, `cohort` (readiness view) |
+| later | `migrate-lineage`, `add-batch`, `link-sources`, `project`, `migrate-status` |
+| cohort artifacts (0009) | `append-cohort`, `cohort-artifacts`, `migrate-cohort` |
+
+Note: `cohort` (v0.4) is the paired-design *readiness* view; `cohort-artifacts` (0009) lists cohort-level *output artifacts* with staleness — different things.
 
 ## Accepted design decisions (v0.4)
 
@@ -65,6 +76,14 @@ See §0 of proposal 0002 for the full list. Key ones:
 5. **Append-only reversal** — `uncensor` writes `resolved_at`, never deletes.
 6. **Strict refuse on append to censored** — `--force-append-on-censored --yes` override.
 7. **N-partition `--pair-by`** — same code path for tumor/normal, longitudinal, multi-region.
+
+## Accepted design decisions (cohort artifacts, proposal 0009)
+
+1. **Sibling tables, not a 4th level** — `cohort_artifacts` + `cohort_artifact_inputs`, mirroring the `qc_events` additive pattern. The three-level core (`LEVEL_ORDER`) is untouched. (§7 has the full Option-A-vs-B reasoning.)
+2. **`(analysis, run_tag)` is the unique key** — a re-genotyping run uses a new `run_tag` and coexists with the prior artifact in the audit trail.
+3. **Read-time staleness, no stored flag** — derived live from the QC/consent cascade, so it tracks censor/uncensor automatically.
+4. **Staleness is flagged, not auto-fixed** — re-running is the operator's call.
+5. **Nextflow stats are optional** — `casetrack_append_cohort` drops `--stats` when handed `[]`; no `{}` placeholder file.
 
 ## Accepted design decisions (v0.3)
 
@@ -101,10 +120,13 @@ casetrack/
 │   ├── consent.py            # consent updates + ethics regex + invariant
 │   ├── autoflag.py           # SLURM summary-TSV convention
 │   ├── reader.py             # _active cascade (§4.4) + DuckDB view
-│   ├── cohort.py             # cmd_cohort + pair-by N-partition
+│   ├── cohort.py             # cmd_cohort + pair-by N-partition (readiness view)
+│   ├── cohort_artifacts.py   # 0009: sibling-table DDL/CRUD + read-time staleness
+│   ├── cohort_artifacts_cli.py # 0009: append-cohort / migrate-cohort / cohort-artifacts
 │   ├── migrate.py            # cmd_migrate_qc
 │   ├── recover.py            # replay helpers for QC actions
 │   └── cli.py                # argparse wiring helpers
+├── casetrack_mcp/            # MCP server (list_projects / query / cohort_artifacts tools)
 ├── setup.py                  # pip entry_points + packages=["casetrack_qc"]
 ├── CLAUDE.md                 # you are here
 ├── README.md                 # user-facing docs
@@ -114,17 +136,16 @@ casetrack/
 │   ├── MIGRATION_v0.2_to_v0.3.md
 │   ├── MIGRATION_v0.3_to_v0.4.md   # ← new
 │   └── proposals/
-│       ├── 0001-sqlite-normalized-backend.md
-│       └── 0002-qc-events-and-censoring.md
+│       └── 0001 … 0009  (0009 = cohort-level artifacts)
 ├── examples/
 │   ├── run_modkit.sh
 │   ├── scripts/
-│   ├── nextflow/
+│   ├── nextflow/             # casetrack.nf module + subworkflows/local/cohort_artifact_tracked.nf
 │   ├── claude/
-│   └── giab_chr21/
+│   └── giab_chr21/           # run_cohort_demo.sh (mock + bcftools engines)
 ├── scripts/
 │   └── generate_demo_dashboard.py
-├── tests/                    # 27 test files, 522 tests
+├── tests/                    # 865 tests (incl. cohort-artifacts: schema/CRUD/staleness/CLI/read-paths/nf)
 └── sandbox/
 ```
 
@@ -142,3 +163,5 @@ casetrack/
 ## What to tell a new session
 
 > Read `docs/proposals/0002-qc-events-and-censoring.md` (§0 has the locked decisions) and `docs/MIGRATION_v0.3_to_v0.4.md`. The v0.4 QC code lives in `casetrack_qc/`. Integration points in `casetrack.py`: `cmd_init_project`, `cmd_append_project`, `cmd_rerun_project`, `cmd_status_project`, `cmd_export_project`, `cmd_validate_project`, `cmd_recover_project`, `cmd_dashboard_project`, plus the argparse dispatch in `main()`.
+>
+> For cohort-level artifacts: read `docs/proposals/0009-cohort-level-artifacts.md` (§7 = why no 4th level; §9 = nothing open). Code is `casetrack_qc/cohort_artifacts.py` (+ `_cli.py`); `casetrack_mcp/` has the agent-facing tool. casetrack.py read-path hooks: `cmd_dashboard_project` (section), `_prepare_v03_query_connection` (`_cohort_artifacts` view), `cmd_status_project` + `cmd_export_project`. The Nextflow process/subworkflow live in `examples/nextflow/`.
