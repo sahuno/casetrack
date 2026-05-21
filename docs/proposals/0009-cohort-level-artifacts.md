@@ -239,6 +239,8 @@ durable design.
 
 5. ~~Dashboard / MCP surfacing of cohort artifacts (§8.4).~~ **Done** — `dashboard` renders a Cohort-artifacts section with fresh/STALE badges; `casetrack_cohort_artifacts` MCP tool surfaces artifacts + staleness to agents.
 
+6. ~~`--stats`-less `append-cohort` ergonomics.~~ **Done** — the `casetrack_append_cohort` process is stats-optional (pass `[]`, `--stats` is dropped); CLI was already optional.
+7. ~~Package the Nextflow gather as a formal subworkflow.~~ **Done** — `subworkflows/local/cohort_artifact_tracked.nf` (`COHORT_ARTIFACT_TRACKED`), verified end-to-end against real Nextflow.
+
 ### Still open
-- `--stats`-less `append-cohort` ergonomics (currently a `{}` file is the idiom).
-- The Nextflow deliverable is a `casetrack_append_cohort` *process* + documented gather pattern, not a packaged `subworkflows/local/*.nf` file.
+- _Nothing tracked._ Proposal 0009 is fully implemented as of 2026-05-21.

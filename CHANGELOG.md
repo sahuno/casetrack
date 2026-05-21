@@ -39,6 +39,13 @@ samples (joint-genotyped VCFs, panels-of-normals, cohort matrices). See
   staleness to AI agents (companion to the CLI command), so an agent doesn't have
   to hand-write the cascade SQL. The `casetrack_query` schema now points at the
   `cohort_artifacts` / `cohort_artifact_inputs` tables.
+- **Packaged Nextflow subworkflow** `subworkflows/local/cohort_artifact_tracked.nf`
+  (`COHORT_ARTIFACT_TRACKED`) — wraps the gather (`collectFile` lineage manifest)
+  + `casetrack_append_cohort` registration as a reusable named DSL2 subworkflow.
+  Verified end-to-end against real Nextflow.
+- **`casetrack_append_cohort` stats are now optional** — pass `[]` in the stats
+  slot and the `--stats` flag is dropped (no `{}` placeholder file needed); the
+  `append-cohort` CLI was already stats-optional.
 - **`casetrack_append_cohort` Nextflow process** (`examples/nextflow/casetrack.nf`)
   — the fan-in companion to `casetrack_append_project`; registers a cohort
   artifact + its assay lineage (passed as a `collectFile` inputs manifest).

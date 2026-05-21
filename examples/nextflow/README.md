@@ -177,6 +177,35 @@ workflow {
 `../giab_chr21/run_cohort_demo.sh` for a runnable, no-cluster version of this
 flow (mock or real `bcftools merge`).
 
+### Packaged subworkflow
+
+For the common case, `subworkflows/local/cohort_artifact_tracked.nf` wraps the
+whole gather-and-register step as a named DSL2 subworkflow:
+
+```groovy
+include { COHORT_ARTIFACT_TRACKED } from './subworkflows/local/cohort_artifact_tracked.nf'
+
+workflow {
+    gvcfs = call_gvcf(assays_ch)                          // tuple(assay_id, gvcf)
+    joint = joint_genotype(gvcfs.map { it[1] }.collect()) // → vcf
+    stats = bcftools_stats(joint)                         // → stats.json
+
+    COHORT_ARTIFACT_TRACKED(
+        gvcfs.map { it[0] },     // assay_ids (gathered into the lineage manifest)
+        joint.combine(stats)     // (artifact, stats)
+    )
+}
+```
+
+It takes the assay-id channel + a paired `(artifact, stats)` channel, builds the
+lineage manifest with `collectFile`, and calls `casetrack_append_cohort`.
+`analysis` / `run_tag` come from `params.cohort_analysis` / `params.run_tag`.
+
+**Stats are optional.** When there is no stats file, pass `[]` in the stats slot
+— `joint.map { v -> tuple(v, []) }` — and the `--stats` flag is dropped. (The
+`casetrack append-cohort` CLI is likewise stats-optional; no `{}` placeholder
+file is needed.)
+
 ## Integration with Claude Code (item 9 in synopsis)
 
 At the end of a pipeline you can chain `casetrack_append.out` into a
