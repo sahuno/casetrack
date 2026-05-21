@@ -6174,6 +6174,13 @@ def _prepare_v03_query_connection(db_path: Path):
     # Proposal 0010: `_reference_usage` view with derived current_version /
     # is_stale. No-op on pre-0010 projects.
     _install_reference_usage_view(con)
+    # Proposal 0011: `_artifact_derivation` view + `derived_stale` on
+    # `_cohort_artifacts`. Installed last; uses base-table direct-staleness
+    # (self_safe) so it does not depend on the views above. No-op pre-0011/0010.
+    from casetrack_qc.reader import (
+        install_artifact_derivation_view as _install_artifact_derivation_view,
+    )
+    _install_artifact_derivation_view(con)
     return con
 
 
