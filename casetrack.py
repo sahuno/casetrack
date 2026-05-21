@@ -6048,11 +6048,16 @@ def _prepare_v03_query_connection(db_path: Path):
     from casetrack_qc.reader import install_active_views as _install_active_views
     _install_active_views(con)
     # Proposal 0009: `_cohort_artifacts` view with derived staleness. No-op on
-    # pre-0009 DBs without the cohort-artifact tables.
+    # pre-0009 DBs without the cohort-artifact tables. Proposal 0010 extends
+    # the view with `ref_stale`; falls back to 0009 view on pre-0010 projects.
     from casetrack_qc.reader import (
         install_cohort_artifact_view as _install_cohort_artifact_view,
+        install_reference_usage_view as _install_reference_usage_view,
     )
     _install_cohort_artifact_view(con)
+    # Proposal 0010: `_reference_usage` view with derived current_version /
+    # is_stale. No-op on pre-0010 projects.
+    _install_reference_usage_view(con)
     return con
 
 
