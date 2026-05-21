@@ -187,3 +187,17 @@ def test_dashboard_renders_references_section(tmp_path):
     assert r.returncode == 0 and out.exists()
     html = out.read_text()
     assert "References" in html and "genome" in html
+
+
+def test_mcp_references_tool(tmp_path, monkeypatch):
+    pdir = _stale_setup(tmp_path)
+    # register the project so the MCP slug resolver finds it
+    subprocess.run([sys.executable, "-m", "casetrack", "projects", "register",
+                    "--project-dir", str(pdir)], capture_output=True, text=True, check=True)
+    from casetrack_mcp import tools
+    # find the slug — list_projects_tool returns {"projects": [...]} with
+    # each entry having "project_id" and "path" keys (confirmed from tools.py)
+    projs = tools.list_projects_tool()["projects"]
+    slug = [p["project_id"] for p in projs if str(pdir) in p["path"]][0]
+    payload = tools.references_tool(slug, stale_only=True)
+    assert any(o["state"] == "STALE" for o in payload["stale_outputs"])

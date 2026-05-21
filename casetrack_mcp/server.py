@@ -37,6 +37,7 @@ from casetrack_mcp.tools import (
     cohort_artifacts_tool,
     list_projects_tool,
     query_tool,
+    references_tool,
 )
 
 # The mcp SDK is optional (install via `pip install casetrack[mcp]`).
@@ -110,6 +111,29 @@ _COHORT_ARTIFACTS_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+_REFERENCES_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "project_id": {
+            "type": "string",
+            "description": (
+                "DNS-label slug identifying a casetrack project in the local "
+                "registry. Call casetrack_list_projects first if unknown."
+            ),
+        },
+        "stale_only": {
+            "type": "boolean",
+            "description": (
+                "When true, return only outputs whose reference version at "
+                "analysis time no longer matches the current declared version. "
+                "Default false."
+            ),
+        },
+    },
+    "required": ["project_id"],
+    "additionalProperties": False,
+}
+
 
 def _build_server() -> "Server":
     """Register the two tool handlers against a fresh Server instance."""
@@ -157,6 +181,18 @@ def _build_server() -> "Server":
                 ),
                 inputSchema=_COHORT_ARTIFACTS_SCHEMA,
             ),
+            Tool(
+                name="casetrack_references",
+                description=(
+                    "List reference artifacts (genome, annotation, known-variant "
+                    "sets) for a project, each with read-time ref-staleness: an "
+                    "output is STALE when a reference version it used no longer "
+                    "matches the current declared version. Pass stale_only=true "
+                    "to see only stale outputs. project_id must be a slug from "
+                    "casetrack_list_projects."
+                ),
+                inputSchema=_REFERENCES_SCHEMA,
+            ),
         ]
 
     @app.call_tool()
@@ -170,6 +206,11 @@ def _build_server() -> "Server":
                 payload = query_tool(project_id, sql)
             elif name == "casetrack_cohort_artifacts":
                 payload = cohort_artifacts_tool(
+                    arguments.get("project_id"),
+                    stale_only=bool(arguments.get("stale_only", False)),
+                )
+            elif name == "casetrack_references":
+                payload = references_tool(
                     arguments.get("project_id"),
                     stale_only=bool(arguments.get("stale_only", False)),
                 )
