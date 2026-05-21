@@ -110,9 +110,10 @@ def test_cohort_artifacts_view_has_derived_stale(tmp_path):
     rows = json.loads(r.stdout)
     annot = next(x for x in rows if x["analysis"] == "annot")
     joint = next(x for x in rows if x["analysis"] == "joint")
-    # annot: input-fresh (its own A1 still active is irrelevant — annot's inputs
-    # ARE A1,A2 and A2 is censored, so annot IS input-stale here). We instead
-    # use a dedicated orthogonality case below; here just assert the chain.
+    # annot's inputs are A1,A2 and A2 is censored, so annot IS input-stale.
+    # (Orthogonality — derived_stale independent of stale — is tested separately
+    # in test_cohort_view_orthogonality_derived_not_input_stale where annot has
+    # only A1 as its own input.) Here we only assert the derived chain propagates.
     assert annot["derived_stale"] in (True, 1)
     # joint itself is input-stale (A2 censored) but has no upstream edges, so
     # its derived_stale is False — direct causes are NOT rolled into derived.
@@ -231,3 +232,61 @@ def test_artifact_derivation_view_cycle_safe(tmp_path):
     assert r.returncode == 0, r.stderr
     rows = json.loads(r.stdout)
     assert len(rows) == 2  # both edges returned, no hang/error
+
+
+# ── Backward-compatibility regression (0011 Task 8 review) ──────────────────
+
+
+def test_cohort_view_ref_stale_survives_without_derivation_table(tmp_path):
+    """Regression: _cohort_artifacts.ref_stale is preserved on 0010-era DBs
+    that lack artifact_derivation (not yet migrated to 0011).
+
+    Before the three-tier fallback fix, a DB with 0009+0010 tables but no
+    artifact_derivation would fail the tier-1 (WITH RECURSIVE) view install and
+    fall all the way back to the pre-0010 view, silently dropping ref_stale and
+    making stale references appear fresh.
+    """
+    proj = _init_project(tmp_path)
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        _entity_rows(conn)
+        conn.commit()
+        ca.ensure_cohort_artifacts_schema(conn)
+        ra.ensure_reference_schema(conn)
+        # Register a genome reference at version hg38_v0.
+        ra.sync_references_from_toml(conn, {
+            "genome": {"path": "/db/hg38.fa", "version": "hg38_v0",
+                       "kind": "genome"}
+        })
+        # Register a cohort artifact using the genome reference.
+        aid = _add_cohort(conn, "joint_vc", "r1", ["A1", "A2"])
+        ra.record_usage(conn, scope="cohort", artifact_id=aid,
+                        ref_key="genome", version_used="hg38_v0",
+                        transaction_id="t")
+        conn.commit()
+        # Bump the genome reference version: usage now stale (hg38_v0 vs hg38_v1).
+        ra.sync_references_from_toml(conn, {
+            "genome": {"path": "/db/hg38.fa", "version": "hg38_v1",
+                       "kind": "genome"}
+        })
+        conn.commit()
+        # Simulate a pre-0011 project: ensure_derivation_schema was NEVER called.
+        # Drop the table if it exists (from init scaffold), so DuckDB can't find it.
+        conn.execute("DROP TABLE IF EXISTS artifact_derivation")
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = _run(["query", "--project-dir", str(proj), "--fmt", "json",
+              'SELECT analysis, ref_stale FROM "_cohort_artifacts"'])
+    assert r.returncode == 0, r.stderr
+    rows = json.loads(r.stdout)
+    assert rows, "Expected at least one row in _cohort_artifacts"
+    row = rows[0]
+    # ref_stale must be present (not KeyError) and truthy (hg38_v0 vs hg38_v1).
+    assert "ref_stale" in row, (
+        "ref_stale column missing — three-tier fallback regressed to pre-0010 view"
+    )
+    assert bool(row["ref_stale"]) is True, (
+        f"Expected ref_stale=True after version bump, got {row['ref_stale']!r}"
+    )

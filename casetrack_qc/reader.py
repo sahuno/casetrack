@@ -243,7 +243,8 @@ def install_cohort_artifact_view(duckdb_con) -> None:
     # Proposal 0011: derived_stale. Joins the recursive transitive closure
     # (derived) computed from BASE TABLES (self_safe=True) so it can be defined
     # inside the very view it would otherwise self-reference.
-    sql_with_ref_stale = f"""
+    # Requires: 0009 (cohort_artifacts) + 0010 (reference_usage) + 0011 (artifact_derivation).
+    sql_with_ref_stale_and_derived = f"""
         CREATE VIEW "_cohort_artifacts" AS
         WITH RECURSIVE {_derived_stale_cte(self_safe=True)}
         SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
@@ -256,6 +257,20 @@ def install_cohort_artifact_view(duckdb_con) -> None:
         LEFT JOIN derived d
                ON d.node = 'cohort:' || ca.analysis || '@' || ca.run_tag
     """
+    # Proposal 0010 view without 0011 derived_stale. This is the exact body
+    # that shipped in v0.8.0 before Task 8 added artifact_derivation support.
+    # Required by 0010-era DBs that have reference_usage/reference_artifacts
+    # but lack artifact_derivation (not yet migrated to 0011).
+    sql_with_ref_stale_only = f"""
+        CREATE VIEW "_cohort_artifacts" AS
+        SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
+               ca.n_inputs, ca.stats_json, ca.created_at,
+               {censored_count} AS n_censored_inputs,
+               ({censored_count} > 0) AS stale,
+               {ref_stale_subquery} AS ref_stale
+        FROM proj.cohort_artifacts ca
+    """
+    # Pre-0010 fallback: no ref_stale column, no derived_stale column.
     sql_without_ref_stale = f"""
         CREATE VIEW "_cohort_artifacts" AS
         SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
@@ -265,16 +280,23 @@ def install_cohort_artifact_view(duckdb_con) -> None:
         FROM proj.cohort_artifacts ca
     """
     try:
-        duckdb_con.execute(sql_with_ref_stale)
+        # Tier 1: full 0011 view (artifact_derivation + reference tables present).
+        duckdb_con.execute(sql_with_ref_stale_and_derived)
     except Exception:
-        # Pre-0010 projects lack reference_usage/reference_artifacts — fall
-        # back to the original view without ref_stale.
+        # Tier 2: 0010-era view — reference tables present but artifact_derivation
+        # is absent (pre-0011 project not yet migrated). Preserves ref_stale so
+        # shipped 0010 functionality is not silently regressed.
         try:
-            duckdb_con.execute(sql_without_ref_stale)
+            duckdb_con.execute(sql_with_ref_stale_only)
         except Exception:
-            # Pre-0009 DBs lack the cohort-artifact tables — skip so `query`
-            # still works.
-            pass
+            # Tier 3: pre-0010 projects lack reference_usage/reference_artifacts —
+            # fall back to the original view without ref_stale.
+            try:
+                duckdb_con.execute(sql_without_ref_stale)
+            except Exception:
+                # Pre-0009 DBs lack the cohort-artifact tables — skip so `query`
+                # still works.
+                pass
 
 
 def install_reference_usage_view(duckdb_con) -> None:
