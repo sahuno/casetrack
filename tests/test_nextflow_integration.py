@@ -264,7 +264,10 @@ def test_nextflow_cohort_command_runs_end_to_end(tmp_path: Path):
         "run_tag":                      "20260520_demo",
         "artifact":                     str(artifact),
         "inputs_tsv":                   str(inputs_tsv),
-        "stats_json":                   str(stats_json),
+        # Nextflow evaluates `def stats_arg = stats_json ? "--stats ..." : ''`;
+        # the static renderer can't run Groovy, so we substitute the resolved
+        # value the way Nextflow would when a stats file is present.
+        "stats_arg":                    f"--stats '{stats_json}'",
     })
     remaining = re.findall(r"\$\{[^}]+\}", rendered)
     assert not remaining, f"unsubstituted placeholders: {remaining}"
@@ -280,6 +283,86 @@ def test_nextflow_cohort_command_runs_end_to_end(tmp_path: Path):
         assert ca.artifact_inputs(conn, art.artifact_id) == ["P1-t-ONT", "P2-t-ONT"]
     finally:
         conn.close()
+
+
+def test_nextflow_cohort_command_stats_optional(tmp_path: Path):
+    """The process must register an artifact even with NO stats file —
+    `stats_arg` resolves to empty and no `--stats` flag is emitted."""
+    from casetrack_qc import cohort_artifacts as ca
+
+    proj = tmp_path / "proj"
+    casetrack.cmd_init(argparse.Namespace(
+        manifest=None, project_dir=str(proj), samples=None, key="sample_id",
+        metadata=None, cols=None, from_template="hgsoc",
+        project_name="nf_cohort_nostats", force=False,
+    ))
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        with casetrack.begin_immediate(conn):
+            conn.executescript(
+                "INSERT INTO patients (patient_id) VALUES ('P1');"
+                "INSERT INTO specimens (specimen_id, patient_id, tissue_site) "
+                "  VALUES ('P1-t', 'P1', 'tumor');"
+                "INSERT INTO assays (assay_id, specimen_id, assay_type) VALUES "
+                "  ('P1-t-ONT', 'P1-t', 'ONT');"
+            )
+    finally:
+        conn.close()
+
+    artifact = tmp_path / "cohort.vcf.gz"
+    artifact.write_text("MOCK")
+    inputs_tsv = tmp_path / "inputs.txt"
+    inputs_tsv.write_text("P1-t-ONT\n")
+
+    src = (NF_DIR / "casetrack.nf").read_text()
+    raw_script = _extract_script(src, "casetrack_append_cohort")
+    casetrack_bin = f"{sys.executable} {Path(casetrack.__file__)}"
+    rendered = _render_script(raw_script, {
+        "params.casetrack_bin":         casetrack_bin,
+        "params.casetrack_project_dir": str(proj),
+        "params.casetrack_extra":       "",
+        "analysis":                     "joint_genotype",
+        "run_tag":                      "nostats_run",
+        "artifact":                     str(artifact),
+        "inputs_tsv":                   str(inputs_tsv),
+        "stats_arg":                    "",   # no stats → no --stats flag
+    })
+    remaining = re.findall(r"\$\{[^}]+\}", rendered)
+    assert not remaining, f"unsubstituted placeholders: {remaining}"
+    assert "--stats" not in rendered
+
+    subprocess.run(["bash", "-c", rendered], check=True,
+                   capture_output=True, text=True)
+
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        art = ca.get_artifact_by_key(conn, "joint_genotype", "nostats_run")
+        assert art is not None
+        assert art.stats_json is None
+    finally:
+        conn.close()
+
+
+# ── packaged subworkflow ────────────────────────────────────────────────────
+
+SUBWF = NF_DIR / "subworkflows" / "local" / "cohort_artifact_tracked.nf"
+
+
+def test_cohort_subworkflow_file_present():
+    assert SUBWF.is_file(), "missing subworkflows/local/cohort_artifact_tracked.nf"
+
+
+def test_cohort_subworkflow_shape():
+    src = SUBWF.read_text()
+    assert "nextflow.enable.dsl = 2" in src
+    assert re.search(r"workflow\s+COHORT_ARTIFACT_TRACKED\s*\{", src)
+    # Includes + uses the registration process.
+    assert "casetrack_append_cohort" in src
+    assert "include {" in src
+    # Gathers the lineage via collectFile and declares take:/emit:.
+    assert "collectFile" in src
+    assert re.search(r"\btake:", src)
+    assert re.search(r"\bemit:", src)
 
 
 def test_nextflow_module_command_with_allow_new(

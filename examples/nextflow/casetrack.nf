@@ -180,7 +180,9 @@ process casetrack_register_project {
  *                path stats_json)
  *          - (analysis, run_tag) is the unique key; a re-run uses a new run_tag.
  *          - inputs_tsv: one assay_id per line ('assay_id' header tolerated).
- *          - stats_json: cohort-level summary; pass a file containing '{}' if none.
+ *          - stats_json: cohort-level summary, OPTIONAL — pass `[]` (an empty
+ *            list) for the staged-file slot when there are no stats, and the
+ *            `--stats` flag is omitted. (`append-cohort` is stats-optional too.)
  * Output : tuple(val analysis, val run_tag) so a downstream report/QC step can
  *          chain off the confirmed-registered artifact.
  * ──────────────────────────────────────────────────────────────────────────*/
@@ -199,6 +201,9 @@ process casetrack_append_cohort {
       tuple val(analysis), val(run_tag)
 
     script:
+    // stats_json is optional: when the caller passes `[]`, Nextflow stages
+    // nothing and `stats_json` is falsy, so we drop the --stats flag entirely.
+    def stats_arg = stats_json ? "--stats '${stats_json}'" : ''
     """
     ${params.casetrack_bin} append-cohort \\
         --project-dir '${params.casetrack_project_dir}' \\
@@ -206,7 +211,7 @@ process casetrack_append_cohort {
         --run-tag '${run_tag}' \\
         --path '${artifact}' \\
         --inputs-from '${inputs_tsv}' \\
-        --stats '${stats_json}' ${params.casetrack_extra}
+        ${stats_arg} ${params.casetrack_extra}
     """
 }
 
