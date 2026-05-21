@@ -72,3 +72,63 @@ def test_schema_apply_syncs_references_and_logs_version_change(tmp_path):
     prov = (pdir / "provenance.jsonl").read_text()
     assert "reference_version_change" in prov
     assert "hg38_v0" in prov and "hg38_v1" in prov
+
+
+def _bootstrap_one_specimen(pdir):
+    """Register P1 (patient) then S1 (specimen) via 'casetrack register'."""
+    subprocess.run([sys.executable, "-m", "casetrack", "register",
+                    "--project-dir", str(pdir), "--level", "patient",
+                    "--id", "P1"],
+                   check=True, capture_output=True, text=True)
+    subprocess.run([sys.executable, "-m", "casetrack", "register",
+                    "--project-dir", str(pdir), "--level", "specimen",
+                    "--id", "S1", "--parent", "P1"],
+                   check=True, capture_output=True, text=True)
+
+
+def test_append_auto_captures_declared_uses(tmp_path):
+    pdir = _init_project(tmp_path)
+    toml = pdir / "casetrack.toml"
+    toml.write_text(toml.read_text() +
+        '\n[references.genome]\npath="/db/hg38.fa"\nversion="hg38_v0"\nkind="genome"\n'
+        '\n[analyses.clair3]\nlevel="specimen"\ncolumn_prefix="clair3"\nuses=["genome"]\n')
+    subprocess.run([sys.executable, "-m", "casetrack", "schema", "apply",
+                    "--project-dir", str(pdir)], check=True, capture_output=True, text=True)
+    _bootstrap_one_specimen(pdir)
+
+    summary = pdir / "clair3_summary.tsv"
+    summary.write_text("specimen_id\tn_snv\nS1\t1000\n")
+    subprocess.run([sys.executable, "-m", "casetrack", "append",
+                    "--project-dir", str(pdir), "--analysis", "clair3",
+                    "--level", "specimen",
+                    "--results", str(summary), "--overwrite"],
+                   check=True, capture_output=True, text=True)
+
+    conn = sqlite3.connect(pdir / casetrack.PROJECT_DB_NAME)
+    s = ra.output_staleness(conn, scope="analysis", entity_level="specimen",
+                            entity_id="S1", analysis="clair3")
+    assert s["state"] == "fresh"  # used hg38_v0, current is hg38_v0
+    conn.close()
+
+
+def test_no_track_references_skips_capture(tmp_path):
+    pdir = _init_project(tmp_path)
+    toml = pdir / "casetrack.toml"
+    toml.write_text(toml.read_text() +
+        '\n[references.genome]\npath="/db/hg38.fa"\nversion="hg38_v0"\nkind="genome"\n'
+        '\n[analyses.clair3]\nlevel="specimen"\ncolumn_prefix="clair3"\nuses=["genome"]\n')
+    subprocess.run([sys.executable, "-m", "casetrack", "schema", "apply",
+                    "--project-dir", str(pdir)], check=True, capture_output=True, text=True)
+    _bootstrap_one_specimen(pdir)
+    summary = pdir / "clair3_summary.tsv"
+    summary.write_text("specimen_id\tn_snv\nS1\t1000\n")
+    subprocess.run([sys.executable, "-m", "casetrack", "append",
+                    "--project-dir", str(pdir), "--analysis", "clair3",
+                    "--level", "specimen",
+                    "--results", str(summary), "--overwrite",
+                    "--no-track-references"], check=True, capture_output=True, text=True)
+    conn = sqlite3.connect(pdir / casetrack.PROJECT_DB_NAME)
+    s = ra.output_staleness(conn, scope="analysis", entity_level="specimen",
+                            entity_id="S1", analysis="clair3")
+    assert s["state"] == "untracked"
+    conn.close()

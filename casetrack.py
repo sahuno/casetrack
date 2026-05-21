@@ -4565,6 +4565,16 @@ def cmd_append_project(args):
                     transaction_id=txn_id,
                     source="slurm",
                 )
+            if not getattr(args, "no_track_references", False):
+                from casetrack_qc.reference_artifacts_cli import capture_reference_usage
+                _override = None
+                if getattr(args, "uses_references", None):
+                    _override = [s.strip() for s in args.uses_references.split(",") if s.strip()]
+                capture_reference_usage(
+                    conn, schema=schema, analysis=analysis, level=level,
+                    entity_ids=list(tsv_keys), transaction_id=txn_id,
+                    override_refs=_override,
+                )
     except _MissingKeys as e:
         conn.close()
         preview = sorted(e.missing)[:5]
@@ -7717,6 +7727,11 @@ Examples:
         action="store_true",
         help="[v0.7] Allow mutations on an archived project (requires --yes)",
     )
+    p_append.add_argument("--uses-references", dest="uses_references", default=None,
+        help="[v0.8] Comma-separated reference keys this run consumed "
+             "(overrides [analyses.<tool>].uses)")
+    p_append.add_argument("--no-track-references", dest="no_track_references",
+        action="store_true", help="[v0.8] Skip reference-usage capture for this append")
     p_append.add_argument(
         "--infer-from-path",
         nargs="?",
