@@ -189,6 +189,96 @@ def test_dashboard_renders_references_section(tmp_path):
     assert "References" in html and "genome" in html
 
 
+def _setup_cohort_with_genome_ref(tmp_path):
+    """Shared setup: project + genome ref hg38_v0 + cohort artifact over A1.
+
+    Returns (pdir, vcf_path).  The genome version is still hg38_v0 on return
+    (no bump); callers can bump or censor independently.
+    """
+    pdir = _init_project(tmp_path)
+    toml = pdir / "casetrack.toml"
+    toml.write_text(toml.read_text() +
+        '\n[references.genome]\npath="/db/hg38.fa"\nversion="hg38_v0"\nkind="genome"\n')
+    subprocess.run([sys.executable, "-m", "casetrack", "schema", "apply",
+                    "--project-dir", str(pdir)], check=True, capture_output=True, text=True)
+    _bootstrap_one_specimen(pdir)
+    conn = sqlite3.connect(pdir / casetrack.PROJECT_DB_NAME)
+    conn.execute("INSERT INTO assays (assay_id, specimen_id, assay_type) "
+                 "VALUES ('A1', 'S1', 'ONT')")
+    conn.commit(); conn.close()
+    vcf = pdir / "joint.vcf.gz"; vcf.write_text("x")
+    subprocess.run([sys.executable, "-m", "casetrack", "append-cohort",
+                    "--project-dir", str(pdir), "--analysis", "joint_genotype",
+                    "--run-tag", "rt1", "--path", str(vcf), "--inputs", "A1",
+                    "--uses-references", "genome"], check=True,
+                   capture_output=True, text=True)
+    return pdir, vcf
+
+
+def _query_cohort_stale_cols(pdir):
+    """Run `casetrack query` on _cohort_artifacts and return (stale_val, ref_stale_val)
+    as lowercase strings, for the first (and only expected) data row."""
+    r = subprocess.run(
+        [sys.executable, "-m", "casetrack", "query",
+         "--project-dir", str(pdir), "--fmt", "tsv",
+         "SELECT artifact_id, stale, ref_stale FROM _cohort_artifacts"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, (
+        f"_cohort_artifacts query failed:\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    )
+    lines = r.stdout.strip().splitlines()
+    assert len(lines) >= 2, f"Expected header + data row, got:\n{r.stdout}"
+    header = lines[0].split("\t")
+    data = lines[1].split("\t")
+    idx_stale = header.index("stale")
+    idx_ref_stale = header.index("ref_stale")
+    return data[idx_stale].strip().lower(), data[idx_ref_stale].strip().lower()
+
+
+def test_cohort_artifact_ref_stale_orthogonal_to_input_stale(tmp_path):
+    """Case A — ref-stale only: ref_stale=true, stale=false.
+
+    Proposal 0010 §6.2: bumping a reference version makes ref_stale truthy while
+    input-stale (stale) stays falsy because the contributing assay is NOT censored.
+    """
+    pdir, _ = _setup_cohort_with_genome_ref(tmp_path)
+    # Bump genome hg38_v0 → hg38_v1 so the usage row is now stale
+    toml = pdir / "casetrack.toml"
+    toml.write_text(toml.read_text().replace("hg38_v0", "hg38_v1"))
+    subprocess.run([sys.executable, "-m", "casetrack", "schema", "apply",
+                    "--project-dir", str(pdir)], check=True, capture_output=True, text=True)
+
+    stale_val, ref_stale_val = _query_cohort_stale_cols(pdir)
+    assert ref_stale_val in ("true", "1"), (
+        f"Expected ref_stale truthy after version bump, got {ref_stale_val!r}"
+    )
+    assert stale_val in ("false", "0"), (
+        f"Expected stale falsy (A1 not censored), got {stale_val!r}"
+    )
+
+
+def test_cohort_artifact_input_stale_with_fresh_ref(tmp_path):
+    """Case B — input-stale only: stale=true, ref_stale=false.
+
+    Proposal 0010 §6.2: censoring a contributing assay makes input-stale truthy
+    while ref_stale stays falsy because the genome version was NOT bumped.
+    """
+    pdir, _ = _setup_cohort_with_genome_ref(tmp_path)
+    # Censor the contributing assay — genome version stays hg38_v0 (fresh)
+    conn = sqlite3.connect(pdir / casetrack.PROJECT_DB_NAME)
+    conn.execute("UPDATE assays SET qc_status='censored' WHERE assay_id='A1'")
+    conn.commit(); conn.close()
+
+    stale_val, ref_stale_val = _query_cohort_stale_cols(pdir)
+    assert stale_val in ("true", "1"), (
+        f"Expected stale truthy after censoring A1, got {stale_val!r}"
+    )
+    assert ref_stale_val in ("false", "0"), (
+        f"Expected ref_stale falsy (genome version not bumped), got {ref_stale_val!r}"
+    )
+
+
 def test_mcp_references_tool(tmp_path, monkeypatch):
     pdir = _stale_setup(tmp_path)
     # register the project so the MCP slug resolver finds it
