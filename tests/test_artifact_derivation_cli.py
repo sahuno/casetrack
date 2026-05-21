@@ -235,6 +235,30 @@ def test_toml_derived_from_materialized_on_schema_apply(tmp_path):
         conn.close()
 
 
+# ── Task 7: --derived-from convenience on append + append-cohort ──────────────
+
+
+def test_append_cohort_derived_from(tmp_path):
+    """``append-cohort --derived-from`` records the edge in artifact_derivation."""
+    p = _project_with_artifacts(tmp_path)  # has joint@v1, annot@v1
+    # Register a new cohort artifact that derives from joint@v1
+    r = _run([
+        "append-cohort", "--project-dir", str(p),
+        "--analysis", "vqsr", "--run-tag", "v1", "--path", "/x/vqsr.vcf",
+        "--inputs", "A1,A2", "--derived-from", "cohort:joint@v1",
+    ])
+    assert r.returncode == 0, r.stderr
+    conn = casetrack.open_project_db(p / "casetrack.db")
+    try:
+        edges = ad.list_edges(conn)
+        assert any(
+            e["down_node"] == "cohort:vqsr@v1" and e["up_node"] == "cohort:joint@v1"
+            for e in edges
+        ), f"expected edge not found; edges={edges}"
+    finally:
+        conn.close()
+
+
 def test_toml_derived_from_malformed_ref_rejected(tmp_path):
     """A malformed derived_from node-ref fails loudly at schema-load validation."""
     proj = _init_project(tmp_path)

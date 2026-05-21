@@ -159,6 +159,9 @@ def build_qc_subparsers(subparsers) -> None:
     p_appc.add_argument("--uses-references", dest="uses_references", default=None,
                         help="[v0.8] Comma-separated reference keys this cohort "
                              "output consumed (e.g. genome,dbsnp)")
+    p_appc.add_argument("--derived-from", dest="derived_from", default=None,
+                        help="[v0.9] Comma-separated upstream node-refs this artifact "
+                             "derives from (e.g. cohort:joint@v1,reference:pon)")
 
     # ── migrate-cohort ──
     p_migc = subparsers.add_parser(

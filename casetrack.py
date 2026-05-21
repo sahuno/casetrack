@@ -4600,6 +4600,13 @@ def cmd_append_project(args):
                     entity_ids=list(tsv_keys), transaction_id=txn_id,
                     override_refs=_override,
                 )
+            if getattr(args, "derived_from", None):
+                from casetrack_qc.artifact_derivation_cli import record_derivation_edges
+                _ups = [s.strip() for s in args.derived_from.split(",") if s.strip()]
+                for _eid in tsv_keys:
+                    record_derivation_edges(
+                        conn, down=f"analysis:{level}/{_eid}/{analysis}",
+                        ups=_ups, transaction_id=txn_id)
     except _MissingKeys as e:
         conn.close()
         preview = sorted(e.missing)[:5]
@@ -7909,6 +7916,9 @@ Examples:
              "(overrides [analyses.<tool>].uses)")
     p_append.add_argument("--no-track-references", dest="no_track_references",
         action="store_true", help="[v0.8] Skip reference-usage capture for this append")
+    p_append.add_argument("--derived-from", dest="derived_from", default=None,
+        help="[v0.9] Comma-separated upstream node-refs each appended output derives from "
+             "(e.g. cohort:joint@v1,reference:pon)")
     p_append.add_argument(
         "--infer-from-path",
         nargs="?",
