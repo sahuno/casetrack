@@ -448,8 +448,11 @@ def validate_schema(schema: dict) -> None:
     # that write into it — consumed by `casetrack append --infer-from-path`.
     if "layout" in schema:
         _validate_layout(schema["layout"])
+    references = schema.get("references", {})
+    if references:
+        _validate_references(references)
     if "analyses" in schema:
-        _validate_analyses(schema["analyses"])
+        _validate_analyses(schema["analyses"], references=references)
 
 
 def _validate_layout(layout: dict) -> None:
@@ -497,7 +500,7 @@ def _validate_layout(layout: dict) -> None:
             )
 
 
-def _validate_analyses(analyses: dict) -> None:
+def _validate_analyses(analyses: dict, references: dict | None = None) -> None:
     if not isinstance(analyses, dict):
         raise SchemaError("[analyses] must be a table")
     import re as _re
@@ -531,6 +534,46 @@ def _validate_analyses(analyses: dict) -> None:
                 raise SchemaError(
                     f"[analyses.{tool}] summary_tsv must be a non-empty string"
                 )
+        uses = spec.get("uses")
+        if uses is not None:
+            if not isinstance(uses, list) or not all(isinstance(u, str) for u in uses):
+                raise SchemaError(
+                    f"[analyses.{tool}] uses must be a list of reference keys"
+                )
+            known = set((references or {}).keys())
+            for ref_key in uses:
+                if known and ref_key not in known:
+                    raise SchemaError(
+                        f"[analyses.{tool}] uses references unknown ref_key "
+                        f"{ref_key!r}; declare it under [references.{ref_key}]"
+                    )
+
+
+def _validate_references(references: dict) -> None:
+    if not isinstance(references, dict):
+        raise SchemaError("[references] must be a table")
+    import re as _re
+    from casetrack_qc.reference_artifacts import REFERENCE_KINDS
+    key_re = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    for ref_key, spec in references.items():
+        if not key_re.match(ref_key):
+            raise SchemaError(
+                f"[references.{ref_key}] key must be a valid identifier"
+            )
+        if not isinstance(spec, dict):
+            raise SchemaError(f"[references.{ref_key}] must be an inline table")
+        for required in ("path", "version"):
+            val = spec.get(required)
+            if not isinstance(val, str) or not val:
+                raise SchemaError(
+                    f"[references.{ref_key}] missing/invalid required key: {required}"
+                )
+        kind = spec.get("kind")
+        if kind is not None and kind not in REFERENCE_KINDS:
+            raise SchemaError(
+                f"[references.{ref_key}] kind={kind!r} must be one of "
+                f"{list(REFERENCE_KINDS)}"
+            )
 
 
 def _validate_level(level: str, spec: dict) -> None:
