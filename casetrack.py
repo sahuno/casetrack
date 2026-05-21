@@ -1548,6 +1548,9 @@ def cmd_init_project(args):
     from casetrack_qc.cohort_artifacts import (
         ensure_cohort_artifacts_schema as _ensure_cohort_artifacts_schema,
     )
+    from casetrack_qc.reference_artifacts import (
+        ensure_reference_schema as _ensure_reference_schema,
+    )
 
     conn = open_project_db(db_path)
     qc_ddl: list[str] = []
@@ -1558,6 +1561,8 @@ def cmd_init_project(args):
             # Proposal 0009: cohort-artifact sibling tables, created in the same
             # init transaction so fresh projects can record joint VCFs / PoNs.
             _ensure_cohort_artifacts_schema(conn)
+            # Proposal 0010: reference-artifact sibling tables, same init txn.
+            _ensure_reference_schema(conn)
             # v0.6 Part B: write the project_meta row in the same
             # transaction as the QC schema so init is atomic.
             write_project_meta(
