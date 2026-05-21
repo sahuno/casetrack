@@ -176,10 +176,139 @@ def record_edge(conn: sqlite3.Connection, *, down: str, up: str,
     )
 
 
+# ── transitive staleness walk ─────────────────────────────────────────────────
+
+def _resolve_artifact_id(conn: sqlite3.Connection, analysis: str, run_tag: str) -> int | None:
+    """Look up cohort_artifacts.artifact_id by (analysis, run_tag). Returns None if absent."""
+    row = conn.execute(
+        "SELECT artifact_id FROM cohort_artifacts WHERE analysis=? AND run_tag=?",
+        (analysis, run_tag),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _reference_usage_upstreams(conn: sqlite3.Connection, node: str) -> list[str]:
+    """reference_usage rows whose consumer is *node* → reference:<ref_key> edges.
+
+    Treats each 0010 usage edge as a derivation edge so a derived-stale
+    reference reaches its consumers (0011 §6.3). No-op if reference_usage absent.
+    """
+    if not _table_exists(conn, "reference_usage"):
+        return []
+    n = LineageNode.parse(node)
+    if n.scope == "cohort":
+        aid = _resolve_artifact_id(conn, n.analysis, n.run_tag)
+        if aid is None:
+            return []
+        rows = conn.execute(
+            "SELECT ref_key FROM reference_usage WHERE scope='cohort' AND artifact_id=?",
+            (aid,)).fetchall()
+    elif n.scope == "analysis":
+        rows = conn.execute(
+            "SELECT ref_key FROM reference_usage WHERE scope='analysis' AND "
+            "entity_level=? AND entity_id=? AND analysis=?",
+            (n.entity_level, n.entity_id, n.analysis)).fetchall()
+    else:
+        return []
+    return [f"reference:{rk}" for (rk,) in rows]
+
+
+def _all_upstreams(conn: sqlite3.Connection, node: str) -> list[str]:
+    """Union of 0011 artifact_derivation edges and the 0010 reference_usage edges."""
+    return upstream_nodes(conn, node) + _reference_usage_upstreams(conn, node)
+
+
+def _direct_stale(conn: sqlite3.Connection, node: str) -> list[str]:
+    """A node's OWN direct staleness reasons (0009 input + 0010 ref), no recursion.
+
+    reference nodes have no intrinsic direct staleness (only derived).
+    analysis nodes have only 0010 ref-staleness (no 0009 inputs).
+    """
+    n = LineageNode.parse(node)
+    reasons: list[str] = []
+    if n.scope == "cohort":
+        from casetrack_qc import cohort_artifacts as _ca
+        aid = _resolve_artifact_id(conn, n.analysis, n.run_tag)
+        if aid is not None:
+            censored = _ca.artifact_staleness(conn).get(aid, [])
+            if censored:
+                reasons.append(f"inputs censored: {', '.join(sorted(censored))}")
+            ref = _ref_state(conn, scope="cohort", artifact_id=aid)
+            reasons += [f"ref {r}" for r in ref]
+    elif n.scope == "analysis":
+        ref = _ref_state(conn, scope="analysis", entity_level=n.entity_level,
+                         entity_id=n.entity_id, analysis=n.analysis)
+        reasons += [f"ref {r}" for r in ref]
+    # reference scope: no intrinsic direct staleness
+    return reasons
+
+
+def _ref_state(conn: sqlite3.Connection, **kw) -> list[str]:
+    """Return reference staleness reason strings for one output, or [] if fresh/untracked."""
+    if not _table_exists(conn, "reference_usage"):
+        return []
+    from casetrack_qc import reference_artifacts as _ra
+    s = _ra.output_staleness(conn, **kw)
+    return s["reasons"] if s["state"] == "STALE" else []
+
+
+def _is_stale(conn: sqlite3.Connection, node: str, memo: dict,
+              path: set) -> tuple[bool, list[str]]:
+    """is_stale(node) = direct OR any upstream is_stale. Memoized, cycle-guarded.
+
+    *path* is the set of nodes currently being evaluated (the DFS call stack). A
+    back-edge (node already in path) contributes nothing — terminate, return False.
+    *memo* caches the final result once a node's full subgraph is resolved.
+    """
+    if node in memo:
+        return memo[node]
+    if node in path:           # back-edge: terminate with no contribution
+        return (False, [])
+    path = path | {node}       # immutable update so sibling branches are independent
+    reasons = list(_direct_stale(conn, node))
+    for up in _all_upstreams(conn, node):
+        up_stale, up_reasons = _is_stale(conn, up, memo, path)
+        if up_stale:
+            why = f"; {'; '.join(up_reasons)}" if up_reasons else ""
+            reasons.append(f"upstream {up} is STALE{why}")
+    result = (len(reasons) > 0, reasons)
+    memo[node] = result
+    return result
+
+
+def derived_staleness(conn: sqlite3.Connection, node: str) -> dict:
+    """{'state': 'fresh'|'STALE', 'reasons': [...]} for *node*.
+
+    derived_stale = any upstream node is_stale (excludes the node's OWN direct
+    causes — those are 0009 ``stale`` / 0010 ``ref_stale``). Boolean two-state
+    rollup: a node with no upstream-derivation edges is cleanly ``fresh`` (NOT
+    ``untracked`` — proposal 0011 §6.2).
+    """
+    memo: dict = {}
+    reasons: list[str] = []
+    for up in _all_upstreams(conn, node):
+        up_stale, up_reasons = _is_stale(conn, up, memo, {node})
+        if up_stale:
+            why = f"; {'; '.join(up_reasons)}" if up_reasons else ""
+            reasons.append(f"upstream {up} is STALE{why}")
+    return {"state": "STALE" if reasons else "fresh", "reasons": sorted(reasons)}
+
+
+def all_derived_stale(conn: sqlite3.Connection) -> list[dict]:
+    """Every down_node with >=1 derivation edge, annotated with derived staleness."""
+    out: list[dict] = []
+    for (node,) in conn.execute(
+        "SELECT DISTINCT down_node FROM artifact_derivation"
+    ).fetchall():
+        out.append({"node": node, **derived_staleness(conn, node)})
+    return out
+
+
 __all__ = [
     "TIMESTAMP_FMT", "NODE_SCOPES", "DerivationError",
     "artifact_derivation_ddl", "artifact_derivation_indexes",
     "derivation_schema_exists", "ensure_derivation_schema",
     "LineageNode",
     "list_edges", "upstream_nodes", "record_edge",
+    "derived_staleness", "all_derived_stale",
 ]
