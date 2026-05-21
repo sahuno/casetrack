@@ -5660,6 +5660,19 @@ def cmd_dashboard_project(args):
                 }
                 for a in _ca_list(conn)
             ]
+
+        # Proposal 0010: reference-artifact section with ref-staleness badge.
+        # Degrades silently when absent (pre-0010 / no [references] in TOML).
+        from casetrack_qc.reference_artifacts import (
+            reference_schema_exists as _ra_exists,
+            list_references as _ra_list,
+            all_stale_outputs as _ra_stale,
+        )
+        if _ra_exists(conn):
+            qc_info["references"] = [r.to_dict() for r in _ra_list(conn)]
+            qc_info["reference_stale"] = [
+                o for o in _ra_stale(conn) if o["state"] == "STALE"
+            ]
     finally:
         conn.close()
 
@@ -5899,6 +5912,8 @@ def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
 
   {_cohort_artifacts_html(qc_info)}
 
+  {_references_html(qc_info)}
+
   <h2>Patients</h2>
   {"".join(body_sections) if body_sections
      else '<p class="muted">No patients registered yet.</p>'}
@@ -5961,6 +5976,44 @@ def _cohort_artifacts_html(qc_info: dict | None) -> str:
         "<table><thead><tr>"
         "<th>analysis</th><th>run_tag</th><th>inputs</th>"
         "<th>status</th><th>censored inputs</th>"
+        "</tr></thead><tbody>"
+        f"{''.join(rows)}</tbody></table>"
+    )
+
+
+def _references_html(qc_info: dict | None) -> str:
+    """Render the references section (proposal 0010) with ref-stale badge.
+
+    Returns "" when no references are declared so pre-0010 projects render
+    identically to before.
+    """
+    if not qc_info:
+        return ""
+    refs = qc_info.get("references") or []
+    if not refs:
+        return ""
+    esc = html.escape
+    stale = qc_info.get("reference_stale") or []
+    n_stale = len(stale)
+    rows = []
+    for r in refs:
+        rows.append(
+            "<tr>"
+            f"<td>{esc(r['ref_key'])}</td>"
+            f"<td class='id'>{esc(r['version'])}</td>"
+            f"<td>{esc(r.get('kind') or '')}</td>"
+            "</tr>"
+        )
+    if n_stale:
+        badge = f'<span class="qc-chip qc-chip-amber">{n_stale} STALE output(s)</span>'
+    else:
+        badge = '<span class="qc-chip qc-chip-grey">all fresh</span>'
+    return (
+        f"<h2>References <span class='muted'>({len(refs)} declared, "
+        f"{n_stale} stale output(s))</span></h2>"
+        f"{badge}"
+        "<table><thead><tr>"
+        "<th>ref_key</th><th>version</th><th>kind</th>"
         "</tr></thead><tbody>"
         f"{''.join(rows)}</tbody></table>"
     )

@@ -176,3 +176,14 @@ def test_validate_flags_orphan_usage(tmp_path):
                         "--project-dir", str(pdir)], capture_output=True, text=True)
     # Assert on the real signal — the orphan ref_key — not the path-leaked "orphan".
     assert "ghostref" in (r.stdout + r.stderr)
+
+
+def test_dashboard_renders_references_section(tmp_path):
+    pdir = _stale_setup(tmp_path)
+    out = pdir / "dash.html"
+    r = subprocess.run([sys.executable, "-m", "casetrack", "dashboard",
+                        "--project-dir", str(pdir), "--output", str(out)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and out.exists()
+    html = out.read_text()
+    assert "References" in html and "genome" in html
