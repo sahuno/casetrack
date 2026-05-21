@@ -166,6 +166,50 @@ process casetrack_register_project {
     """
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Cohort-level artifacts (proposal 0009).
+ *
+ * A cohort artifact is ONE output derived from MANY assays — a joint-genotyped
+ * VCF, a panel-of-normals, a cohort matrix. The Nextflow shape is a fan-IN: the
+ * per-assay channel collects (`.collect()`) into a single joint process, whose
+ * output is registered once via `casetrack append-cohort`. The contributing
+ * assay_ids are passed as a one-per-line file (`inputs_tsv`) — easiest produced
+ * with `per_assay_ch.map{ it[0] }.collectFile(name: 'inputs.txt', newLine: true)`.
+ *
+ * Input  : tuple(val analysis, val run_tag, path artifact, path inputs_tsv,
+ *                path stats_json)
+ *          - (analysis, run_tag) is the unique key; a re-run uses a new run_tag.
+ *          - inputs_tsv: one assay_id per line ('assay_id' header tolerated).
+ *          - stats_json: cohort-level summary; pass a file containing '{}' if none.
+ * Output : tuple(val analysis, val run_tag) so a downstream report/QC step can
+ *          chain off the confirmed-registered artifact.
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+process casetrack_append_cohort {
+    tag "${analysis}/${run_tag}"
+
+    maxForks 1
+    errorStrategy 'retry'
+    maxRetries 2
+
+    input:
+      tuple val(analysis), val(run_tag), path(artifact), path(inputs_tsv), path(stats_json)
+
+    output:
+      tuple val(analysis), val(run_tag)
+
+    script:
+    """
+    ${params.casetrack_bin} append-cohort \\
+        --project-dir '${params.casetrack_project_dir}' \\
+        --analysis '${analysis}' \\
+        --run-tag '${run_tag}' \\
+        --path '${artifact}' \\
+        --inputs-from '${inputs_tsv}' \\
+        --stats '${stats_json}' ${params.casetrack_extra}
+    """
+}
+
 process casetrack_add_metadata_project {
     tag "add-metadata@${params.casetrack_level}"
 

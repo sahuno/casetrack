@@ -189,6 +189,48 @@ def install_active_views(duckdb_con) -> None:
         pass
 
 
+def install_cohort_artifact_view(duckdb_con) -> None:
+    """Attach a ``_cohort_artifacts`` DuckDB view (proposal 0009).
+
+    Exposes each cohort artifact with two derived columns:
+      - ``n_censored_inputs`` — contributing assays currently excluded by the
+        §4.4 cascade (QC fail/censored or consent-revoked).
+      - ``stale`` — boolean, true when ``n_censored_inputs > 0``.
+
+    Silent no-op on projects without the cohort-artifact tables (pre-0009).
+    """
+    # proj-qualified active-assay set (mirrors build_active_assay_sql, but the
+    # tables live in the attached `proj` catalog inside DuckDB).
+    active_sql = """
+        SELECT a.assay_id
+        FROM proj.assays a
+        JOIN proj.specimens s ON a.specimen_id = s.specimen_id
+        JOIN proj.patients  p ON s.patient_id  = p.patient_id
+        WHERE a.qc_status NOT IN ('fail', 'censored', 'consent_revoked')
+          AND s.qc_status NOT IN ('fail', 'censored', 'consent_revoked')
+          AND p.qc_status NOT IN ('fail', 'censored', 'consent_revoked')
+          AND p.consent_status IN ('consented', 'consented_limited_use')
+    """
+    censored_count = f"""
+        (SELECT COUNT(*) FROM proj.cohort_artifact_inputs ci
+          WHERE ci.artifact_id = ca.artifact_id
+            AND ci.assay_id NOT IN ({active_sql}))
+    """
+    sql = f"""
+        CREATE VIEW "_cohort_artifacts" AS
+        SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
+               ca.n_inputs, ca.stats_json, ca.created_at,
+               {censored_count} AS n_censored_inputs,
+               ({censored_count} > 0) AS stale
+        FROM proj.cohort_artifacts ca
+    """
+    try:
+        duckdb_con.execute(sql)
+    except Exception:
+        # Pre-0009 DBs lack the tables — skip so `query` still works.
+        pass
+
+
 __all__ = [
     "DEFAULT_CONSENT_INCLUDE",
     "DEFAULT_QC_EXCLUDE",
@@ -198,4 +240,5 @@ __all__ = [
     "build_active_assay_sql",
     "exclusion_breakdown",
     "install_active_views",
+    "install_cohort_artifact_view",
 ]

@@ -34,6 +34,7 @@ from typing import Any
 
 from casetrack_mcp.tools import (
     MCPToolError,
+    cohort_artifacts_tool,
     list_projects_tool,
     query_tool,
 )
@@ -77,11 +78,35 @@ _QUERY_SCHEMA: dict[str, Any] = {
                 "A single SELECT or WITH statement. Non-SELECT SQL is "
                 "rejected — use the casetrack CLI to mutate data. "
                 "The raw join view is `_`; the QC/consent-cascaded view "
-                "is `_active`."
+                "is `_active`. Cohort-level artifacts are in the "
+                "`cohort_artifacts` / `cohort_artifact_inputs` tables — for "
+                "their derived staleness, use casetrack_cohort_artifacts."
             ),
         },
     },
     "required": ["project_id", "sql"],
+    "additionalProperties": False,
+}
+
+_COHORT_ARTIFACTS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "project_id": {
+            "type": "string",
+            "description": (
+                "DNS-label slug identifying a casetrack project in the local "
+                "registry. Call casetrack_list_projects first if unknown."
+            ),
+        },
+        "stale_only": {
+            "type": "boolean",
+            "description": (
+                "When true, return only artifacts with one or more censored / "
+                "consent-revoked contributing assays. Default false."
+            ),
+        },
+    },
+    "required": ["project_id"],
     "additionalProperties": False,
 }
 
@@ -120,6 +145,18 @@ def _build_server() -> "Server":
                 ),
                 inputSchema=_QUERY_SCHEMA,
             ),
+            Tool(
+                name="casetrack_cohort_artifacts",
+                description=(
+                    "List cohort-level artifacts (joint VCFs, panels-of-normals, "
+                    "cohort matrices) for a project, each with read-time "
+                    "staleness: `stale` is true when a contributing assay is "
+                    "censored or consent-revoked. Pass stale_only=true to see "
+                    "only artifacts needing attention. project_id must be a slug "
+                    "from casetrack_list_projects."
+                ),
+                inputSchema=_COHORT_ARTIFACTS_SCHEMA,
+            ),
         ]
 
     @app.call_tool()
@@ -131,6 +168,11 @@ def _build_server() -> "Server":
                 project_id = arguments.get("project_id")
                 sql = arguments.get("sql")
                 payload = query_tool(project_id, sql)
+            elif name == "casetrack_cohort_artifacts":
+                payload = cohort_artifacts_tool(
+                    arguments.get("project_id"),
+                    stale_only=bool(arguments.get("stale_only", False)),
+                )
             else:
                 raise MCPToolError(f"unknown tool: {name!r}")
         except MCPToolError as e:

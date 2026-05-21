@@ -4,6 +4,48 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Cohort-level artifacts — a first-class home for analysis outputs that span many
+samples (joint-genotyped VCFs, panels-of-normals, cohort matrices). See
+[proposal 0009](docs/proposals/0009-cohort-level-artifacts.md).
+
+### Added
+
+- **`cohort_artifacts` + `cohort_artifact_inputs` tables** — additive sibling
+  tables (the `qc_events` pattern), created by `casetrack init`; the three-level
+  core is untouched. One row per cohort output, keyed by `(analysis, run_tag)`,
+  with a many-to-many join to contributing `assay_id`s. The
+  4th-hierarchy-level alternative was rejected (proposal 0009 §7).
+- **`casetrack append-cohort`** — register a cohort artifact + its assay lineage
+  in one transaction (`--inputs a,b` or `--inputs-from FILE`, optional `--stats`
+  JSON and `--checksum`). Writes an `action='append_cohort'` provenance entry.
+  A distinct `run_tag` gives v1/v2 of a re-genotyping run separate identity.
+- **`casetrack cohort-artifacts`** — list artifacts with **read-time staleness**:
+  an artifact is flagged `STALE` when any contributing assay is currently
+  censored or consent-revoked, derived live from the QC/consent cascade
+  (proposal 0002 §4.4) with no stored flag. `--stale-only`, `--fmt table|tsv|json`.
+- **Staleness surfaced in the existing read paths** (proposal 0009 §4):
+  `casetrack status` appends a cohort-artifact section (count + per-artifact
+  fresh/STALE) in the human view; `casetrack query` exposes a `_cohort_artifacts`
+  DuckDB view with derived `n_censored_inputs` / `stale` columns; `casetrack
+  export --include-cohort-artifacts` writes the `cohort_artifacts` (with those
+  derived columns) and `cohort_artifact_inputs` tables (auto-enabled for XLSX).
+- **`casetrack migrate-cohort`** — additive migration to create the two tables on
+  a pre-0009 project (`--dry-run` supported).
+- **Dashboard** — `casetrack dashboard` renders a "Cohort artifacts" section with
+  per-artifact `fresh`/`STALE` badges and the censored inputs behind each STALE.
+- **MCP** — new `casetrack_cohort_artifacts` tool surfaces artifacts + derived
+  staleness to AI agents (companion to the CLI command), so an agent doesn't have
+  to hand-write the cascade SQL. The `casetrack_query` schema now points at the
+  `cohort_artifacts` / `cohort_artifact_inputs` tables.
+- **`casetrack_append_cohort` Nextflow process** (`examples/nextflow/casetrack.nf`)
+  — the fan-in companion to `casetrack_append_project`; registers a cohort
+  artifact + its assay lineage (passed as a `collectFile` inputs manifest).
+- **`examples/giab_chr21/run_cohort_demo.sh`** — runnable cohort demo with two
+  cheap engines (`--engine mock` zero-compute; `--engine bcftools` real
+  multi-sample merge), ending on the censor → STALE cascade punchline.
+
 ## [0.5.0] — 2026-04-18
 
 Tool-first results directory convention + one-flag `append` via path inference.

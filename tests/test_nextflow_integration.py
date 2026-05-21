@@ -183,6 +183,105 @@ def test_nextflow_module_command_runs_end_to_end(
     assert pd.notna(df.loc["SAMPLE_01", "modkit_methylation_done"])
 
 
+# ── cohort-artifact process (proposal 0009) ────────────────────────────────
+
+
+def test_module_declares_cohort_process():
+    src = (NF_DIR / "casetrack.nf").read_text()
+    assert re.search(r"process\s+casetrack_append_cohort\s*\{", src)
+
+
+def test_cohort_process_inputs_outputs():
+    """`casetrack_append_cohort` takes the (analysis, run_tag, artifact,
+    inputs_tsv, stats_json) fan-in tuple and re-emits (analysis, run_tag)."""
+    src = (NF_DIR / "casetrack.nf").read_text()
+    m = re.search(
+        r"process\s+casetrack_append_cohort\s*\{(?P<body>.*?)^\}",
+        src, re.S | re.M,
+    )
+    assert m, "could not isolate casetrack_append_cohort process body"
+    body = m.group("body")
+    assert re.search(
+        r"tuple\s+val\(analysis\),\s*val\(run_tag\),\s*path\(artifact\),"
+        r"\s*path\(inputs_tsv\),\s*path\(stats_json\)",
+        body,
+    )
+    assert re.search(r"output:\s*\n\s*tuple\s+val\(analysis\),\s*val\(run_tag\)", body)
+    assert "maxForks 1" in body
+    assert "errorStrategy 'retry'" in body
+    assert "append-cohort" in body
+    assert "--inputs-from" in body
+
+
+def _extract_script(src: str, process_name: str) -> str:
+    m = re.search(
+        rf"process\s+{process_name}\s*\{{.*?script:\s*.*?\"{{3}}(?P<body>.*?)\"{{3}}",
+        src, re.S,
+    )
+    assert m, f"could not find script block in {process_name}"
+    return m.group("body")
+
+
+def test_nextflow_cohort_command_runs_end_to_end(tmp_path: Path):
+    """Execute the exact shell block casetrack_append_cohort would run and
+    verify the cohort artifact + its assay lineage land in the project."""
+    from casetrack_qc import cohort_artifacts as ca
+
+    proj = tmp_path / "proj"
+    casetrack.cmd_init(argparse.Namespace(
+        manifest=None, project_dir=str(proj), samples=None, key="sample_id",
+        metadata=None, cols=None, from_template="hgsoc",
+        project_name="nf_cohort", force=False,
+    ))
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        with casetrack.begin_immediate(conn):
+            conn.executescript(
+                "INSERT INTO patients (patient_id) VALUES ('P1'), ('P2');"
+                "INSERT INTO specimens (specimen_id, patient_id, tissue_site) "
+                "  VALUES ('P1-t', 'P1', 'tumor'), ('P2-t', 'P2', 'tumor');"
+                "INSERT INTO assays (assay_id, specimen_id, assay_type) VALUES "
+                "  ('P1-t-ONT', 'P1-t', 'ONT'), ('P2-t-ONT', 'P2-t', 'ONT');"
+            )
+    finally:
+        conn.close()
+
+    artifact = tmp_path / "cohort.vcf.gz"
+    artifact.write_text("MOCK")
+    inputs_tsv = tmp_path / "inputs.txt"
+    inputs_tsv.write_text("P1-t-ONT\nP2-t-ONT\n")
+    stats_json = tmp_path / "stats.json"
+    stats_json.write_text('{"n_variants": 42}')
+
+    src = (NF_DIR / "casetrack.nf").read_text()
+    raw_script = _extract_script(src, "casetrack_append_cohort")
+    casetrack_bin = f"{sys.executable} {Path(casetrack.__file__)}"
+    rendered = _render_script(raw_script, {
+        "params.casetrack_bin":         casetrack_bin,
+        "params.casetrack_project_dir": str(proj),
+        "params.casetrack_extra":       "",
+        "analysis":                     "joint_genotype",
+        "run_tag":                      "20260520_demo",
+        "artifact":                     str(artifact),
+        "inputs_tsv":                   str(inputs_tsv),
+        "stats_json":                   str(stats_json),
+    })
+    remaining = re.findall(r"\$\{[^}]+\}", rendered)
+    assert not remaining, f"unsubstituted placeholders: {remaining}"
+
+    subprocess.run(["bash", "-c", rendered], check=True,
+                   capture_output=True, text=True)
+
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        art = ca.get_artifact_by_key(conn, "joint_genotype", "20260520_demo")
+        assert art is not None
+        assert art.n_inputs == 2
+        assert ca.artifact_inputs(conn, art.artifact_id) == ["P1-t-ONT", "P2-t-ONT"]
+    finally:
+        conn.close()
+
+
 def test_nextflow_module_command_with_allow_new(
     tmp_project: Path, samples_file: Path
 ):

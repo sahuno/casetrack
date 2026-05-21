@@ -287,6 +287,9 @@ and exact SQL.
 | `link-sources`   | **v0.6** — record which run assays fed a specimen or merged assay (Mode A: run→merged-assay; Mode B: run→specimen) |
 | `project`        | **v0.7** — project lifecycle (`set-status`, `status`) — active / complete / archived |
 | `migrate-status` | **v0.7** — add lifecycle `status` column to `project_meta` (idempotent)       |
+| `append-cohort`  | **v0.7** — register a cohort-level artifact (joint VCF, PoN, matrix) + its assay lineage (proposal 0009) |
+| `cohort-artifacts`| **v0.7** — list cohort-level artifacts with read-time staleness (`--stale-only`) |
+| `migrate-cohort` | **v0.7** — additive: create the cohort-artifact tables on a pre-0009 project   |
 
 `casetrack <cmd> --help` for the full option list on any subcommand.
 

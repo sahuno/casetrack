@@ -218,3 +218,89 @@ def query_tool(project_id: str, sql: str, *, row_limit: int = 10_000) -> dict:
         "truncated": truncated,
         "row_limit": row_limit,
     }
+
+
+def _resolve_and_open(project_id: str):
+    """Resolve a registry project_id to (resolved_path, open sqlite conn),
+    enforcing the same closed-world lookup + hard-gate as ``query_tool``.
+
+    Raises :class:`MCPToolError` on every failure mode so the server adapter
+    surfaces a readable message. Caller must close the returned connection.
+    """
+    if not isinstance(project_id, str) or not project_id:
+        raise MCPToolError("project_id must be a non-empty string")
+    resolved = casetrack.registry_resolve(project_id)
+    if resolved is None:
+        known = sorted((_read_registry().get("projects") or {}).keys())
+        hint = (f" Known project_ids: {', '.join(known)}." if known
+                else " No projects are registered. Run `casetrack init ...` to create one.")
+        raise MCPToolError(
+            f"project_id {project_id!r} is not in the casetrack registry.{hint}"
+        )
+    db_path = resolved / casetrack.PROJECT_DB_NAME
+    if not db_path.exists():
+        raise MCPToolError(
+            f"casetrack.db not found for project {project_id!r} at {resolved}. "
+            f"The registry entry may be stale."
+        )
+    try:
+        schema = casetrack.load_schema(resolved / casetrack.PROJECT_TOML_NAME)
+    except casetrack.SchemaError as e:
+        raise MCPToolError(f"schema load failed for project {project_id!r}: {e}") from e
+    conn = casetrack.open_project_db(db_path)
+    try:
+        casetrack.require_project_identity_or_fail(conn, schema, resolved)
+        casetrack.check_project_identity_consistency(conn, schema, resolved)
+    except ValueError as e:
+        conn.close()
+        raise MCPToolError(str(e)) from e
+    return resolved, conn
+
+
+def cohort_artifacts_tool(project_id: str, *, stale_only: bool = False) -> dict:
+    """Return cohort-level artifacts (proposal 0009) with read-time staleness.
+
+    An artifact is ``stale`` when one or more of its contributing assays is
+    currently censored or consent-revoked (the §4.4 cascade). This is the
+    agent-facing companion to the `casetrack cohort-artifacts` CLI command —
+    discoverable without the agent having to hand-write the cascade SQL.
+
+    Returns ``{project_id, project_path, n_artifacts, n_stale, artifacts:[...]}``.
+    On a pre-0009 project (no cohort-artifact tables), ``artifacts`` is empty.
+    """
+    from casetrack_qc.cohort_artifacts import (
+        artifact_staleness as _artifact_staleness,
+        cohort_artifacts_schema_exists as _ca_schema_exists,
+        list_artifacts as _list_artifacts,
+    )
+
+    resolved, conn = _resolve_and_open(project_id)
+    try:
+        artifacts: list[dict] = []
+        if _ca_schema_exists(conn):
+            stale_map = _artifact_staleness(conn)
+            for a in _list_artifacts(conn):
+                censored = stale_map.get(a.artifact_id, [])
+                if stale_only and not censored:
+                    continue
+                artifacts.append({
+                    "artifact_id": a.artifact_id,
+                    "analysis": a.analysis,
+                    "run_tag": a.run_tag,
+                    "path": a.path,
+                    "n_inputs": a.n_inputs,
+                    "stale": bool(censored),
+                    "n_censored_inputs": len(censored),
+                    "censored_inputs": censored,
+                })
+    finally:
+        conn.close()
+
+    casetrack.registry_touch(project_id)
+    return {
+        "project_id": project_id,
+        "project_path": str(resolved),
+        "n_artifacts": len(artifacts),
+        "n_stale": sum(1 for a in artifacts if a["stale"]),
+        "artifacts": artifacts,
+    }

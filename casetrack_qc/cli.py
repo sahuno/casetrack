@@ -11,6 +11,11 @@ import argparse
 
 from casetrack_qc.censor import cmd_censor, cmd_qc_history, cmd_uncensor
 from casetrack_qc.cohort import cmd_cohort
+from casetrack_qc.cohort_artifacts_cli import (
+    cmd_append_cohort,
+    cmd_cohort_artifacts,
+    cmd_migrate_cohort,
+)
 from casetrack_qc.migrate import cmd_migrate_qc
 
 
@@ -124,6 +129,48 @@ def build_qc_subparsers(subparsers) -> None:
     p_cohort.add_argument("--fmt", choices=["table", "tsv", "json", "md"],
                           default="table")
 
+    # ── append-cohort ── (proposal 0009)
+    p_appc = subparsers.add_parser(
+        "append-cohort",
+        help="[v0.7] Register a cohort-level artifact (joint VCF, PoN, matrix) "
+             "+ its assay lineage",
+    )
+    p_appc.add_argument("--project-dir", required=True)
+    p_appc.add_argument("--analysis", required=True,
+                        help="Analysis name, e.g. joint_genotype")
+    p_appc.add_argument("--run-tag", dest="run_tag", required=True,
+                        help="Run identifier; (analysis, run_tag) is the unique key")
+    p_appc.add_argument("--path", required=True, help="Path to the artifact on disk")
+    p_appc.add_argument("--inputs",
+                        help="Comma-separated contributing assay_ids")
+    p_appc.add_argument("--inputs-from", dest="inputs_from",
+                        help="File of assay_ids (one per line; 'assay_id' header "
+                             "and extra TSV columns tolerated)")
+    p_appc.add_argument("--stats", help="JSON file of cohort-level summary stats")
+    p_appc.add_argument("--checksum", help="Artifact checksum (e.g. sha256)")
+    p_appc.add_argument("--created-by", dest="created_by",
+                        help="Override the recorded actor (default: manual:$USER)")
+
+    # ── migrate-cohort ──
+    p_migc = subparsers.add_parser(
+        "migrate-cohort",
+        help="[v0.7] Additive: create cohort-artifact tables on a pre-0009 project",
+    )
+    p_migc.add_argument("--project-dir", required=True)
+    p_migc.add_argument("--dry-run", action="store_true",
+                        help="Print the plan, make no changes")
+
+    # ── cohort-artifacts ──
+    p_calist = subparsers.add_parser(
+        "cohort-artifacts",
+        help="[v0.7] List cohort-level artifacts with read-time staleness",
+    )
+    p_calist.add_argument("--project-dir", required=True)
+    p_calist.add_argument("--fmt", choices=["table", "tsv", "json"],
+                         default="table")
+    p_calist.add_argument("--stale-only", dest="stale_only", action="store_true",
+                         help="Show only artifacts with one or more censored inputs")
+
 
 def qc_command_dispatch() -> dict:
     """Command-name → function map that ``casetrack.main()`` merges into its own."""
@@ -133,4 +180,7 @@ def qc_command_dispatch() -> dict:
         "qc-history": cmd_qc_history,
         "migrate-qc": cmd_migrate_qc,
         "cohort": cmd_cohort,
+        "append-cohort": cmd_append_cohort,
+        "migrate-cohort": cmd_migrate_cohort,
+        "cohort-artifacts": cmd_cohort_artifacts,
     }
