@@ -581,6 +581,19 @@ def _validate_references(references: dict) -> None:
                 raise SchemaError(
                     f"[references.{ref_key}] derived_from must be a list of node-refs"
                 )
+            # Validate node-ref format at schema-load time (like kind above), so a
+            # malformed ref fails loudly here instead of being silently warn-skipped
+            # at `schema apply` write time.
+            from casetrack_qc.artifact_derivation import (
+                LineageNode as _LineageNode, DerivationError as _DerivErr,
+            )
+            for entry in df:
+                try:
+                    _LineageNode.parse(entry)
+                except _DerivErr as exc:
+                    raise SchemaError(
+                        f"[references.{ref_key}] derived_from {entry!r}: {exc}"
+                    ) from exc
 
 
 def _validate_level(level: str, spec: dict) -> None:
@@ -4860,6 +4873,12 @@ def _schema_apply(project_dir: Path, schema: dict, issues: list[dict]) -> None:
         from casetrack_qc.reference_artifacts import (
             ensure_reference_schema, sync_references_from_toml,
         )
+        # Proposal 0011: derivation imports alongside the 0010 ones.
+        from casetrack_qc.artifact_derivation import (
+            ensure_derivation_schema as _ensure_deriv,
+            record_edge as _record_edge,
+            DerivationError as _DerivErr,
+        )
         txn_id = _new_transaction_id()
         conn = open_project_db(project_dir / PROJECT_DB_NAME)
         try:
@@ -4867,11 +4886,9 @@ def _schema_apply(project_dir: Path, schema: dict, issues: list[dict]) -> None:
                 ensure_reference_schema(conn)
                 ref_changes = sync_references_from_toml(conn, references)
                 # Proposal 0011: materialize [references.<key>].derived_from edges.
-                from casetrack_qc.artifact_derivation import (
-                    ensure_derivation_schema as _ensure_deriv,
-                    record_edge as _record_edge,
-                    DerivationError as _DerivErr,
-                )
+                # _ensure_deriv here doubles as the implicit migration path for a
+                # pre-0011 project (same posture as ensure_reference_schema above);
+                # `migrate-derivation` remains the explicit, no-[references] route.
                 _ensure_deriv(conn)
                 for ref_key, spec in references.items():
                     for up in (spec.get("derived_from") or []):
@@ -4880,7 +4897,8 @@ def _schema_apply(project_dir: Path, schema: dict, issues: list[dict]) -> None:
                                          transaction_id=txn_id)
                         except _DerivErr as e:
                             print(
-                                f"Warning: skipping derived_from for {ref_key}: {e}",
+                                f"Warning: skipping derived_from edge "
+                                f"reference:{ref_key} <- {up}: {e}",
                                 file=sys.stderr,
                             )
         finally:

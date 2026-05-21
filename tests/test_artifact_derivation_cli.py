@@ -233,3 +233,22 @@ def test_toml_derived_from_materialized_on_schema_apply(tmp_path):
         ), f"expected edge not found; edges={edges}"
     finally:
         conn.close()
+
+
+def test_toml_derived_from_malformed_ref_rejected(tmp_path):
+    """A malformed derived_from node-ref fails loudly at schema-load validation."""
+    proj = _init_project(tmp_path)
+    toml_path = proj / "casetrack.toml"
+    toml_path.write_text(
+        toml_path.read_text()
+        + (
+            '\n[references.pon]\n'
+            'path = "/x/pon.vcf"\n'
+            'version = "pon_v1"\n'
+            'kind = "known_variants"\n'
+            'derived_from = ["not-a-valid-node-ref"]\n'
+        )
+    )
+    r = _run(["schema", "apply", "--project-dir", str(proj)])
+    assert r.returncode != 0
+    assert "derived_from" in (r.stderr + r.stdout)
