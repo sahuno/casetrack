@@ -6485,6 +6485,23 @@ def cmd_export_project(args):
                         out_path = output / f"{tbl}{ext}"
                     _write_df(df_ref, out_path)
                     written.append((tbl, out_path, len(df_ref)))
+
+        # Proposal 0011: artifact_derivation table. Auto for XLSX.
+        include_deriv = getattr(args, "include_derivation", False) or (
+            ext == ".xlsx" and not args.sql and shape != "joined"
+        )
+        if include_deriv:
+            from casetrack_qc.artifact_derivation import (
+                derivation_schema_exists as _deriv_exists,
+            )
+            if _deriv_exists(conn):
+                df_d = pd.read_sql_query("SELECT * FROM artifact_derivation", conn)
+                if prefix_mode:
+                    out_path = Path(f"{prefix_base}.artifact_derivation{ext}")
+                else:
+                    out_path = output / f"artifact_derivation{ext}"
+                _write_df(df_d, out_path)
+                written.append(("artifact_derivation", out_path, len(df_d)))
     finally:
         conn.close()
 
@@ -8275,6 +8292,11 @@ Examples:
     p_export.add_argument(
         "--include-references", action="store_true",
         help="[v0.8] Also export reference_artifacts + reference_usage tables "
+             "(auto-enabled for XLSX multi-sheet output)",
+    )
+    p_export.add_argument(
+        "--include-derivation", dest="include_derivation", action="store_true",
+        help="[v0.9] Also export the artifact_derivation table "
              "(auto-enabled for XLSX multi-sheet output)",
     )
 

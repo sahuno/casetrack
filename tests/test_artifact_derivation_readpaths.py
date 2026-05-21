@@ -312,3 +312,22 @@ def test_cohort_view_ref_stale_survives_without_derivation_table(tmp_path):
     assert bool(row["ref_stale"]) is True, (
         f"Expected ref_stale=True after version bump, got {row['ref_stale']!r}"
     )
+
+
+# ── Task 10: export --include-derivation (0011 §6.5) ─────────────────────────
+
+
+def test_export_include_derivation(tmp_path):
+    """``export --include-derivation`` writes artifact_derivation.tsv containing
+    the recorded edge (annot <- joint)."""
+    p = _proj(tmp_path)
+    out = tmp_path / "exp"          # directory → ext = .tsv (no prefix_mode)
+    r = _run(["export", "--project-dir", str(p),
+              "--output", str(out), "--include-derivation"])
+    assert r.returncode == 0, r.stderr
+    deriv_file = out / "artifact_derivation.tsv"
+    assert deriv_file.exists(), f"artifact_derivation.tsv not written; stdout={r.stdout!r}"
+    content = deriv_file.read_text()
+    # The edge recorded in _proj: down=cohort:annot@v1, up=cohort:joint@v1
+    assert "cohort:annot@v1" in content
+    assert "cohort:joint@v1" in content
