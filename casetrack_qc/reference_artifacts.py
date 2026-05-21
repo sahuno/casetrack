@@ -96,8 +96,116 @@ def ensure_reference_schema(conn: sqlite3.Connection) -> list[str]:
     return executed
 
 
+class ReferenceError(Exception):
+    """Raised when a reference operation violates an enforced invariant."""
+
+
+@dataclass
+class ReferenceArtifact:
+    ref_key: str
+    path: str
+    version: str
+    kind: str | None
+    checksum: str | None
+    updated_at: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def get_reference(conn: sqlite3.Connection, ref_key: str) -> "ReferenceArtifact | None":
+    row = conn.execute(
+        "SELECT ref_key, path, version, kind, checksum, updated_at "
+        "FROM reference_artifacts WHERE ref_key = ?", (ref_key,)
+    ).fetchone()
+    return ReferenceArtifact(*row) if row else None
+
+
+def list_references(conn: sqlite3.Connection) -> list["ReferenceArtifact"]:
+    rows = conn.execute(
+        "SELECT ref_key, path, version, kind, checksum, updated_at "
+        "FROM reference_artifacts ORDER BY ref_key"
+    ).fetchall()
+    return [ReferenceArtifact(*r) for r in rows]
+
+
+def sync_references_from_toml(conn: sqlite3.Connection, toml_refs: dict) -> list[dict]:
+    """Make reference_artifacts match the TOML [references] block.
+
+    Inserts new refs, updates changed path/version/kind/checksum. Returns the
+    list of version changes ({ref_key, old_version, new_version}) so the caller
+    can write reference_version_change provenance. Removal from TOML does NOT
+    delete the row here (a usage row pointing at a removed ref must still read
+    STALE — 0010 §6.1); removal handling is left to a future doctor check.
+    """
+    now = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    changes: list[dict] = []
+    for ref_key, spec in toml_refs.items():
+        existing = get_reference(conn, ref_key)
+        new_version = spec["version"]
+        if existing is None:
+            conn.execute(
+                "INSERT INTO reference_artifacts "
+                "(ref_key, path, version, kind, checksum, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (ref_key, spec["path"], new_version, spec.get("kind"),
+                 spec.get("checksum"), now),
+            )
+            changes.append({"ref_key": ref_key, "old_version": None,
+                            "new_version": new_version})
+        elif (existing.version != new_version or existing.path != spec["path"]
+              or existing.kind != spec.get("kind")
+              or existing.checksum != spec.get("checksum")):
+            conn.execute(
+                "UPDATE reference_artifacts SET path=?, version=?, kind=?, "
+                "checksum=?, updated_at=? WHERE ref_key=?",
+                (spec["path"], new_version, spec.get("kind"),
+                 spec.get("checksum"), now, ref_key),
+            )
+            if existing.version != new_version:
+                changes.append({"ref_key": ref_key,
+                                "old_version": existing.version,
+                                "new_version": new_version})
+    return changes
+
+
+def record_usage(conn: sqlite3.Connection, *, scope: str, ref_key: str,
+                 version_used: str, transaction_id: str,
+                 entity_level: str | None = None,
+                 entity_id: str | None = None,
+                 analysis: str | None = None,
+                 artifact_id: int | None = None,
+                 recorded_at: str | None = None) -> None:
+    """Upsert one (output × ref) usage edge. Re-append overwrites version_used."""
+    if recorded_at is None:
+        recorded_at = datetime.datetime.now().strftime(TIMESTAMP_FMT)
+    if scope == "analysis":
+        conn.execute(
+            "DELETE FROM reference_usage WHERE scope='analysis' AND "
+            "entity_level=? AND entity_id=? AND analysis=? AND ref_key=?",
+            (entity_level, entity_id, analysis, ref_key),
+        )
+    elif scope == "cohort":
+        conn.execute(
+            "DELETE FROM reference_usage WHERE scope='cohort' AND "
+            "artifact_id=? AND ref_key=?", (artifact_id, ref_key),
+        )
+    else:
+        raise ReferenceError(f"unknown usage scope {scope!r}")
+    conn.execute(
+        "INSERT INTO reference_usage (scope, entity_level, entity_id, analysis, "
+        "artifact_id, ref_key, version_used, recorded_at, transaction_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (scope, entity_level, entity_id, analysis, artifact_id, ref_key,
+         version_used, recorded_at, transaction_id),
+    )
+
+
 __all__ = [
     "TIMESTAMP_FMT", "REFERENCE_KINDS",
     "reference_artifacts_ddl", "reference_usage_ddl", "reference_usage_indexes",
     "reference_schema_exists", "ensure_reference_schema",
+    "ReferenceError", "ReferenceArtifact",
+    "get_reference", "list_references",
+    "sync_references_from_toml", "record_usage",
 ]
