@@ -42,6 +42,7 @@ def cohort_artifacts_ddl() -> str:
         "    checksum       TEXT,\n"
         "    n_inputs       INTEGER NOT NULL,\n"
         "    stats_json     TEXT,\n"
+        "    region_scope   TEXT,\n"
         "    created_at     TEXT NOT NULL,\n"
         "    created_by     TEXT,\n"
         "    transaction_id TEXT NOT NULL,\n"
@@ -56,6 +57,7 @@ def cohort_artifact_inputs_ddl() -> str:
         "    artifact_id INTEGER NOT NULL "
         "REFERENCES cohort_artifacts(artifact_id) ON DELETE CASCADE,\n"
         "    assay_id    TEXT NOT NULL REFERENCES assays(assay_id) ON DELETE RESTRICT,\n"
+        "    role        TEXT,\n"
         "    PRIMARY KEY (artifact_id, assay_id)\n"
         ")"
     )
@@ -79,6 +81,11 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         (name,),
     ).fetchone()
     return row is not None
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cur = conn.execute(f'PRAGMA table_info("{table}")')
+    return any(row[1] == column for row in cur.fetchall())
 
 
 def cohort_artifacts_schema_exists(conn: sqlite3.Connection) -> bool:
@@ -107,6 +114,39 @@ def ensure_cohort_artifacts_schema(conn: sqlite3.Connection) -> list[str]:
         for idx_ddl in cohort_artifacts_indexes():
             conn.execute(idx_ddl)
             executed.append(idx_ddl)
+    executed.extend(ensure_region_scope_columns(conn))
+    return executed
+
+
+def ensure_region_scope_columns(conn: sqlite3.Connection) -> list[str]:
+    """Add the proposal-0013 columns to existing 0009 tables. Idempotent.
+
+    ``region_scope`` on ``cohort_artifacts`` and ``role`` on
+    ``cohort_artifact_inputs``. No-op (returns ``[]``) when the tables are
+    absent (pre-0009) or the columns already exist (fresh DDL or already
+    migrated). Caller owns the transaction.
+    """
+    executed: list[str] = []
+    if _table_exists(conn, "cohort_artifacts") and not _column_exists(
+        conn, "cohort_artifacts", "region_scope"
+    ):
+        sql = "ALTER TABLE cohort_artifacts ADD COLUMN region_scope TEXT"
+        conn.execute(sql)
+        executed.append(sql)
+    if _table_exists(conn, "cohort_artifact_inputs") and not _column_exists(
+        conn, "cohort_artifact_inputs", "role"
+    ):
+        sql = "ALTER TABLE cohort_artifact_inputs ADD COLUMN role TEXT"
+        conn.execute(sql)
+        executed.append(sql)
+    # after adding the region_scope column, create the grouping index:
+    if executed and _table_exists(conn, "cohort_artifacts"):
+        idx = (
+            "CREATE INDEX IF NOT EXISTS idx_cohort_artifacts_scope "
+            "ON cohort_artifacts(region_scope)"
+        )
+        conn.execute(idx)
+        executed.append(idx)
     return executed
 
 
@@ -287,6 +327,7 @@ __all__ = [
     "cohort_artifacts_indexes",
     "cohort_artifacts_schema_exists",
     "ensure_cohort_artifacts_schema",
+    "ensure_region_scope_columns",
     "insert_artifact",
     "add_artifact_inputs",
     "get_artifact",
