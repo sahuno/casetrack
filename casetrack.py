@@ -6806,7 +6806,7 @@ class _MetadataRouting(Exception):
 def _upsert_level(conn, *, level, frame, schema, allow_new, overwrite):
     """Validate ``frame`` against ``level``'s schema and upsert it into the level table.
 
-    Caller owns the transaction. Returns {'inserted': n, 'updated': m, 'skipped': 0,
+    Caller owns the transaction. Returns {'inserted': n, 'updated': m,
     'meta_cols': [...], 'sql': [...]}. Raises _MetadataRouting (missing keys without
     allow_new, or missing parents), ValueError (undeclared column / malformed id),
     or sqlite3.IntegrityError. A frame with only the key column (no attribute/FK
@@ -6826,11 +6826,15 @@ def _upsert_level(conn, *, level, frame, schema, allow_new, overwrite):
     meta_cols = [c for c in frame.columns if c != key_col]
     declared_cols = set(level_spec["columns"])
     unknown = [c for c in meta_cols if c not in declared_cols]
+    # Pre-checked by cmd_add_metadata_project for richer UX; re-validated here so
+    # direct callers (cmd_register_cohort) get a deterministic error.
     if unknown:
         raise ValueError(
             f"columns not declared in casetrack.toml under [levels.{level}.columns]: {unknown}"
         )
 
+    # Pre-checked by cmd_add_metadata_project for richer UX; re-validated here so
+    # direct callers (cmd_register_cohort) get a deterministic error.
     if allow_new and parent_key_col and parent_key_col not in frame.columns:
         raise ValueError(
             f"inserting new {level}(s) requires the parent FK column {parent_key_col!r}"
@@ -6866,7 +6870,14 @@ def _upsert_level(conn, *, level, frame, schema, allow_new, overwrite):
         raise _MetadataRouting(set(), missing_parents)
 
     # UPDATE existing keys (fill-only unless overwrite). No-op when meta_cols empty.
-    update_keys = [k for k in tsv_keys if k in existing_keys]
+    # Dedupe so duplicate input rows don't inflate n_updated or cause redundant UPDATEs;
+    # idx_by_key already maps each key to its last occurrence, so deduping is safe.
+    _update_seen: set = set()
+    update_keys = []
+    for _k in tsv_keys:
+        if _k in existing_keys and _k not in _update_seen:
+            update_keys.append(_k)
+            _update_seen.add(_k)
     if update_keys and meta_cols:
         if overwrite:
             set_clauses = ", ".join(f"{_quote_ident(c)} = ?" for c in meta_cols)
@@ -6921,7 +6932,6 @@ def _upsert_level(conn, *, level, frame, schema, allow_new, overwrite):
     return {
         "inserted": n_inserted,
         "updated": n_updated,
-        "skipped": 0,
         "meta_cols": meta_cols,
         "sql": executed_sql,
     }
