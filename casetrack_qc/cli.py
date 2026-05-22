@@ -15,6 +15,7 @@ from casetrack_qc.cohort_artifacts_cli import (
     cmd_append_cohort,
     cmd_cohort_artifacts,
     cmd_migrate_cohort,
+    cmd_migrate_region_scope,
 )
 from casetrack_qc.migrate import cmd_migrate_qc
 from casetrack_qc.reference_artifacts_cli import cmd_migrate_references, cmd_references
@@ -172,6 +173,15 @@ def build_qc_subparsers(subparsers) -> None:
     p_migc.add_argument("--dry-run", action="store_true",
                         help="Print the plan, make no changes")
 
+    # ── migrate-region-scope ── (proposal 0013)
+    p_migrs = subparsers.add_parser(
+        "migrate-region-scope",
+        help="[v0.11] Additive: add region_scope/role columns to a pre-0013 project",
+    )
+    p_migrs.add_argument("--project-dir", required=True)
+    p_migrs.add_argument("--dry-run", action="store_true",
+                         help="Print the plan, make no changes")
+
     # ── cohort-artifacts ──
     p_calist = subparsers.add_parser(
         "cohort-artifacts",
@@ -245,6 +255,7 @@ def qc_command_dispatch() -> dict:
         "cohort": cmd_cohort,
         "append-cohort": cmd_append_cohort,
         "migrate-cohort": cmd_migrate_cohort,
+        "migrate-region-scope": cmd_migrate_region_scope,
         "cohort-artifacts": cmd_cohort_artifacts,
         "migrate-references": cmd_migrate_references,
         "references": cmd_references,

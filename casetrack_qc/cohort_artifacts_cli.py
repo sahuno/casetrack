@@ -176,6 +176,66 @@ def cmd_migrate_cohort(args) -> None:
         conn.close()
 
 
+# ── migrate-region-scope ─────────────────────────────────────────────────────
+
+
+def _region_scope_columns_present(conn) -> bool:
+    """True when both 0013 columns already exist on the cohort-artifact tables."""
+    if not ca.cohort_artifacts_schema_exists(conn):
+        return False
+    art_cols = {r[1] for r in conn.execute(
+        'PRAGMA table_info("cohort_artifacts")').fetchall()}
+    in_cols = {r[1] for r in conn.execute(
+        'PRAGMA table_info("cohort_artifact_inputs")').fetchall()}
+    return "region_scope" in art_cols and "role" in in_cols
+
+
+def cmd_migrate_region_scope(args) -> None:
+    """Additive: add region_scope/role columns to a post-0009 / pre-0013 project.
+
+    Mirrors ``cmd_migrate_cohort`` exactly: resolve project → open db → one
+    ``begin_immediate`` write → provenance entry.
+    """
+    # Upgrade path — bypass the legacy gate so we can operate on older projects.
+    project_dir, _ = casetrack._resolve_project(
+        args.project_dir, bypass_legacy_gate=True
+    )
+    db_path = project_dir / casetrack.PROJECT_DB_NAME
+
+    conn = casetrack.open_project_db(db_path)
+    try:
+        if not ca.cohort_artifacts_schema_exists(conn):
+            print(
+                "Error: project has no cohort-artifact schema. Run "
+                f"`casetrack migrate-cohort --project-dir {project_dir}` first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if _region_scope_columns_present(conn):
+            print("No migration needed — region_scope/role columns already present.")
+            return
+        if getattr(args, "dry_run", False):
+            print(
+                "[dry-run] Would add cohort_artifacts.region_scope and "
+                "cohort_artifact_inputs.role (additive ALTER TABLE)."
+            )
+            return
+        txn_id = casetrack._new_transaction_id()
+        with casetrack.begin_immediate(conn):
+            executed = ca.ensure_region_scope_columns(conn)
+        casetrack.log_project_provenance(
+            project_dir,
+            {
+                "action": "migrate_region_scope",
+                "executed_sql": executed,
+                "transaction_id": txn_id,
+            },
+        )
+        print(f"Added region_scope/role columns ({len(executed)} statements).")
+    finally:
+        conn.close()
+
+
 # ── cohort-artifacts (list + staleness) ──────────────────────────────────────
 
 
@@ -246,4 +306,9 @@ def cmd_cohort_artifacts(args) -> None:
         conn.close()
 
 
-__all__ = ["cmd_append_cohort", "cmd_migrate_cohort", "cmd_cohort_artifacts"]
+__all__ = [
+    "cmd_append_cohort",
+    "cmd_migrate_cohort",
+    "cmd_migrate_region_scope",
+    "cmd_cohort_artifacts",
+]
