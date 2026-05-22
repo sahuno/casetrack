@@ -76,3 +76,30 @@ def test_table_output_shows_scope(tmp_path: Path, capsys):
         project_dir=str(proj), fmt="table", stale_only=False, scope=None))
     out = capsys.readouterr().out
     assert "genome-wide" in out and "promoters_EPDnew" in out
+
+
+def test_tsv_output_has_region_scope_column_and_handles_null(tmp_path: Path, capsys):
+    proj = _project_with_two_scoped_artifacts(tmp_path)
+    # Append an UNSCOPED artifact too — its TSV cell for region_scope must be empty (not "None").
+    from casetrack_qc.cohort_artifacts_cli import cmd_append_cohort
+    cmd_append_cohort(argparse.Namespace(
+        project_dir=str(proj), analysis="dss_dmr", run_tag="nosc",
+        path="/x", inputs="A1", inputs_from=None, stats=None, checksum=None,
+        created_by=None, uses_references=None, derived_from=None,
+        region_scope=None))
+    capsys.readouterr()  # drain init/append output
+    cmd_cohort_artifacts(argparse.Namespace(
+        project_dir=str(proj), fmt="tsv", stale_only=False, scope=None))
+    out = capsys.readouterr().out
+    lines = out.strip().splitlines()
+    # Header (first non-empty, possibly leading-# stripped) must include region_scope.
+    header_line = lines[0].lstrip("#").strip()
+    header = header_line.split("\t")
+    assert "region_scope" in header
+    rs_idx = header.index("region_scope")
+    run_tag_idx = header.index("run_tag")
+    cell_by_run = {row.split("\t")[run_tag_idx]: row.split("\t")[rs_idx]
+                   for row in lines[1:] if row.strip()}
+    assert cell_by_run["gw"] == "genome-wide"
+    assert cell_by_run["prom"] == "promoters_EPDnew"
+    assert cell_by_run["nosc"] == ""   # NULL renders as empty string, not "None"

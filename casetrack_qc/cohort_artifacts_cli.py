@@ -317,7 +317,7 @@ def cmd_cohort_artifacts(args) -> None:
 
         rows = _artifact_rows(conn)
         scope = getattr(args, "scope", None)
-        if scope:
+        if scope is not None:
             rows = [r for r in rows if r["region_scope"] == scope]
         if getattr(args, "stale_only", False):
             rows = [r for r in rows if r["stale"]]
@@ -330,7 +330,7 @@ def cmd_cohort_artifacts(args) -> None:
                     "stale", "n_censored_inputs", "path"]
             print("#" + "\t".join(cols))
             for r in rows:
-                print("\t".join(str(r[c]) for c in cols))
+                print("\t".join("" if r[c] is None else str(r[c]) for c in cols))
         else:
             if not rows:
                 print("No cohort artifacts.")
