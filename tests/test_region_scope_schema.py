@@ -9,8 +9,6 @@ import argparse
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 import casetrack
 from casetrack_qc import cohort_artifacts as ca
 

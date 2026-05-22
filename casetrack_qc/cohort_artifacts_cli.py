@@ -148,6 +148,9 @@ def cmd_migrate_cohort(args) -> None:
 
     conn = casetrack.open_project_db(db_path)
     try:
+        # NOTE: this guard only checks table presence. A post-0009/pre-0013 project
+        # (tables exist but lack region_scope/role) is upgraded via `migrate-region-scope`,
+        # not here.
         if ca.cohort_artifacts_schema_exists(conn):
             print("No migration needed — cohort-artifact schema already in place.")
             return

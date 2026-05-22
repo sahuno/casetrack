@@ -139,7 +139,8 @@ def ensure_region_scope_columns(conn: sqlite3.Connection) -> list[str]:
         sql = "ALTER TABLE cohort_artifact_inputs ADD COLUMN role TEXT"
         conn.execute(sql)
         executed.append(sql)
-    # after adding the region_scope column, create the grouping index:
+    # Create the grouping index if any column was added and the parent table exists.
+    # IF NOT EXISTS makes this idempotent across partial migrations.
     if executed and _table_exists(conn, "cohort_artifacts"):
         idx = (
             "CREATE INDEX IF NOT EXISTS idx_cohort_artifacts_scope "
