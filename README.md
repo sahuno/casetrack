@@ -6,7 +6,14 @@ Answers two questions about a multi-patient, multi-specimen, multi-assay
 cohort: "*is this analysis complete?*" and "*is this sample usable?*"
 
 Storage layers, one CLI:
-- **v0.6 (current, alpha)**: identity layer on top of v0.4. Every project
+- **v0.10 (current, alpha)**: `register-cohort` — load patients + specimens
+  + assays from one schema-native wide sample sheet in a single transaction
+  (proposal 0012). Builds on the additive sibling-table layers added since
+  v0.6: cohort-level artifacts (joint VCFs / PoNs / matrices, proposal 0009),
+  versioned reference artifacts with downstream staleness (proposal 0010),
+  and artifact-to-artifact lineage with transitive `derived_stale`
+  (proposal 0011). The three-level core is untouched by all of these.
+- **v0.6**: identity layer on top of v0.4. Every project
   gets a `project_id` slug at init, persisted in TOML + `project_meta`
   SQLite table + `~/.casetrack/registry.json`, so commands can address a
   project by name (`casetrack --project hgsoc-2026 query "..."`) instead
