@@ -7378,6 +7378,8 @@ def cmd_register_cohort(args):
                     allow_new=True,
                     overwrite=getattr(args, "overwrite", False),
                 )
+    # Defensive: unreachable in normal flow (allow_new=True + FK-ordered upsert +
+    # pre-validation), retained in case _upsert_level's contract changes.
     except _MetadataRouting as e:
         conn.close()
         missing = sorted((e.missing_keys | e.missing_parents))[:5]
@@ -7410,6 +7412,8 @@ def cmd_register_cohort(args):
         },
         "overwrite": bool(getattr(args, "overwrite", False)),
         "transaction_id": txn_id,
+        "schema_v_before": schema["project"]["schema_v"],
+        "schema_v_after": schema["project"]["schema_v"],
     })
 
     print(

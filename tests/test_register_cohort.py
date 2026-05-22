@@ -170,12 +170,15 @@ def test_register_cohort_dry_run_writes_nothing(tmp_path):
         conn.close()
 
 
-def test_register_cohort_rerun_idempotent(tmp_path):
+def test_register_cohort_rerun_idempotent(tmp_path, capsys):
     proj = _init_project(tmp_path)
     sheet = tmp_path / "cohort.tsv"
     _write_sheet(sheet)
     casetrack.cmd_register_cohort(_ns(proj, sheet))
-    casetrack.cmd_register_cohort(_ns(proj, sheet))  # second run inserts 0 new
+    capsys.readouterr()  # discard first-run output
+    casetrack.cmd_register_cohort(_ns(proj, sheet))  # second run inserts 0
+    out = capsys.readouterr().out
+    assert "assays +0" in out
     conn = casetrack.open_project_db(proj / "casetrack.db")
     try:
         assert conn.execute("SELECT COUNT(*) FROM assays").fetchone()[0] == 3
@@ -196,5 +199,34 @@ def test_register_cohort_rolls_back_on_bad_sheet(tmp_path):
     conn = casetrack.open_project_db(proj / "casetrack.db")
     try:
         assert conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_register_cohort_rolls_back_on_mid_transaction_integrity_error(tmp_path, monkeypatch):
+    """IntegrityError on the assay frame rolls back already-staged patients+specimens."""
+    import sqlite3
+    proj = _init_project(tmp_path)
+    sheet = tmp_path / "cohort.tsv"
+    _write_sheet(sheet)
+
+    original_upsert = casetrack._upsert_level
+
+    def failing_upsert(conn, *, level, frame, schema, allow_new, overwrite):
+        if level == "assay":
+            raise sqlite3.IntegrityError("forced error on assay frame")
+        return original_upsert(conn, level=level, frame=frame, schema=schema,
+                               allow_new=allow_new, overwrite=overwrite)
+
+    monkeypatch.setattr(casetrack, "_upsert_level", failing_upsert)
+
+    with pytest.raises(SystemExit) as exc_info:
+        casetrack.cmd_register_cohort(_ns(proj, sheet))
+    assert exc_info.value.code == 1
+
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM specimens").fetchone()[0] == 0
     finally:
         conn.close()
