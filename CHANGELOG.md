@@ -4,6 +4,47 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-05-22
+
+One-shot cohort registration from a wide sample sheet — load patients,
+specimens, and assays in a single transaction from one TSV whose column
+names match the schema's declared level columns. See
+[proposal 0012](docs/proposals/0012-register-cohort.md).
+
+### Added
+
+- **`casetrack register-cohort`** — load a schema-native wide sample sheet
+  (one row per assay, columns routed to the right level by reading
+  `casetrack.toml`) in one `BEGIN IMMEDIATE` transaction; any error rolls
+  back the whole load. Column→level routing is schema-driven — no mapping
+  flags needed; the sheet stays correct as the schema evolves.
+- **`--dry-run`** — print the per-level new/existing plan (counts + first
+  few IDs) without writing anything. The recommended guard before the first
+  real load.
+- **`--overwrite`** — replace non-null attributes on existing rows instead
+  of the default fill-only behaviour (same semantics as `add-metadata
+  --overwrite`).
+- **Pre-write intra-sheet integrity validation** — four checks run before
+  the transaction opens: (a) all three ID columns present; (b) every
+  specimen maps to exactly one patient across the sheet (conflicting-parent
+  guard); (c) no duplicate assay IDs; (d) no conflicting attribute values
+  for the same entity across rows. Any failure prints a clear error and
+  exits cleanly.
+- **Shared `_upsert_level` engine** — extracted from `add-metadata`'s
+  per-level validate-and-upsert core; both `add-metadata` (one call) and
+  `register-cohort` (three calls in FK order: patient → specimen → assay)
+  use the same tested code path.
+- **`--force-archived --yes`** — permit mutations on an archived project
+  (mirrors the same guard on all sibling commands, v0.7).
+
+### Notes
+
+- `register-cohort` targets the common case: full-chain rows where every
+  assay's full parentage is known at load time. Partial rows (a banked
+  patient with no assay yet) keep using `register` or `add-metadata`.
+- This command is the intended successor to `migrate` for *new* projects
+  once flat mode is removed in v1.0.
+
 ## [0.9.0] — 2026-05-21
 
 Artifact-to-artifact lineage — a generic `derived-from` edge between any two

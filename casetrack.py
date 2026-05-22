@@ -93,7 +93,7 @@ SQLITE_BUSY_TIMEOUT_MS = 30000
 # Casetrack version stamped into project_meta.casetrack_version on init
 # (proposal 0005 Part B). Reflects the release that created the row, so
 # future schema migrations can decide whether the row needs touch-ups.
-_CASETRACK_VERSION = "0.9.0"
+_CASETRACK_VERSION = "0.10.0"
 
 # project_meta DDL — proposal 0005 §6.1. CHECK constraint mirrors the
 # Python-side _PROJECT_ID_PATTERN so a hand-edit of the SQLite file can't
@@ -6803,6 +6803,359 @@ class _MetadataRouting(Exception):
         )
 
 
+def _upsert_level(conn, *, level, frame, schema, allow_new, overwrite):
+    """Validate ``frame`` against ``level``'s schema and upsert it into the level table.
+
+    Caller owns the transaction. Returns {'inserted': n, 'updated': m,
+    'meta_cols': [...], 'sql': [...]}. Raises _MetadataRouting (missing keys without
+    allow_new, or missing parents), ValueError (undeclared column / malformed id),
+    or sqlite3.IntegrityError. A frame with only the key column (no attribute/FK
+    columns) inserts key-only rows — register-cohort relies on this (proposal 0012).
+    """
+    level_spec = schema["levels"][level]
+    table = f"{level}s"
+    key_col = level_spec["key"]
+    parent_key_col = level_spec.get("parent_key")
+    parent_level = level_spec.get("parent")
+
+    if key_col not in frame.columns:
+        raise ValueError(
+            f"key column {key_col!r} not in sample sheet for level {level!r}"
+        )
+
+    meta_cols = [c for c in frame.columns if c != key_col]
+    declared_cols = set(level_spec["columns"])
+    unknown = [c for c in meta_cols if c not in declared_cols]
+    # Pre-checked by cmd_add_metadata_project for richer UX; re-validated here so
+    # direct callers (cmd_register_cohort) get a deterministic error.
+    if unknown:
+        raise ValueError(
+            f"columns not declared in casetrack.toml under [levels.{level}.columns]: {unknown}"
+        )
+
+    # Pre-checked by cmd_add_metadata_project for richer UX; re-validated here so
+    # direct callers (cmd_register_cohort) get a deterministic error.
+    if allow_new and parent_key_col and parent_key_col not in frame.columns:
+        raise ValueError(
+            f"inserting new {level}(s) requires the parent FK column {parent_key_col!r}"
+        )
+
+    executed_sql: list[str] = []
+    n_updated = n_inserted = 0
+
+    existing_keys = {
+        str(r[0]) for r in conn.execute(
+            f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
+        ).fetchall()
+    }
+    tsv_keys = frame[key_col].astype(str).tolist()
+    missing_keys = set(tsv_keys) - existing_keys
+
+    parents_needed: set = set()
+    missing_parents: set = set()
+    if missing_keys and allow_new and parent_level:
+        new_rows = frame[frame[key_col].astype(str).isin(missing_keys)]
+        parents_needed = set(new_rows[parent_key_col].astype(str))
+        parent_table = f"{parent_level}s"
+        parents_have = {
+            str(r[0]) for r in conn.execute(
+                f"SELECT {_quote_ident(parent_key_col)} FROM {_quote_ident(parent_table)}"
+            ).fetchall()
+        }
+        missing_parents = parents_needed - parents_have
+
+    if missing_keys and not allow_new:
+        raise _MetadataRouting(missing_keys, set())
+    if missing_parents:
+        raise _MetadataRouting(set(), missing_parents)
+
+    # UPDATE existing keys (fill-only unless overwrite). No-op when meta_cols empty.
+    # Dedupe so duplicate input rows don't inflate n_updated or cause redundant UPDATEs;
+    # idx_by_key already maps each key to its last occurrence, so deduping is safe.
+    _update_seen: set = set()
+    update_keys = []
+    for _k in tsv_keys:
+        if _k in existing_keys and _k not in _update_seen:
+            update_keys.append(_k)
+            _update_seen.add(_k)
+    if update_keys and meta_cols:
+        if overwrite:
+            set_clauses = ", ".join(f"{_quote_ident(c)} = ?" for c in meta_cols)
+        else:
+            # Default = fill-only: COALESCE keeps existing non-null values.
+            set_clauses = ", ".join(
+                f"{_quote_ident(c)} = COALESCE({_quote_ident(c)}, ?)"
+                for c in meta_cols
+            )
+        update_sql = (
+            f"UPDATE {_quote_ident(table)} SET {set_clauses} "
+            f"WHERE {_quote_ident(key_col)} = ?"
+        )
+        executed_sql.append(update_sql)
+        idx_by_key = {
+            str(frame.iloc[i][key_col]): i for i in range(len(frame))
+        }
+        for k in update_keys:
+            row = frame.iloc[idx_by_key[k]]
+            values = tuple(_coerce_for_sqlite(row[c]) for c in meta_cols)
+            values += (k,)
+            conn.execute(update_sql, values)
+            n_updated += 1
+
+    # INSERT new keys.
+    if allow_new and missing_keys:
+        # Validate every new key against the schema's format rules (proposal 0005 Part A).
+        for new_key in missing_keys:
+            validate_hierarchy_id(new_key, schema, level)
+        # Also validate parent keys we're about to reference.
+        if parent_level:
+            for parent_id in parents_needed:
+                validate_hierarchy_id(parent_id, schema, parent_level)
+        # Case-variant check against existing rows, once per batch.
+        folded_existing = _preload_folded_ids(conn, schema, level)
+        for new_key in missing_keys:
+            check_id_case_unique(conn, schema, level, new_key, folded_existing)
+        new_rows = frame[frame[key_col].astype(str).isin(missing_keys)]
+        insert_cols = [key_col] + meta_cols
+        quoted_cols = ", ".join(_quote_ident(c) for c in insert_cols)
+        placeholders = ", ".join("?" * len(insert_cols))
+        insert_sql = (
+            f"INSERT INTO {_quote_ident(table)} "
+            f"({quoted_cols}) VALUES ({placeholders})"
+        )
+        executed_sql.append(insert_sql)
+        for _, row in new_rows.iterrows():
+            values = tuple(_coerce_for_sqlite(row[c]) for c in insert_cols)
+            conn.execute(insert_sql, values)
+            n_inserted += 1
+
+    return {
+        "inserted": n_inserted,
+        "updated": n_updated,
+        "meta_cols": meta_cols,
+        "sql": executed_sql,
+    }
+
+
+def _route_samplesheet_columns(columns, schema):
+    """Map each sample-sheet column to the level(s) whose frame it belongs in.
+
+    Key columns (patient_id/specimen_id/assay_id) and parent-FK columns route to
+    every frame that needs them; a non-key attribute routes to the single level
+    that declares it. Returns {level: [cols in sheet order]} for the 3 levels.
+    Raises ValueError on a column declared at no level (undeclared) or a non-key
+    attribute declared at >1 level (ambiguous).
+
+    Parameters
+    ----------
+    columns : list[str]
+        Ordered list of column names from the wide sample-sheet.
+    schema : dict
+        Parsed casetrack.toml schema dict (must have ``schema["levels"]``).
+
+    Returns
+    -------
+    dict[str, list[str]]
+        ``{level: [col, ...]}`` for each level in LEVEL_ORDER.
+
+    Example
+    -------
+    >>> routed = _route_samplesheet_columns(
+    ...     ["patient_id", "cohort", "specimen_id", "tissue_site", "assay_id", "assay_type"],
+    ...     schema)
+    >>> routed["patient"]
+    ['patient_id', 'cohort']
+    """
+    levels = schema["levels"]
+    keys = {levels[lvl]["key"] for lvl in LEVEL_ORDER}                      # PKs
+    parent_keys = {levels[lvl].get("parent_key") for lvl in LEVEL_ORDER} - {None}
+    cross_level = keys | parent_keys                                        # routed positionally
+
+    # which level declares each non-key attribute (must be exactly one)
+    attr_owner: dict = {}
+    for lvl in LEVEL_ORDER:
+        for col in levels[lvl]["columns"]:
+            if col in cross_level:
+                continue
+            if col in attr_owner:
+                raise ValueError(
+                    f"column {col!r} declared at both "
+                    f"{attr_owner[col]!r} and {lvl!r} levels (ambiguous)"
+                )
+            attr_owner[col] = lvl
+
+    # Validate every input column is declared somewhere
+    col_set = set(columns)
+    for col in columns:
+        if col not in cross_level and col not in attr_owner:
+            raise ValueError(
+                f"column {col!r} is not declared at any level in casetrack.toml; "
+                f"declare it (and run `casetrack schema apply`) first"
+            )
+
+    # Build each level's frame columns: cross-level keys/FKs in schema-declaration
+    # order (so PK always precedes parent FK), then level-specific attributes in
+    # their input-sheet order.
+    routed = {}
+    for lvl in LEVEL_ORDER:
+        lvl_decl = list(levels[lvl]["columns"])          # schema order for this level
+        cross_cols = [c for c in lvl_decl if c in cross_level and c in col_set]
+        attr_cols = [c for c in columns if c in attr_owner and attr_owner[c] == lvl]
+        routed[lvl] = cross_cols + attr_cols
+    return routed
+
+
+def _explode_samplesheet(df, schema):
+    """Split a wide sample-sheet DataFrame into per-level frames, deduped by key.
+
+    Returns ``{level: DataFrame}``. Each frame keeps only that level's routed
+    columns and is deduplicated on the level's key column (identical duplicate
+    rows collapse — parent rows shared across many assays appear once).
+
+    **Pre-condition**: this function assumes the frame has already been validated
+    by ``_validate_samplesheet`` — specifically, that every level key column is
+    present and that no non-key attribute has conflicting values across rows that
+    share the same key.  When deduplicating, the first row encountered for each
+    key is kept; conflicting attribute values are *not* detected here.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Wide sample-sheet with one row per assay.
+    schema : dict
+        Parsed casetrack.toml schema dict.
+
+    Returns
+    -------
+    dict[str, pandas.DataFrame]
+        ``{level: DataFrame}`` for each level in LEVEL_ORDER.
+
+    Example
+    -------
+    >>> frames = _explode_samplesheet(df, schema)
+    >>> len(frames["patient"])   # 2 patients across 3 rows
+    2
+    """
+    routed = _route_samplesheet_columns(list(df.columns), schema)
+    frames = {}
+    for lvl in LEVEL_ORDER:
+        key_col = schema["levels"][lvl]["key"]
+        sub = df[routed[lvl]].drop_duplicates(subset=[key_col]).reset_index(drop=True)
+        frames[lvl] = sub
+    return frames
+
+
+def _validate_samplesheet(df, schema):
+    """Pre-write integrity checks for a register-cohort sample sheet (0012 §6.4).
+
+    Raises ValueError (with a human message) on the first violation: a missing
+    level key column, a missing required column, a row with any blank key or
+    required attr (full-chain), a specimen mapped to >1 patient, a duplicate
+    assay_id, or an entity key with conflicting attribute values across rows.
+    Routing/undeclared-column errors are surfaced by _route_samplesheet_columns
+    (called first). Runs entirely before any DB write so a bad sheet never
+    half-loads.
+
+    Note: the full-chain blank check and the conflict checks iterate per-cell /
+    per-entity; this is intended for cohort scale (hundreds to low thousands of
+    rows). Very large sheets (100K+ rows) are outside the design scope and will
+    be noticeably slow.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Wide sample-sheet with one row per assay.
+    schema : dict
+        Parsed casetrack.toml schema dict.
+
+    Raises
+    ------
+    ValueError
+        On any integrity violation, with a human-readable message naming the
+        offending column(s) or entity key(s).
+
+    Example
+    -------
+    >>> _validate_samplesheet(df, schema)  # no raise when valid
+    """
+    routed = _route_samplesheet_columns(list(df.columns), schema)  # undeclared/ambiguous → ValueError
+    levels = schema["levels"]
+
+    # every level's KEY column must be present (else later df[key] dereferences KeyError)
+    for lvl in LEVEL_ORDER:
+        key_col = levels[lvl]["key"]
+        if key_col not in df.columns:
+            raise ValueError(
+                f"required key column {key_col!r} (level {lvl}) missing from sample sheet"
+            )
+
+    # required attribute columns must be present in the header
+    for lvl in LEVEL_ORDER:
+        for col, spec in levels[lvl]["columns"].items():
+            if spec.get("required") and col not in df.columns:
+                raise ValueError(
+                    f"required column {col!r} (level {lvl}) missing from sample sheet"
+                )
+
+    # full chain: every row must have all three keys + every required attr non-empty
+    def _blank(v):
+        return v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == ""
+
+    required_cols = [
+        c
+        for lvl in LEVEL_ORDER
+        for c, s in levels[lvl]["columns"].items()
+        if (s.get("required") or c == levels[lvl]["key"]) and c in df.columns
+    ]
+    for i in range(len(df)):
+        for col in required_cols:
+            if _blank(df.iloc[i][col]):
+                raise ValueError(
+                    f"row {i}: empty {col!r} breaks the patient→specimen→assay chain"
+                )
+
+    # specimen → exactly one parent patient (read parent key from schema, not hardcoded)
+    specimen_key = levels["specimen"]["key"]
+    specimen_parent_key = levels["specimen"].get("parent_key")
+    if not specimen_parent_key:
+        raise ValueError(
+            "schema is missing parent_key for level 'specimen'; run `casetrack schema apply`"
+        )
+    sp = df[[specimen_key, specimen_parent_key]].astype(str).drop_duplicates()
+    dup_sp = sp[sp.duplicated(subset=[specimen_key], keep=False)]
+    if not dup_sp.empty:
+        bad = sorted(dup_sp[specimen_key].unique())[:3]
+        raise ValueError(
+            f"specimen(s) mapped to >1 parent patient (one parent only): {bad}"
+        )
+
+    # duplicate assay_id: allow fully-identical duplicate rows; flag only conflicting ones
+    assay_key = levels["assay"]["key"]
+    if df[assay_key].astype(str).duplicated().any():
+        assay_cols = routed["assay"]
+        confl = df[assay_cols].astype(str).drop_duplicates()
+        if confl[assay_key].duplicated().any():
+            bad = sorted(
+                confl[confl[assay_key].duplicated(keep=False)][assay_key].unique()
+            )[:3]
+            raise ValueError(
+                f"duplicate {assay_key!r} with differing values: {bad}"
+            )
+
+    # conflicting attributes for the same entity key (patient, specimen)
+    for lvl in ("patient", "specimen"):
+        key_col = levels[lvl]["key"]
+        cols = routed[lvl]
+        distinct = df[cols].astype(str).drop_duplicates()
+        if distinct[key_col].duplicated().any():
+            bad = sorted(
+                distinct[distinct[key_col].duplicated(keep=False)][key_col].unique()
+            )[:3]
+            raise ValueError(
+                f"{lvl} key(s) with conflicting attribute values across rows: {bad}"
+            )
+
+
 def cmd_add_metadata_project(args):
     project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     from casetrack_lifecycle.gate import assert_not_archived as _assert_not_archived
@@ -6879,101 +7232,18 @@ def cmd_add_metadata_project(args):
 
     db_path = project_dir / PROJECT_DB_NAME
     conn = open_project_db(db_path)
-    executed_sql: list[str] = []
-    n_updated = 0
-    n_inserted = 0
+    result: dict = {"inserted": 0, "updated": 0, "meta_cols": meta_cols, "sql": []}
 
     try:
         with begin_immediate(conn):
-            existing_keys = {
-                str(r[0]) for r in conn.execute(
-                    f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
-                ).fetchall()
-            }
-            tsv_keys = metadata[key_col].astype(str).tolist()
-            tsv_key_set = set(tsv_keys)
-            missing_keys = tsv_key_set - existing_keys
-
-            # If we're inserting, validate parents first.
-            missing_parents: set = set()
-            if missing_keys and args.allow_new and parent_level:
-                new_rows = metadata[metadata[key_col].astype(str).isin(missing_keys)]
-                parent_col = parent_key_col
-                parents_needed = set(new_rows[parent_col].astype(str))
-                parent_table = f"{parent_level}s"
-                parents_have = {
-                    str(r[0]) for r in conn.execute(
-                        f"SELECT {_quote_ident(parent_col)} FROM {_quote_ident(parent_table)}"
-                    ).fetchall()
-                }
-                missing_parents = parents_needed - parents_have
-
-            if missing_keys and not args.allow_new:
-                raise _MetadataRouting(missing_keys, set())
-            if missing_parents:
-                raise _MetadataRouting(set(), missing_parents)
-
-            # UPDATEs for existing keys.
-            update_keys = [k for k in tsv_keys if k in existing_keys]
-            if update_keys:
-                if args.overwrite:
-                    set_clauses = ", ".join(f"{_quote_ident(c)} = ?" for c in meta_cols)
-                else:
-                    # Default = fill-only (matches v0.2 add-metadata default).
-                    set_clauses = ", ".join(
-                        f"{_quote_ident(c)} = COALESCE({_quote_ident(c)}, ?)"
-                        for c in meta_cols
-                    )
-                update_sql = (
-                    f"UPDATE {_quote_ident(table)} SET {set_clauses} "
-                    f"WHERE {_quote_ident(key_col)} = ?"
-                )
-                executed_sql.append(update_sql)
-                idx_by_key = {
-                    str(metadata.iloc[i][key_col]): i for i in range(len(metadata))
-                }
-                for k in update_keys:
-                    row = metadata.iloc[idx_by_key[k]]
-                    values = tuple(_coerce_for_sqlite(row[c]) for c in meta_cols)
-                    values += (k,)
-                    conn.execute(update_sql, values)
-                    n_updated += 1
-
-            # INSERTs for new keys.
-            if args.allow_new and missing_keys:
-                # v0.6: validate every new key against the schema's format
-                # rules (proposal 0005 Part A) before the INSERT runs, so
-                # malformed IDs surface at the source of the problem.
-                for new_key in missing_keys:
-                    validate_hierarchy_id(new_key, schema, level)
-                # Also validate parent keys we're about to reference — if
-                # missing_parents was non-empty, we've already failed above;
-                # here we only reach valid parents, but their case-variants
-                # still need checking.
-                if parent_level:
-                    for parent_id in parents_needed:
-                        validate_hierarchy_id(parent_id, schema, parent_level)
-                # Case-variant check against existing rows, once per batch.
-                folded_existing = _preload_folded_ids(conn, schema, level)
-                for new_key in missing_keys:
-                    check_id_case_unique(
-                        conn, schema, level, new_key, folded_existing
-                    )
-                new_rows = metadata[metadata[key_col].astype(str).isin(missing_keys)]
-                insert_cols = [key_col] + meta_cols
-                quoted_cols = ", ".join(_quote_ident(c) for c in insert_cols)
-                placeholders = ", ".join("?" * len(insert_cols))
-                insert_sql = (
-                    f"INSERT INTO {_quote_ident(table)} "
-                    f"({quoted_cols}) VALUES ({placeholders})"
-                )
-                executed_sql.append(insert_sql)
-                for _, row in new_rows.iterrows():
-                    values = tuple(
-                        _coerce_for_sqlite(row[c]) for c in insert_cols
-                    )
-                    conn.execute(insert_sql, values)
-                    n_inserted += 1
+            result = _upsert_level(
+                conn,
+                level=level,
+                frame=metadata,
+                schema=schema,
+                allow_new=args.allow_new,
+                overwrite=args.overwrite,
+            )
 
     except _MetadataRouting as e:
         conn.close()
@@ -7016,19 +7286,142 @@ def cmd_add_metadata_project(args):
         "level": level,
         "metadata_file": str(metadata_path),
         "metadata_checksum": _checksum(str(metadata_path)),
-        "columns": meta_cols,
-        "rows_updated": n_updated,
-        "rows_inserted": n_inserted,
+        "columns": result["meta_cols"],
+        "rows_updated": result["updated"],
+        "rows_inserted": result["inserted"],
         "mode": "overwrite" if args.overwrite else ("fill_only" if args.fill_only else "fill_only"),
         "transaction_id": _new_transaction_id(),
-        "sql": executed_sql,
+        "sql": result["sql"],
         "schema_v_before": schema["project"]["schema_v"],
         "schema_v_after": schema["project"]["schema_v"],
     })
 
     print(
         f"add-metadata → {level}: "
-        f"updated={n_updated}, inserted={n_inserted}, columns={len(meta_cols)}."
+        f"updated={result['updated']}, inserted={result['inserted']}, "
+        f"columns={len(result['meta_cols'])}."
+    )
+
+
+# ── register-cohort (proposal 0012 §6.5) ──────────────────────────────────────
+
+def cmd_register_cohort(args):
+    """Explode one schema-native wide sample sheet into the three normalized
+    tables (patients, specimens, assays) in a single transaction (proposal 0012).
+
+    The sample sheet must contain every level's key column plus any required
+    attribute columns declared in casetrack.toml.  Columns are routed to the
+    appropriate level table by _route_samplesheet_columns; duplicate parent rows
+    (e.g. the same patient appearing on multiple assay rows) are collapsed by
+    _explode_samplesheet before upsert.
+
+    --dry-run prints what *would* be loaded without touching the DB.
+    Re-running with the same sheet is idempotent (fill-only upsert by default).
+    """
+    project_dir, schema = _resolve_project(
+        args.project_dir, project_id=getattr(args, "project", None)
+    )
+    from casetrack_lifecycle.gate import assert_not_archived as _assert_not_archived
+    _assert_not_archived(
+        project_dir,
+        force_archived=getattr(args, "force_archived", False),
+        yes=getattr(args, "yes", False),
+    )
+
+    sheet_path = Path(args.samplesheet)
+    if not sheet_path.exists():
+        print(f"Error: sample sheet not found: {sheet_path}", file=sys.stderr)
+        sys.exit(1)
+
+    df = pd.read_csv(sheet_path, sep="\t", dtype=str)
+
+    try:
+        _validate_samplesheet(df, schema)
+        frames = _explode_samplesheet(df, schema)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if getattr(args, "dry_run", False):
+        conn = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            print("[dry-run] register-cohort would load:")
+            for lvl in LEVEL_ORDER:
+                key_col = schema["levels"][lvl]["key"]
+                table = f"{lvl}s"
+                existing = {
+                    str(r[0]) for r in conn.execute(
+                        f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
+                    ).fetchall()
+                }
+                keys = set(frames[lvl][key_col].astype(str))
+                new_count = len(keys - existing)
+                print(
+                    f"  {lvl:8s}: {new_count} new, "
+                    f"{len(keys) - new_count} existing"
+                )
+        finally:
+            conn.close()
+        return
+
+    txn_id = _new_transaction_id()
+    conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    counts: dict = {}
+    try:
+        with begin_immediate(conn):
+            for lvl in LEVEL_ORDER:  # FK order: patient → specimen → assay
+                counts[lvl] = _upsert_level(
+                    conn,
+                    level=lvl,
+                    frame=frames[lvl],
+                    schema=schema,
+                    allow_new=True,
+                    overwrite=getattr(args, "overwrite", False),
+                )
+    # Defensive: unreachable in normal flow (allow_new=True + FK-ordered upsert +
+    # pre-validation), retained in case _upsert_level's contract changes.
+    except _MetadataRouting as e:
+        conn.close()
+        missing = sorted((e.missing_keys | e.missing_parents))[:5]
+        print(
+            f"Error: register-cohort aborted — unresolved parents/keys: {missing}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except ValueError as e:
+        conn.close()
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+    except sqlite3.IntegrityError as e:
+        conn.close()
+        print(
+            f"Error: register-cohort aborted — {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    finally:
+        conn.close()
+
+    log_project_provenance(project_dir, {
+        "action": "register_cohort",
+        "samplesheet": str(sheet_path),
+        "samplesheet_checksum": _checksum(str(sheet_path)),
+        "counts": {
+            lvl: {"inserted": counts[lvl]["inserted"], "updated": counts[lvl]["updated"]}
+            for lvl in LEVEL_ORDER
+        },
+        "overwrite": bool(getattr(args, "overwrite", False)),
+        "transaction_id": txn_id,
+        "schema_v_before": schema["project"]["schema_v"],
+        "schema_v_after": schema["project"]["schema_v"],
+    })
+
+    print(
+        "register-cohort: "
+        + ", ".join(
+            f"{lvl}s +{counts[lvl]['inserted']} (~{counts[lvl]['updated']})"
+            for lvl in LEVEL_ORDER
+        )
     )
 
 
@@ -8337,6 +8730,33 @@ Examples:
         help="[v0.7] Allow mutations on an archived project (requires --yes)",
     )
 
+    # ── register-cohort ── (proposal 0012)
+    p_regcohort = subparsers.add_parser(
+        "register-cohort",
+        help="[v0.10] Bulk-register patients+specimens+assays from one wide sample sheet",
+    )
+    g_rc = p_regcohort.add_mutually_exclusive_group(required=True)
+    g_rc.add_argument("--project-dir", help="Casetrack project directory")
+    g_rc.add_argument("--project", help="Registered project id (registry lookup)")
+    p_regcohort.add_argument(
+        "--samplesheet", required=True,
+        help="Wide TSV: one row per assay, columns named to match the schema "
+             "(patient_id, specimen_id, assay_id + declared level columns)",
+    )
+    p_regcohort.add_argument(
+        "--overwrite", action="store_true",
+        help="Replace existing non-null attribute cells (default: fill-only)",
+    )
+    p_regcohort.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="Print the per-level new/existing plan; write nothing",
+    )
+    p_regcohort.add_argument(
+        "--force-archived", action="store_true",
+        help="[v0.7] Allow mutations on an archived project (requires --yes)",
+    )
+    p_regcohort.add_argument("--yes", action="store_true", help="Confirm --force-archived")
+
     # ── dashboard ──
     p_dash = subparsers.add_parser(
         "dashboard",
@@ -8611,6 +9031,7 @@ Examples:
         "migrate": cmd_migrate,
         "migrate-project-id": cmd_migrate_project_id,
         "register": cmd_register,
+        "register-cohort": cmd_register_cohort,
         "doctor": cmd_doctor_project,
         "recover": cmd_recover_project,
     }

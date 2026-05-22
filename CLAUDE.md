@@ -6,7 +6,7 @@ Manifest-centric case management CLI for bioinformatics pipelines on HPC (SLURM)
 
 - **Repo**: https://github.com/sahuno/casetrack (private)
 - **Author**: Samuel Ahuno (ekwame001@gmail.com / sahuno@mskcc.org)
-- **Current release**: v0.9.0 — artifact-to-artifact lineage + transitive derived-staleness (proposal 0011)
+- **Current release**: v0.10.0 — `register-cohort` one-shot wide-sheet loader (proposal 0012)
 - **Next release**: v1.0 (flat-mode removal)
 - **HPC target**: IRIS @ MSKCC (SLURM, WekaFS shared storage, Apptainer containers)
 
@@ -21,7 +21,7 @@ Manifest-centric case management CLI for bioinformatics pipelines on HPC (SLURM)
 | `docs/proposals/0002-qc-events-and-censoring.md` | **The shipped v0.4 design.** QC events, cascade semantics, consent rules, cohort `--pair-by`. §0 has the 13 locked-in decisions. |
 | `docs/proposals/0001-sqlite-normalized-backend.md` | **The shipped v0.3 design.** Three-level hierarchy, SQLite backend, concurrency strategy. |
 | `docs/MIGRATION_v0.3_to_v0.4.md` | Step-by-step upgrade guide (one command: `casetrack migrate-qc`). |
-| `CHANGELOG.md` | Release notes (most recent = v0.9.0). |
+| `CHANGELOG.md` | Release notes (most recent = v0.10.0). |
 | `casetrack.py` | v0.3 commands, in one file (~5.6K lines). |
 | `casetrack_qc/` | v0.4 QC subsystem — lives next to the monolith, never merged into it. |
 | `README.md` | User-facing command table. |
@@ -79,6 +79,7 @@ Each `[analyses.<tool>]` declares `uses = [...]`; `append` auto-snapshots the cu
 | cohort artifacts (0009) | `append-cohort`, `cohort-artifacts`, `migrate-cohort` |
 | reference artifacts (0010) | `references`, `migrate-references` (+ `append`/`append-cohort` `--uses-references`) |
 | derivation / lineage (0011) | `derived-from`, `derivation`, `migrate-derivation` (+ `append`/`append-cohort` `--derived-from`) |
+| cohort registration (0012) | `register-cohort` — load patients + specimens + assays from one wide sample sheet in a single transaction; successor to `migrate` for new projects post-v1.0 |
 
 Note: `cohort` (v0.4) is the paired-design *readiness* view; `cohort-artifacts` (0009) lists cohort-level *output artifacts* with staleness — different things.
 
