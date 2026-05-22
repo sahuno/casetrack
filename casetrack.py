@@ -7333,7 +7333,7 @@ def cmd_register_cohort(args):
         print(f"Error: sample sheet not found: {sheet_path}", file=sys.stderr)
         sys.exit(1)
 
-    df = pd.read_csv(sheet_path, sep="\t", dtype=str).fillna("")
+    df = pd.read_csv(sheet_path, sep="\t", dtype=str)
 
     try:
         _validate_samplesheet(df, schema)

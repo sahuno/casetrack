@@ -1,6 +1,6 @@
 # tests/test_register_cohort.py
 """Unit + CLI tests for register-cohort (proposal 0012)."""
-import argparse, copy, subprocess, sys
+import argparse, copy, json, subprocess, sys
 import pandas as pd
 import pytest
 import casetrack
@@ -262,3 +262,161 @@ def test_register_cohort_cli_validation_exit2(tmp_path):
     r = _run(["register-cohort", "--project-dir", str(proj), "--samplesheet", str(bad)])
     assert r.returncode == 2
     assert "Error" in r.stderr and "Traceback" not in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 regression: blank optional cells store NULL, not empty string (0012 review)
+# ---------------------------------------------------------------------------
+
+def test_register_cohort_blank_optional_cell_stores_null(tmp_path):
+    """A blank optional column (e.g. age) in the sample sheet must be stored as
+    NULL in SQLite, not as an empty string ''.  This ensures add-metadata
+    --fill-only can back-fill the value later, and NULL-based coverage queries
+    give correct counts.
+
+    The hgsoc template has optional patient columns (age, sex, diagnosis, …) and
+    optional specimen columns (timepoint, collection_date, tumor_purity) — any of
+    which may be absent from rows in the sheet.  We include 'age' (INTEGER) with
+    a blank cell for P1 and a real value for P2.
+    """
+    proj = _init_project(tmp_path)
+    sheet = tmp_path / "cohort_blank.tsv"
+    # Include the optional 'age' column; leave it blank for P1, filled for P2.
+    sheet.write_text(
+        "patient_id\tage\ttissue_site\tspecimen_id\tassay_type\tassay_id\n"
+        "P1\t\ttumor\tP1-T\tONT\tP1-T-ONT\n"   # age blank → should be NULL
+        "P2\t42\ttumor\tP2-T\tONT\tP2-T-ONT\n"  # age = 42
+    )
+    casetrack.cmd_register_cohort(_ns(proj, sheet))
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        p1_age = conn.execute(
+            "SELECT age FROM patients WHERE patient_id = 'P1'"
+        ).fetchone()[0]
+        p2_age = conn.execute(
+            "SELECT age FROM patients WHERE patient_id = 'P2'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    # P1's blank age must be NULL (Python None), not empty string
+    assert p1_age is None, f"Expected NULL for blank age, got {p1_age!r}"
+    # P2's age must be stored (SQLite stores INTEGER as int via _coerce_for_sqlite)
+    assert p2_age is not None, "Expected non-NULL age for P2"
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: --overwrite updates changed attributes (proposal §10, 0012 review)
+# ---------------------------------------------------------------------------
+
+def test_register_cohort_overwrite_updates_changed_attrs(tmp_path):
+    """--overwrite must update a changed attribute value on re-registration.
+    Without --overwrite (fill-only), an already-non-null value must NOT change.
+    Uses the optional 'age' column (INTEGER) on the patient level in the hgsoc
+    template.
+    """
+    proj = _init_project(tmp_path)
+
+    # First load: P1 age = 30
+    sheet1 = tmp_path / "cohort1.tsv"
+    sheet1.write_text(
+        "patient_id\tage\ttissue_site\tspecimen_id\tassay_type\tassay_id\n"
+        "P1\t30\ttumor\tP1-T\tONT\tP1-T-ONT\n"
+    )
+    casetrack.cmd_register_cohort(_ns(proj, sheet1))
+
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    age_after_first = conn.execute(
+        "SELECT age FROM patients WHERE patient_id = 'P1'"
+    ).fetchone()[0]
+    conn.close()
+    assert age_after_first is not None  # sanity: first load stored the value
+
+    # Second load: P1 age = 45, fill-only (no --overwrite) — must NOT change
+    sheet2 = tmp_path / "cohort2.tsv"
+    sheet2.write_text(
+        "patient_id\tage\ttissue_site\tspecimen_id\tassay_type\tassay_id\n"
+        "P1\t45\ttumor\tP1-T\tONT\tP1-T-ONT\n"
+    )
+    casetrack.cmd_register_cohort(_ns(proj, sheet2, overwrite=False))
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    age_fill_only = conn.execute(
+        "SELECT age FROM patients WHERE patient_id = 'P1'"
+    ).fetchone()[0]
+    conn.close()
+    assert int(age_fill_only) == 30, (
+        f"fill-only should not overwrite non-null age; got {age_fill_only!r}"
+    )
+
+    # Third load: same sheet, with --overwrite — must update age to 45
+    casetrack.cmd_register_cohort(_ns(proj, sheet2, overwrite=True))
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    age_after_overwrite = conn.execute(
+        "SELECT age FROM patients WHERE patient_id = 'P1'"
+    ).fetchone()[0]
+    conn.close()
+    assert int(age_after_overwrite) == 45, (
+        f"--overwrite should update age to 45; got {age_after_overwrite!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 3a: FK linkage — 3-table JOIN produces the right row count (0012 review)
+# ---------------------------------------------------------------------------
+
+def test_register_cohort_join_across_levels(tmp_path):
+    """A 3-table JOIN (patients ⋈ specimens ⋈ assays) must produce exactly one
+    row per assay, confirming FK linkage is intact after register-cohort.
+    """
+    proj = _init_project(tmp_path)
+    sheet = tmp_path / "cohort.tsv"
+    _write_sheet(sheet)
+    casetrack.cmd_register_cohort(_ns(proj, sheet))
+
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        row_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM patients p
+            JOIN specimens s ON s.patient_id = p.patient_id
+            JOIN assays a ON a.specimen_id = s.specimen_id
+            """
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    # _write_sheet has 3 assays; each joins to exactly one specimen and one patient
+    assert row_count == 3, f"Expected 3 joined rows, got {row_count}"
+
+
+# ---------------------------------------------------------------------------
+# Fix 3b: provenance shape — action + counts dict (0012 review)
+# ---------------------------------------------------------------------------
+
+def test_register_cohort_provenance_shape(tmp_path):
+    """The provenance.jsonl entry written by register-cohort must have
+    action == 'register_cohort' and a counts dict with inserted/updated
+    keys for each level (patient, specimen, assay).
+    """
+    proj = _init_project(tmp_path)
+    sheet = tmp_path / "cohort.tsv"
+    _write_sheet(sheet)
+    casetrack.cmd_register_cohort(_ns(proj, sheet))
+
+    prov_path = proj / "provenance.jsonl"
+    entries = [json.loads(ln) for ln in prov_path.read_text().splitlines() if ln.strip()]
+    reg = next((e for e in entries if e.get("action") == "register_cohort"), None)
+    assert reg is not None, "No 'register_cohort' entry found in provenance.jsonl"
+
+    # counts dict must exist and have the expected structure
+    counts = reg.get("counts", {})
+    for lvl in ("patient", "specimen", "assay"):
+        assert lvl in counts, f"counts missing level {lvl!r}"
+        assert "inserted" in counts[lvl], f"counts[{lvl!r}] missing 'inserted'"
+        assert "updated" in counts[lvl], f"counts[{lvl!r}] missing 'updated'"
+
+    # first load: all 3 assays / 3 specimens / 2 patients must be inserts
+    assert counts["patient"]["inserted"] == 2
+    assert counts["specimen"]["inserted"] == 3
+    assert counts["assay"]["inserted"] == 3
