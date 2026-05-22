@@ -93,7 +93,7 @@ SQLITE_BUSY_TIMEOUT_MS = 30000
 # Casetrack version stamped into project_meta.casetrack_version on init
 # (proposal 0005 Part B). Reflects the release that created the row, so
 # future schema migrations can decide whether the row needs touch-ups.
-_CASETRACK_VERSION = "0.9.0"
+_CASETRACK_VERSION = "0.10.0"
 
 # project_meta DDL — proposal 0005 §6.1. CHECK constraint mirrors the
 # Python-side _PROJECT_ID_PATTERN so a hand-edit of the SQLite file can't
@@ -8753,7 +8753,7 @@ Examples:
     )
     p_regcohort.add_argument(
         "--force-archived", action="store_true",
-        help="[v0.7] Allow on an archived project (requires --yes)",
+        help="[v0.7] Allow mutations on an archived project (requires --yes)",
     )
     p_regcohort.add_argument("--yes", action="store_true", help="Confirm --force-archived")
 

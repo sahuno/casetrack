@@ -226,6 +226,41 @@ casetrack query --project hgsoc-2026 --fmt json \
 
 `--project hgsoc-2026` and `--project-dir cohort/` are interchangeable — pass either, not both. The registry is local to your account (`~/.casetrack/registry.json`); team-shared registries are deferred to a later proposal.
 
+### Registering a whole cohort from one sheet (v0.10+)
+
+When every row in your samplesheet has a full patient → specimen → assay
+chain, `register-cohort` loads all three levels in one shot:
+
+```
+# cohort.tsv — one row per assay; column names match casetrack.toml
+patient_id   specimen_id         assay_id                    sex  brca_status  tissue_site  assay_type
+HGSOC001     HGSOC001-tumor      HGSOC001-tumor-ONT-WGS      F    brca1        tumor        ONT
+HGSOC001     HGSOC001-normal     HGSOC001-normal-ONT-WGS     F    brca1        normal       ONT
+HGSOC002     HGSOC002-tumor      HGSOC002-tumor-ONT-WGS      F    brca2        tumor        ONT
+```
+
+```bash
+# 1. Preview — prints per-level new/existing counts, writes nothing.
+casetrack register-cohort --project-dir . --samplesheet cohort.tsv --dry-run
+
+# 2. Load for real — single BEGIN IMMEDIATE transaction; any row error rolls
+#    back all three levels together.
+casetrack register-cohort --project-dir . --samplesheet cohort.tsv
+
+# 3. Update metadata on an already-loaded cohort (replace non-null attrs).
+casetrack register-cohort --project-dir . --samplesheet cohort.tsv --overwrite
+```
+
+Column routing is schema-driven: `casetrack` reads `casetrack.toml` and routes
+each column to the right level (`patient_id` → `patients`, `specimen_id` →
+`specimens`, `assay_id` → `assays`). No mapping flags needed; the sheet stays
+correct as the schema evolves.
+
+For partial loads (a patient with no assay yet, or updating a single level),
+keep using `register` / `add-metadata`. `register-cohort` requires all three ID
+columns on every row — it targets the full-chain case. See
+[proposal 0012](docs/proposals/0012-register-cohort.md).
+
 ## Quick start — v0.2 flat mode (deprecated)
 
 ```bash
@@ -295,6 +330,7 @@ and exact SQL.
 | `derived-from`   | **v0.9** — declare a derivation edge between two lineage nodes (`cohort:`, `reference:`, `analysis:`) (proposal 0011) |
 | `derivation`     | **v0.9** — inspect the full derivation graph / derived-stale state (`--node`, `--stale-only`, `--fmt`) (proposal 0011) |
 | `migrate-derivation` | **v0.9** — additive: create the `artifact_derivation` table on a pre-0011 project |
+| `register-cohort` | **v0.10** — load patients + specimens + assays from one wide sample sheet in a single transaction; schema-driven column routing, pre-write integrity validation, `--dry-run` preview (proposal 0012) |
 
 `casetrack <cmd> --help` for the full option list on any subcommand.
 

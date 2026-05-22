@@ -27,6 +27,7 @@ Ask yourself: am I registering an entity (adding a new patient/specimen/assay ro
 | Add cohort-artifact tables to a pre-0009 project | `casetrack migrate-cohort` | `--project-dir . [--dry-run]` |
 | List reference artifacts + staleness (v0.8 / proposal 0010) | `casetrack references` | `--project-dir . [--stale-only] [--fmt table\|tsv\|json]` |
 | Add reference-artifact tables to a pre-0010 project (v0.8 / proposal 0010) | `casetrack migrate-references` | `--project-dir . [--dry-run]` |
+| Load all three levels from one wide sample sheet (v0.10 / proposal 0012) | `casetrack register-cohort` | `--project-dir . --samplesheet cohort.tsv [--dry-run] [--overwrite]` |
 | See overall progress | `casetrack status` | `--project-dir .` |
 | Run arbitrary SQL | `casetrack query` | `--project-dir . --sql "..."` |
 | Inspect current DB schema | `casetrack schema show` | `--project-dir .` |

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Author** | Samuel Ahuno ([ekwame001@gmail.com](mailto:ekwame001@gmail.com)) |
-| **Status** | accepted (design) — 2026-05-21 |
+| **Status** | accepted (implemented) — 2026-05-22 |
 | **Depends on** | 0001 (hierarchy + SQLite backend), 0003 (init scaffold) |
 | **Relates to** | `migrate` (flat→project) — `register-cohort` is its successor for *new* projects once flat mode is removed at v1.0 |
 
