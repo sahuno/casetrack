@@ -85,3 +85,19 @@ def test_add_artifact_inputs_without_roles_is_backward_compatible(tmp_path: Path
         assert ca.artifact_input_roles(conn, aid) == {"A_T": None}
     finally:
         conn.close()
+
+
+def test_add_artifact_inputs_partial_roles(tmp_path: Path):
+    proj = _project_with_assays(tmp_path)
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        with casetrack.begin_immediate(conn):
+            ca.ensure_cohort_artifacts_schema(conn)
+            aid = ca.insert_artifact(
+                conn, analysis="x", run_tag="r1", path="/x", n_inputs=2,
+                transaction_id="t1")
+            ca.add_artifact_inputs(conn, aid, ["A_T", "A_N"],
+                                   roles={"A_T": "tumor"})  # A_N has no role
+        assert ca.artifact_input_roles(conn, aid) == {"A_N": None, "A_T": "tumor"}
+    finally:
+        conn.close()

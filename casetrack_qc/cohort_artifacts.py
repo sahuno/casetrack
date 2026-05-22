@@ -248,6 +248,10 @@ def add_artifact_inputs(
     e.g. ``{"A_T": "tumor", "A_N": "normal"}``. Omitted entries (or ``None``
     for the whole dict) store NULL in the ``role`` column, which is always
     backward-compatible.
+
+    Because the INSERT uses ``INSERT OR IGNORE``, a second call for the same
+    ``(artifact_id, assay_id)`` pair will silently skip the row and will NOT
+    update an existing role — roles are write-once per input link.
     """
     ids = list(assay_ids)
     for assay_id in ids:
