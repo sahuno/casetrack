@@ -292,6 +292,7 @@ def _artifact_rows(conn) -> list[dict]:
                 "run_tag": art.run_tag,
                 "path": art.path,
                 "n_inputs": art.n_inputs,
+                "region_scope": art.region_scope,
                 "stale": len(censored) > 0,
                 "n_censored_inputs": len(censored),
                 "censored_inputs": censored,
@@ -315,6 +316,9 @@ def cmd_cohort_artifacts(args) -> None:
             sys.exit(1)
 
         rows = _artifact_rows(conn)
+        scope = getattr(args, "scope", None)
+        if scope:
+            rows = [r for r in rows if r["region_scope"] == scope]
         if getattr(args, "stale_only", False):
             rows = [r for r in rows if r["stale"]]
 
@@ -322,7 +326,7 @@ def cmd_cohort_artifacts(args) -> None:
         if fmt == "json":
             print(json.dumps(rows, indent=2))
         elif fmt == "tsv":
-            cols = ["artifact_id", "analysis", "run_tag", "n_inputs",
+            cols = ["artifact_id", "analysis", "run_tag", "region_scope", "n_inputs",
                     "stale", "n_censored_inputs", "path"]
             print("#" + "\t".join(cols))
             for r in rows:
@@ -337,6 +341,8 @@ def cmd_cohort_artifacts(args) -> None:
                     f"[{flag}] {r['analysis']}/{r['run_tag']}  "
                     f"id={r['artifact_id']}  inputs={r['n_inputs']}"
                 )
+                if r["region_scope"]:
+                    line += f"  scope={r['region_scope']}"
                 if r["stale"]:
                     line += (
                         f"  censored={r['n_censored_inputs']} "

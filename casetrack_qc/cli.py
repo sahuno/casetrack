@@ -197,6 +197,8 @@ def build_qc_subparsers(subparsers) -> None:
                          default="table")
     p_calist.add_argument("--stale-only", dest="stale_only", action="store_true",
                          help="Show only artifacts with one or more censored inputs")
+    p_calist.add_argument("--scope", default=None,
+                         help="[v0.11] Show only artifacts with this region_scope label")
 
     # ── migrate-references ── (proposal 0010)
     p_migr = subparsers.add_parser(
