@@ -7045,6 +7045,108 @@ def _explode_samplesheet(df, schema):
     return frames
 
 
+def _validate_samplesheet(df, schema):
+    """Pre-write integrity checks for a register-cohort sample sheet (0012 §6.4).
+
+    Raises ValueError (with a human message) on the first violation: a missing
+    level key column, a missing required column, a row with any blank key or
+    required attr (full-chain), a specimen mapped to >1 patient, a duplicate
+    assay_id, or an entity key with conflicting attribute values across rows.
+    Routing/undeclared-column errors are surfaced by _route_samplesheet_columns
+    (called first). Runs entirely before any DB write so a bad sheet never
+    half-loads.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Wide sample-sheet with one row per assay.
+    schema : dict
+        Parsed casetrack.toml schema dict.
+
+    Raises
+    ------
+    ValueError
+        On any integrity violation, with a human-readable message naming the
+        offending column(s) or entity key(s).
+
+    Example
+    -------
+    >>> _validate_samplesheet(df, schema)  # no raise when valid
+    """
+    routed = _route_samplesheet_columns(list(df.columns), schema)  # undeclared/ambiguous → ValueError
+    levels = schema["levels"]
+
+    # every level's KEY column must be present (else later df[key] dereferences KeyError)
+    for lvl in LEVEL_ORDER:
+        key_col = levels[lvl]["key"]
+        if key_col not in df.columns:
+            raise ValueError(
+                f"required key column {key_col!r} (level {lvl}) missing from sample sheet"
+            )
+
+    # required attribute columns must be present in the header
+    for lvl in LEVEL_ORDER:
+        for col, spec in levels[lvl]["columns"].items():
+            if spec.get("required") and col not in df.columns:
+                raise ValueError(
+                    f"required column {col!r} (level {lvl}) missing from sample sheet"
+                )
+
+    # full chain: every row must have all three keys + every required attr non-empty
+    def _blank(v):
+        return v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == ""
+
+    required_cols = [
+        c
+        for lvl in LEVEL_ORDER
+        for c, s in levels[lvl]["columns"].items()
+        if (s.get("required") or c == levels[lvl]["key"]) and c in df.columns
+    ]
+    for i in range(len(df)):
+        for col in required_cols:
+            if _blank(df.iloc[i][col]):
+                raise ValueError(
+                    f"row {i}: empty {col!r} breaks the patient→specimen→assay chain"
+                )
+
+    # specimen → exactly one parent patient (read parent key from schema, not hardcoded)
+    specimen_key = levels["specimen"]["key"]
+    specimen_parent_key = levels["specimen"].get("parent_key", "patient_id")
+    sp = df[[specimen_key, specimen_parent_key]].astype(str).drop_duplicates()
+    dup_sp = sp[sp.duplicated(subset=[specimen_key], keep=False)]
+    if not dup_sp.empty:
+        bad = sorted(dup_sp[specimen_key].unique())[:3]
+        raise ValueError(
+            f"specimen(s) mapped to >1 parent patient (one parent only): {bad}"
+        )
+
+    # duplicate assay_id: allow fully-identical duplicate rows; flag only conflicting ones
+    assay_key = levels["assay"]["key"]
+    if df[assay_key].astype(str).duplicated().any():
+        assay_cols = routed["assay"]
+        confl = df[assay_cols].astype(str).drop_duplicates()
+        if confl[assay_key].duplicated().any():
+            bad = sorted(
+                confl[confl[assay_key].duplicated(keep=False)][assay_key].unique()
+            )[:3]
+            raise ValueError(
+                f"duplicate {assay_key!r} with differing values: {bad}"
+            )
+
+    # conflicting attributes for the same entity key (patient, specimen)
+    for lvl in ("patient", "specimen"):
+        key_col = levels[lvl]["key"]
+        cols = routed[lvl]
+        distinct = df[cols].astype(str).drop_duplicates()
+        if distinct[key_col].duplicated().any():
+            bad = sorted(
+                distinct[distinct[key_col].duplicated(keep=False)][key_col].unique()
+            )[:3]
+            raise ValueError(
+                f"{lvl} key(s) with conflicting attribute values across rows: {bad}"
+            )
+
+
 def cmd_add_metadata_project(args):
     project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     from casetrack_lifecycle.gate import assert_not_archived as _assert_not_archived
