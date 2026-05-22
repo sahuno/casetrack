@@ -6803,6 +6803,130 @@ class _MetadataRouting(Exception):
         )
 
 
+def _upsert_level(conn, *, level, frame, schema, allow_new, overwrite):
+    """Validate ``frame`` against ``level``'s schema and upsert it into the level table.
+
+    Caller owns the transaction. Returns {'inserted': n, 'updated': m, 'skipped': 0,
+    'meta_cols': [...], 'sql': [...]}. Raises _MetadataRouting (missing keys without
+    allow_new, or missing parents), ValueError (undeclared column / malformed id),
+    or sqlite3.IntegrityError. A frame with only the key column (no attribute/FK
+    columns) inserts key-only rows — register-cohort relies on this (proposal 0012).
+    """
+    level_spec = schema["levels"][level]
+    table = f"{level}s"
+    key_col = level_spec["key"]
+    parent_key_col = level_spec.get("parent_key")
+    parent_level = level_spec.get("parent")
+
+    if key_col not in frame.columns:
+        raise ValueError(
+            f"key column {key_col!r} not in sample sheet for level {level!r}"
+        )
+
+    meta_cols = [c for c in frame.columns if c != key_col]
+    declared_cols = set(level_spec["columns"])
+    unknown = [c for c in meta_cols if c not in declared_cols]
+    if unknown:
+        raise ValueError(
+            f"columns not declared in casetrack.toml under [levels.{level}.columns]: {unknown}"
+        )
+
+    if allow_new and parent_key_col and parent_key_col not in frame.columns:
+        raise ValueError(
+            f"inserting new {level}(s) requires the parent FK column {parent_key_col!r}"
+        )
+
+    executed_sql: list[str] = []
+    n_updated = n_inserted = 0
+
+    existing_keys = {
+        str(r[0]) for r in conn.execute(
+            f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
+        ).fetchall()
+    }
+    tsv_keys = frame[key_col].astype(str).tolist()
+    missing_keys = set(tsv_keys) - existing_keys
+
+    parents_needed: set = set()
+    missing_parents: set = set()
+    if missing_keys and allow_new and parent_level:
+        new_rows = frame[frame[key_col].astype(str).isin(missing_keys)]
+        parents_needed = set(new_rows[parent_key_col].astype(str))
+        parent_table = f"{parent_level}s"
+        parents_have = {
+            str(r[0]) for r in conn.execute(
+                f"SELECT {_quote_ident(parent_key_col)} FROM {_quote_ident(parent_table)}"
+            ).fetchall()
+        }
+        missing_parents = parents_needed - parents_have
+
+    if missing_keys and not allow_new:
+        raise _MetadataRouting(missing_keys, set())
+    if missing_parents:
+        raise _MetadataRouting(set(), missing_parents)
+
+    # UPDATE existing keys (fill-only unless overwrite). No-op when meta_cols empty.
+    update_keys = [k for k in tsv_keys if k in existing_keys]
+    if update_keys and meta_cols:
+        if overwrite:
+            set_clauses = ", ".join(f"{_quote_ident(c)} = ?" for c in meta_cols)
+        else:
+            # Default = fill-only: COALESCE keeps existing non-null values.
+            set_clauses = ", ".join(
+                f"{_quote_ident(c)} = COALESCE({_quote_ident(c)}, ?)"
+                for c in meta_cols
+            )
+        update_sql = (
+            f"UPDATE {_quote_ident(table)} SET {set_clauses} "
+            f"WHERE {_quote_ident(key_col)} = ?"
+        )
+        executed_sql.append(update_sql)
+        idx_by_key = {
+            str(frame.iloc[i][key_col]): i for i in range(len(frame))
+        }
+        for k in update_keys:
+            row = frame.iloc[idx_by_key[k]]
+            values = tuple(_coerce_for_sqlite(row[c]) for c in meta_cols)
+            values += (k,)
+            conn.execute(update_sql, values)
+            n_updated += 1
+
+    # INSERT new keys.
+    if allow_new and missing_keys:
+        # Validate every new key against the schema's format rules (proposal 0005 Part A).
+        for new_key in missing_keys:
+            validate_hierarchy_id(new_key, schema, level)
+        # Also validate parent keys we're about to reference.
+        if parent_level:
+            for parent_id in parents_needed:
+                validate_hierarchy_id(parent_id, schema, parent_level)
+        # Case-variant check against existing rows, once per batch.
+        folded_existing = _preload_folded_ids(conn, schema, level)
+        for new_key in missing_keys:
+            check_id_case_unique(conn, schema, level, new_key, folded_existing)
+        new_rows = frame[frame[key_col].astype(str).isin(missing_keys)]
+        insert_cols = [key_col] + meta_cols
+        quoted_cols = ", ".join(_quote_ident(c) for c in insert_cols)
+        placeholders = ", ".join("?" * len(insert_cols))
+        insert_sql = (
+            f"INSERT INTO {_quote_ident(table)} "
+            f"({quoted_cols}) VALUES ({placeholders})"
+        )
+        executed_sql.append(insert_sql)
+        for _, row in new_rows.iterrows():
+            values = tuple(_coerce_for_sqlite(row[c]) for c in insert_cols)
+            conn.execute(insert_sql, values)
+            n_inserted += 1
+
+    return {
+        "inserted": n_inserted,
+        "updated": n_updated,
+        "skipped": 0,
+        "meta_cols": meta_cols,
+        "sql": executed_sql,
+    }
+
+
 def cmd_add_metadata_project(args):
     project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     from casetrack_lifecycle.gate import assert_not_archived as _assert_not_archived
@@ -6879,101 +7003,18 @@ def cmd_add_metadata_project(args):
 
     db_path = project_dir / PROJECT_DB_NAME
     conn = open_project_db(db_path)
-    executed_sql: list[str] = []
-    n_updated = 0
-    n_inserted = 0
+    result: dict = {"inserted": 0, "updated": 0, "meta_cols": meta_cols, "sql": []}
 
     try:
         with begin_immediate(conn):
-            existing_keys = {
-                str(r[0]) for r in conn.execute(
-                    f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
-                ).fetchall()
-            }
-            tsv_keys = metadata[key_col].astype(str).tolist()
-            tsv_key_set = set(tsv_keys)
-            missing_keys = tsv_key_set - existing_keys
-
-            # If we're inserting, validate parents first.
-            missing_parents: set = set()
-            if missing_keys and args.allow_new and parent_level:
-                new_rows = metadata[metadata[key_col].astype(str).isin(missing_keys)]
-                parent_col = parent_key_col
-                parents_needed = set(new_rows[parent_col].astype(str))
-                parent_table = f"{parent_level}s"
-                parents_have = {
-                    str(r[0]) for r in conn.execute(
-                        f"SELECT {_quote_ident(parent_col)} FROM {_quote_ident(parent_table)}"
-                    ).fetchall()
-                }
-                missing_parents = parents_needed - parents_have
-
-            if missing_keys and not args.allow_new:
-                raise _MetadataRouting(missing_keys, set())
-            if missing_parents:
-                raise _MetadataRouting(set(), missing_parents)
-
-            # UPDATEs for existing keys.
-            update_keys = [k for k in tsv_keys if k in existing_keys]
-            if update_keys:
-                if args.overwrite:
-                    set_clauses = ", ".join(f"{_quote_ident(c)} = ?" for c in meta_cols)
-                else:
-                    # Default = fill-only (matches v0.2 add-metadata default).
-                    set_clauses = ", ".join(
-                        f"{_quote_ident(c)} = COALESCE({_quote_ident(c)}, ?)"
-                        for c in meta_cols
-                    )
-                update_sql = (
-                    f"UPDATE {_quote_ident(table)} SET {set_clauses} "
-                    f"WHERE {_quote_ident(key_col)} = ?"
-                )
-                executed_sql.append(update_sql)
-                idx_by_key = {
-                    str(metadata.iloc[i][key_col]): i for i in range(len(metadata))
-                }
-                for k in update_keys:
-                    row = metadata.iloc[idx_by_key[k]]
-                    values = tuple(_coerce_for_sqlite(row[c]) for c in meta_cols)
-                    values += (k,)
-                    conn.execute(update_sql, values)
-                    n_updated += 1
-
-            # INSERTs for new keys.
-            if args.allow_new and missing_keys:
-                # v0.6: validate every new key against the schema's format
-                # rules (proposal 0005 Part A) before the INSERT runs, so
-                # malformed IDs surface at the source of the problem.
-                for new_key in missing_keys:
-                    validate_hierarchy_id(new_key, schema, level)
-                # Also validate parent keys we're about to reference — if
-                # missing_parents was non-empty, we've already failed above;
-                # here we only reach valid parents, but their case-variants
-                # still need checking.
-                if parent_level:
-                    for parent_id in parents_needed:
-                        validate_hierarchy_id(parent_id, schema, parent_level)
-                # Case-variant check against existing rows, once per batch.
-                folded_existing = _preload_folded_ids(conn, schema, level)
-                for new_key in missing_keys:
-                    check_id_case_unique(
-                        conn, schema, level, new_key, folded_existing
-                    )
-                new_rows = metadata[metadata[key_col].astype(str).isin(missing_keys)]
-                insert_cols = [key_col] + meta_cols
-                quoted_cols = ", ".join(_quote_ident(c) for c in insert_cols)
-                placeholders = ", ".join("?" * len(insert_cols))
-                insert_sql = (
-                    f"INSERT INTO {_quote_ident(table)} "
-                    f"({quoted_cols}) VALUES ({placeholders})"
-                )
-                executed_sql.append(insert_sql)
-                for _, row in new_rows.iterrows():
-                    values = tuple(
-                        _coerce_for_sqlite(row[c]) for c in insert_cols
-                    )
-                    conn.execute(insert_sql, values)
-                    n_inserted += 1
+            result = _upsert_level(
+                conn,
+                level=level,
+                frame=metadata,
+                schema=schema,
+                allow_new=args.allow_new,
+                overwrite=args.overwrite,
+            )
 
     except _MetadataRouting as e:
         conn.close()
@@ -7016,19 +7057,20 @@ def cmd_add_metadata_project(args):
         "level": level,
         "metadata_file": str(metadata_path),
         "metadata_checksum": _checksum(str(metadata_path)),
-        "columns": meta_cols,
-        "rows_updated": n_updated,
-        "rows_inserted": n_inserted,
+        "columns": result["meta_cols"],
+        "rows_updated": result["updated"],
+        "rows_inserted": result["inserted"],
         "mode": "overwrite" if args.overwrite else ("fill_only" if args.fill_only else "fill_only"),
         "transaction_id": _new_transaction_id(),
-        "sql": executed_sql,
+        "sql": result["sql"],
         "schema_v_before": schema["project"]["schema_v"],
         "schema_v_after": schema["project"]["schema_v"],
     })
 
     print(
         f"add-metadata → {level}: "
-        f"updated={n_updated}, inserted={n_inserted}, columns={len(meta_cols)}."
+        f"updated={result['updated']}, inserted={result['inserted']}, "
+        f"columns={len(result['meta_cols'])}."
     )
 
 
