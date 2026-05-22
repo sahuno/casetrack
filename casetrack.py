@@ -7303,6 +7303,124 @@ def cmd_add_metadata_project(args):
     )
 
 
+# ── register-cohort (proposal 0012 §6.5) ──────────────────────────────────────
+
+def cmd_register_cohort(args):
+    """Explode one schema-native wide sample sheet into the three normalized
+    tables (patients, specimens, assays) in a single transaction (proposal 0012).
+
+    The sample sheet must contain every level's key column plus any required
+    attribute columns declared in casetrack.toml.  Columns are routed to the
+    appropriate level table by _route_samplesheet_columns; duplicate parent rows
+    (e.g. the same patient appearing on multiple assay rows) are collapsed by
+    _explode_samplesheet before upsert.
+
+    --dry-run prints what *would* be loaded without touching the DB.
+    Re-running with the same sheet is idempotent (fill-only upsert by default).
+    """
+    project_dir, schema = _resolve_project(
+        args.project_dir, project_id=getattr(args, "project", None)
+    )
+    from casetrack_lifecycle.gate import assert_not_archived as _assert_not_archived
+    _assert_not_archived(
+        project_dir,
+        force_archived=getattr(args, "force_archived", False),
+        yes=getattr(args, "yes", False),
+    )
+
+    sheet_path = Path(args.samplesheet)
+    if not sheet_path.exists():
+        print(f"Error: sample sheet not found: {sheet_path}", file=sys.stderr)
+        sys.exit(1)
+
+    df = pd.read_csv(sheet_path, sep="\t", dtype=str).fillna("")
+
+    try:
+        _validate_samplesheet(df, schema)
+        frames = _explode_samplesheet(df, schema)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if getattr(args, "dry_run", False):
+        conn = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            print("[dry-run] register-cohort would load:")
+            for lvl in LEVEL_ORDER:
+                key_col = schema["levels"][lvl]["key"]
+                table = f"{lvl}s"
+                existing = {
+                    str(r[0]) for r in conn.execute(
+                        f"SELECT {_quote_ident(key_col)} FROM {_quote_ident(table)}"
+                    ).fetchall()
+                }
+                keys = set(frames[lvl][key_col].astype(str))
+                new_count = len(keys - existing)
+                print(
+                    f"  {lvl:8s}: {new_count} new, "
+                    f"{len(keys) - new_count} existing"
+                )
+        finally:
+            conn.close()
+        return
+
+    txn_id = _new_transaction_id()
+    conn = open_project_db(project_dir / PROJECT_DB_NAME)
+    counts: dict = {}
+    try:
+        with begin_immediate(conn):
+            for lvl in LEVEL_ORDER:  # FK order: patient → specimen → assay
+                counts[lvl] = _upsert_level(
+                    conn,
+                    level=lvl,
+                    frame=frames[lvl],
+                    schema=schema,
+                    allow_new=True,
+                    overwrite=getattr(args, "overwrite", False),
+                )
+    except _MetadataRouting as e:
+        conn.close()
+        missing = sorted((e.missing_keys | e.missing_parents))[:5]
+        print(
+            f"Error: register-cohort aborted — unresolved parents/keys: {missing}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except ValueError as e:
+        conn.close()
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+    except sqlite3.IntegrityError as e:
+        conn.close()
+        print(
+            f"Error: register-cohort aborted — {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    finally:
+        conn.close()
+
+    log_project_provenance(project_dir, {
+        "action": "register_cohort",
+        "samplesheet": str(sheet_path),
+        "samplesheet_checksum": _checksum(str(sheet_path)),
+        "counts": {
+            lvl: {"inserted": counts[lvl]["inserted"], "updated": counts[lvl]["updated"]}
+            for lvl in LEVEL_ORDER
+        },
+        "overwrite": bool(getattr(args, "overwrite", False)),
+        "transaction_id": txn_id,
+    })
+
+    print(
+        "register-cohort: "
+        + ", ".join(
+            f"{lvl}s +{counts[lvl]['inserted']} (~{counts[lvl]['updated']})"
+            for lvl in LEVEL_ORDER
+        )
+    )
+
+
 # ── v0.3 status ────────────────────────────────────────────────────────────────
 #
 # Implements `casetrack status --project-dir` per proposal 0001 §7.1. Four

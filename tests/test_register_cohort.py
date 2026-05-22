@@ -109,3 +109,92 @@ def test_validate_missing_key_column():
     df = _full_sheet().drop(columns=["assay_id"])
     with pytest.raises(ValueError, match="assay_id|key"):
         casetrack._validate_samplesheet(df, SCHEMA)
+
+
+# ---------------------------------------------------------------------------
+# cmd_register_cohort integration tests (Task 4)
+# ---------------------------------------------------------------------------
+
+def _init_project(tmp_path):
+    """Init an hgsoc project and return its directory path."""
+    proj = tmp_path / "proj"
+    ns = argparse.Namespace(
+        manifest=None, project_dir=str(proj), samples=None, key="sample_id",
+        metadata=None, cols=None, from_template="hgsoc",
+        project_name=None, force=False,
+    )
+    casetrack.cmd_init(ns)
+    return proj
+
+
+def _write_sheet(path):
+    """Write a minimal valid hgsoc sample sheet (3 assays, 2 patients)."""
+    path.write_text(
+        "patient_id\ttissue_site\tspecimen_id\tassay_type\tassay_id\n"
+        "P1\ttumor\tP1-T\tONT\tP1-T-ONT\n"
+        "P1\tnormal\tP1-N\tONT\tP1-N-ONT\n"
+        "P2\ttumor\tP2-T\tONT\tP2-T-ONT\n"
+    )
+
+
+def _ns(proj, sheet, **kw):
+    base = dict(project_dir=str(proj), project=None, samplesheet=str(sheet),
+                overwrite=False, dry_run=False, force_archived=False, yes=False)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_register_cohort_loads_all_levels(tmp_path):
+    proj = _init_project(tmp_path)
+    sheet = tmp_path / "cohort.tsv"
+    _write_sheet(sheet)
+    casetrack.cmd_register_cohort(_ns(proj, sheet))
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM specimens").fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM assays").fetchone()[0] == 3
+    finally:
+        conn.close()
+
+
+def test_register_cohort_dry_run_writes_nothing(tmp_path):
+    proj = _init_project(tmp_path)
+    sheet = tmp_path / "cohort.tsv"
+    _write_sheet(sheet)
+    casetrack.cmd_register_cohort(_ns(proj, sheet, dry_run=True))
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_register_cohort_rerun_idempotent(tmp_path):
+    proj = _init_project(tmp_path)
+    sheet = tmp_path / "cohort.tsv"
+    _write_sheet(sheet)
+    casetrack.cmd_register_cohort(_ns(proj, sheet))
+    casetrack.cmd_register_cohort(_ns(proj, sheet))  # second run inserts 0 new
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM assays").fetchone()[0] == 3
+    finally:
+        conn.close()
+
+
+def test_register_cohort_rolls_back_on_bad_sheet(tmp_path):
+    """Blank assay_id fails validation → sys.exit(2) → nothing written."""
+    proj = _init_project(tmp_path)
+    sheet = tmp_path / "bad.tsv"
+    sheet.write_text(
+        "patient_id\ttissue_site\tspecimen_id\tassay_type\tassay_id\n"
+        "P1\ttumor\tP1-T\tONT\t\n"  # blank assay_id → validation error
+    )
+    with pytest.raises(SystemExit):
+        casetrack.cmd_register_cohort(_ns(proj, sheet))
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0] == 0
+    finally:
+        conn.close()
