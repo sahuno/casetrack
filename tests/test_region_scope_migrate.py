@@ -9,6 +9,8 @@ import argparse
 import json
 from pathlib import Path
 
+import pytest
+
 import casetrack
 from casetrack_qc.cohort_artifacts_cli import cmd_migrate_region_scope
 
@@ -69,4 +71,24 @@ def test_migrate_region_scope_is_idempotent(tmp_path: Path, capsys):
     out = capsys.readouterr().out.lower()
     assert "no migration needed" in out
     prov = (proj / "provenance.jsonl").read_text().splitlines()
-    assert any(json.loads(l).get("action") == "migrate_region_scope" for l in prov)
+    entries = [l for l in prov if json.loads(l).get("action") == "migrate_region_scope"]
+    assert len(entries) == 1  # second call is a no-op — provenance written exactly once
+
+
+def test_migrate_region_scope_errors_without_cohort_schema(tmp_path: Path):
+    proj = tmp_path / "proj"
+    casetrack.cmd_init(argparse.Namespace(
+        manifest=None, project_dir=str(proj), samples=None, key="sample_id",
+        metadata=None, cols=None, from_template="hgsoc",
+        project_name="test", force=False,
+    ))
+    # Drop both 0009 tables to simulate a project with no cohort-artifact schema.
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    with casetrack.begin_immediate(conn):
+        conn.execute("DROP TABLE IF EXISTS cohort_artifact_inputs")
+        conn.execute("DROP TABLE IF EXISTS cohort_artifacts")
+    conn.close()
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_migrate_region_scope(argparse.Namespace(project_dir=str(proj), dry_run=False))
+    assert exc_info.value.code == 1

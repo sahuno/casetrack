@@ -1,8 +1,9 @@
 """CLI commands for cohort-level artifacts (proposal 0009 §6.3).
 
-- ``migrate-cohort``    — additive: create the two tables on a pre-0009 project.
-- ``append-cohort``     — register one cohort artifact + its assay lineage.
-- ``cohort-artifacts``  — list artifacts with read-time staleness.
+- ``migrate-cohort``       — additive: create the two tables on a pre-0009 project.
+- ``append-cohort``        — register one cohort artifact + its assay lineage.
+- ``cohort-artifacts``     — list artifacts with read-time staleness.
+- ``migrate-region-scope`` — additive: add region_scope/role columns to a post-0009 / pre-0013 project.
 
 Mirrors the ``casetrack_qc.migrate`` / ``casetrack_qc.cohort`` command style:
 resolve project → open db → one ``begin_immediate`` write → provenance entry.
