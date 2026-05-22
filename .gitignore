@@ -37,3 +37,12 @@ Thumbs.db
 # regenerated every run by the summary phase, not source.
 examples/hgsoc_sim/hpc/benchmarks/
 
+# Nextflow local runtime state — machine-specific paths + binary cache/index
+# files, regenerated every run; never source (Codex review 0012, P2).
+.nextflow/
+.nextflow.log*
+
+# GUI smoke-test HTML snapshots — rendered from a real project, so they carry
+# patient/sample metadata; regenerable from the smoke test (Codex review 0012, P1).
+sandbox/gui_smoke/
+
