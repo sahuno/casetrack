@@ -230,3 +230,35 @@ def test_register_cohort_rolls_back_on_mid_transaction_integrity_error(tmp_path,
         assert conn.execute("SELECT COUNT(*) FROM specimens").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI end-to-end tests (Task 5) — exercise the argparse + dispatch layer
+# ---------------------------------------------------------------------------
+
+def _run(args):
+    return subprocess.run(
+        [sys.executable, "-m", "casetrack", *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_register_cohort_cli_end_to_end(tmp_path):
+    proj = _init_project(tmp_path)
+    sheet = tmp_path / "cohort.tsv"
+    _write_sheet(sheet)
+    r = _run(["register-cohort", "--project-dir", str(proj), "--samplesheet", str(sheet)])
+    assert r.returncode == 0, r.stderr
+    assert "register-cohort:" in r.stdout
+    r2 = _run(["register-cohort", "--project-dir", str(proj), "--samplesheet", str(sheet), "--dry-run"])
+    assert r2.returncode == 0 and "[dry-run]" in r2.stdout
+
+
+def test_register_cohort_cli_validation_exit2(tmp_path):
+    proj = _init_project(tmp_path)
+    bad = tmp_path / "bad.tsv"
+    bad.write_text("patient_id\tbogus_col\nP1\tx\n")  # undeclared column
+    r = _run(["register-cohort", "--project-dir", str(proj), "--samplesheet", str(bad)])
+    assert r.returncode == 2
+    assert "Error" in r.stderr and "Traceback" not in r.stderr

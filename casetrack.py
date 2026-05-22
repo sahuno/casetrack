@@ -8730,6 +8730,33 @@ Examples:
         help="[v0.7] Allow mutations on an archived project (requires --yes)",
     )
 
+    # ── register-cohort ── (proposal 0012)
+    p_regcohort = subparsers.add_parser(
+        "register-cohort",
+        help="[v0.10] Bulk-register patients+specimens+assays from one wide sample sheet",
+    )
+    g_rc = p_regcohort.add_mutually_exclusive_group(required=True)
+    g_rc.add_argument("--project-dir", help="Casetrack project directory")
+    g_rc.add_argument("--project", help="Registered project id (registry lookup)")
+    p_regcohort.add_argument(
+        "--samplesheet", required=True,
+        help="Wide TSV: one row per assay, columns named to match the schema "
+             "(patient_id, specimen_id, assay_id + declared level columns)",
+    )
+    p_regcohort.add_argument(
+        "--overwrite", action="store_true",
+        help="Replace existing non-null attribute cells (default: fill-only)",
+    )
+    p_regcohort.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="Print the per-level new/existing plan; write nothing",
+    )
+    p_regcohort.add_argument(
+        "--force-archived", action="store_true",
+        help="[v0.7] Allow on an archived project (requires --yes)",
+    )
+    p_regcohort.add_argument("--yes", action="store_true", help="Confirm --force-archived")
+
     # ── dashboard ──
     p_dash = subparsers.add_parser(
         "dashboard",
@@ -9004,6 +9031,7 @@ Examples:
         "migrate": cmd_migrate,
         "migrate-project-id": cmd_migrate_project_id,
         "register": cmd_register,
+        "register-cohort": cmd_register_cohort,
         "doctor": cmd_doctor_project,
         "recover": cmd_recover_project,
     }
