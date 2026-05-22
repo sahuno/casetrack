@@ -7056,6 +7056,11 @@ def _validate_samplesheet(df, schema):
     (called first). Runs entirely before any DB write so a bad sheet never
     half-loads.
 
+    Note: the full-chain blank check and the conflict checks iterate per-cell /
+    per-entity; this is intended for cohort scale (hundreds to low thousands of
+    rows). Very large sheets (100K+ rows) are outside the design scope and will
+    be noticeably slow.
+
     Parameters
     ----------
     df : pandas.DataFrame
@@ -7111,7 +7116,11 @@ def _validate_samplesheet(df, schema):
 
     # specimen → exactly one parent patient (read parent key from schema, not hardcoded)
     specimen_key = levels["specimen"]["key"]
-    specimen_parent_key = levels["specimen"].get("parent_key", "patient_id")
+    specimen_parent_key = levels["specimen"].get("parent_key")
+    if not specimen_parent_key:
+        raise ValueError(
+            "schema is missing parent_key for level 'specimen'; run `casetrack schema apply`"
+        )
     sp = df[[specimen_key, specimen_parent_key]].astype(str).drop_duplicates()
     dup_sp = sp[sp.duplicated(subset=[specimen_key], keep=False)]
     if not dup_sp.empty:

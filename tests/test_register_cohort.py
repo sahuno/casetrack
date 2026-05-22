@@ -100,7 +100,7 @@ def test_validate_duplicate_assay():
 
 def test_validate_conflicting_attribute():
     df = _full_sheet(); df.loc[1, "patient_id"] = "P1"; df.loc[1, "cohort"] = "other"
-    with pytest.raises(ValueError, match="conflict|cohort"):
+    with pytest.raises(ValueError, match="conflicting attribute"):
         casetrack._validate_samplesheet(df, SCHEMA)
 
 
