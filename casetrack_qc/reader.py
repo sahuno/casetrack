@@ -22,6 +22,21 @@ from typing import Iterable
 # QC statuses that exclude by default (proposal §4.4).
 DEFAULT_QC_EXCLUDE: tuple[str, ...] = ("fail", "censored", "consent_revoked")
 
+# proj-qualified active-assay subquery used inside DuckDB views (the tables live
+# in the attached `proj` catalog). Mirrors build_active_assay_sql with default
+# exclusions. Shared by install_cohort_artifact_view and _derived_stale_cte so
+# the cohort input-staleness definition has exactly one source of truth.
+_ACTIVE_ASSAY_SQL = """
+        SELECT a.assay_id
+        FROM proj.assays a
+        JOIN proj.specimens s ON a.specimen_id = s.specimen_id
+        JOIN proj.patients  p ON s.patient_id  = p.patient_id
+        WHERE a.qc_status NOT IN ('fail', 'censored', 'consent_revoked')
+          AND s.qc_status NOT IN ('fail', 'censored', 'consent_revoked')
+          AND p.qc_status NOT IN ('fail', 'censored', 'consent_revoked')
+          AND p.consent_status IN ('consented', 'consented_limited_use')
+    """
+
 # Consent statuses excluded by default (§4.3). `consented_limited_use` is
 # treated as usable.
 DEFAULT_CONSENT_INCLUDE: tuple[str, ...] = ("consented", "consented_limited_use")
@@ -206,16 +221,7 @@ def install_cohort_artifact_view(duckdb_con) -> None:
     """
     # proj-qualified active-assay set (mirrors build_active_assay_sql, but the
     # tables live in the attached `proj` catalog inside DuckDB).
-    active_sql = """
-        SELECT a.assay_id
-        FROM proj.assays a
-        JOIN proj.specimens s ON a.specimen_id = s.specimen_id
-        JOIN proj.patients  p ON s.patient_id  = p.patient_id
-        WHERE a.qc_status NOT IN ('fail', 'censored', 'consent_revoked')
-          AND s.qc_status NOT IN ('fail', 'censored', 'consent_revoked')
-          AND p.qc_status NOT IN ('fail', 'censored', 'consent_revoked')
-          AND p.consent_status IN ('consented', 'consented_limited_use')
-    """
+    active_sql = _ACTIVE_ASSAY_SQL
     censored_count = f"""
         (SELECT COUNT(*) FROM proj.cohort_artifact_inputs ci
           WHERE ci.artifact_id = ca.artifact_id
@@ -234,7 +240,28 @@ def install_cohort_artifact_view(duckdb_con) -> None:
               AND (rr.version IS NULL OR rr.version <> ru.version_used)
         )
     """
-    sql_with_ref_stale = f"""
+    # Proposal 0011: derived_stale. Joins the recursive transitive closure
+    # (derived) computed from BASE TABLES (self_safe=True) so it can be defined
+    # inside the very view it would otherwise self-reference.
+    # Requires: 0009 (cohort_artifacts) + 0010 (reference_usage) + 0011 (artifact_derivation).
+    sql_with_ref_stale_and_derived = f"""
+        CREATE VIEW "_cohort_artifacts" AS
+        WITH RECURSIVE {_derived_stale_cte(self_safe=True)}
+        SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
+               ca.n_inputs, ca.stats_json, ca.created_at,
+               {censored_count} AS n_censored_inputs,
+               ({censored_count} > 0) AS stale,
+               {ref_stale_subquery} AS ref_stale,
+               COALESCE(d.derived_stale, FALSE) AS derived_stale
+        FROM proj.cohort_artifacts ca
+        LEFT JOIN derived d
+               ON d.node = 'cohort:' || ca.analysis || '@' || ca.run_tag
+    """
+    # Proposal 0010 view without 0011 derived_stale. This is the exact body
+    # that shipped in v0.8.0 before Task 8 added artifact_derivation support.
+    # Required by 0010-era DBs that have reference_usage/reference_artifacts
+    # but lack artifact_derivation (not yet migrated to 0011).
+    sql_with_ref_stale_only = f"""
         CREATE VIEW "_cohort_artifacts" AS
         SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
                ca.n_inputs, ca.stats_json, ca.created_at,
@@ -243,6 +270,7 @@ def install_cohort_artifact_view(duckdb_con) -> None:
                {ref_stale_subquery} AS ref_stale
         FROM proj.cohort_artifacts ca
     """
+    # Pre-0010 fallback: no ref_stale column, no derived_stale column.
     sql_without_ref_stale = f"""
         CREATE VIEW "_cohort_artifacts" AS
         SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
@@ -252,16 +280,23 @@ def install_cohort_artifact_view(duckdb_con) -> None:
         FROM proj.cohort_artifacts ca
     """
     try:
-        duckdb_con.execute(sql_with_ref_stale)
+        # Tier 1: full 0011 view (artifact_derivation + reference tables present).
+        duckdb_con.execute(sql_with_ref_stale_and_derived)
     except Exception:
-        # Pre-0010 projects lack reference_usage/reference_artifacts — fall
-        # back to the original view without ref_stale.
+        # Tier 2: 0010-era view — reference tables present but artifact_derivation
+        # is absent (pre-0011 project not yet migrated). Preserves ref_stale so
+        # shipped 0010 functionality is not silently regressed.
         try:
-            duckdb_con.execute(sql_without_ref_stale)
+            duckdb_con.execute(sql_with_ref_stale_only)
         except Exception:
-            # Pre-0009 DBs lack the cohort-artifact tables — skip so `query`
-            # still works.
-            pass
+            # Tier 3: pre-0010 projects lack reference_usage/reference_artifacts —
+            # fall back to the original view without ref_stale.
+            try:
+                duckdb_con.execute(sql_without_ref_stale)
+            except Exception:
+                # Pre-0009 DBs lack the cohort-artifact tables — skip so `query`
+                # still works.
+                pass
 
 
 def install_reference_usage_view(duckdb_con) -> None:
@@ -297,6 +332,124 @@ def install_reference_usage_view(duckdb_con) -> None:
         pass
 
 
+def _derived_stale_cte(self_safe: bool = False) -> str:
+    """Reusable ``WITH RECURSIVE`` body computing derived_stale per node (0011).
+
+    Produces three CTEs plus a final ``derived(node, derived_stale)`` relation.
+    The caller must prefix this with ``WITH RECURSIVE`` and append a SELECT.
+
+    Semantics (must match casetrack_qc.artifact_derivation.derived_staleness):
+      - ``edges``  : up-edges = artifact_derivation (down->up) UNION the 0010
+        reference_usage consumer->``reference:<ref_key>`` edge.
+      - ``direct`` : each node's OWN single-hop staleness. cohort = (>=1 censored
+        input) OR (cohort ref-version mismatch); analysis = (ref mismatch);
+        reference = FALSE (references have no intrinsic direct staleness).
+      - ``reach``  : transitive closure (>=1 hop) of edges, seeded by every edge
+        (so a node's own direct staleness is NEVER folded into its derived_stale).
+        ``UNION`` (not UNION ALL) dedupes the working set so cycles terminate.
+      - ``derived``: node is derived_stale iff any node it reaches is direct-stale.
+
+    ``self_safe=True`` computes cohort/analysis direct staleness from BASE TABLES
+    (proj.cohort_artifacts / proj.reference_usage / proj.reference_artifacts)
+    instead of the ``_cohort_artifacts`` / ``_reference_usage`` DuckDB views.
+    This variant is REQUIRED when the CTE is embedded in the definition of the
+    ``_cohort_artifacts`` view itself (and in ``_artifact_derivation``, which is
+    installed in the same pass and must not depend on view-install order) —
+    reading the views there would be a self-reference / forward-reference.
+    """
+    if self_safe:
+        cohort_direct = """
+        SELECT 'cohort:' || ca.analysis || '@' || ca.run_tag AS node,
+               ((SELECT COUNT(*) FROM proj.cohort_artifact_inputs ci
+                  WHERE ci.artifact_id = ca.artifact_id
+                    AND ci.assay_id NOT IN (%(active)s)) > 0
+                OR EXISTS (
+                    SELECT 1 FROM proj.reference_usage ru2
+                    LEFT JOIN proj.reference_artifacts rr2 ON rr2.ref_key = ru2.ref_key
+                    WHERE ru2.scope = 'cohort'
+                      AND ru2.artifact_id = ca.artifact_id
+                      AND (rr2.version IS NULL OR rr2.version <> ru2.version_used))
+               ) AS d
+        FROM proj.cohort_artifacts ca
+        """ % {"active": _ACTIVE_ASSAY_SQL}
+        analysis_direct = """
+        SELECT 'analysis:' || ru.entity_level || '/' || ru.entity_id || '/' || ru.analysis AS node,
+               BOOL_OR(rr.version IS NULL OR rr.version <> ru.version_used) AS d
+        FROM proj.reference_usage ru
+        LEFT JOIN proj.reference_artifacts rr ON rr.ref_key = ru.ref_key
+        WHERE ru.scope = 'analysis'
+        GROUP BY 1
+        """
+    else:
+        cohort_direct = (
+            "SELECT 'cohort:' || analysis || '@' || run_tag AS node, "
+            "(stale OR ref_stale) AS d FROM \"_cohort_artifacts\""
+        )
+        analysis_direct = (
+            "SELECT 'analysis:' || entity_level || '/' || entity_id || '/' || analysis, "
+            "BOOL_OR(is_stale) FROM \"_reference_usage\" WHERE scope='analysis' GROUP BY 1"
+        )
+    return f"""
+    edges AS (
+        SELECT down_node, up_node FROM proj.artifact_derivation
+        UNION
+        SELECT CASE ru.scope
+                 WHEN 'cohort'   THEN 'cohort:' || ca.analysis || '@' || ca.run_tag
+                 WHEN 'analysis' THEN 'analysis:' || ru.entity_level || '/' || ru.entity_id || '/' || ru.analysis
+               END AS down_node,
+               'reference:' || ru.ref_key AS up_node
+        FROM proj.reference_usage ru
+        LEFT JOIN proj.cohort_artifacts ca ON ca.artifact_id = ru.artifact_id
+        WHERE ru.scope IN ('cohort', 'analysis')
+    ),
+    direct AS (
+        {cohort_direct}
+        UNION ALL
+        SELECT 'reference:' || ref_key, FALSE FROM proj.reference_artifacts
+        UNION ALL
+        {analysis_direct}
+    ),
+    reach(start, cur) AS (
+        SELECT down_node, up_node FROM edges
+        UNION
+        SELECT r.start, e.up_node FROM reach r JOIN edges e ON e.down_node = r.cur
+    ),
+    derived AS (
+        SELECT reach.start AS node, BOOL_OR(COALESCE(direct.d, FALSE)) AS derived_stale
+        FROM reach LEFT JOIN direct ON direct.node = reach.cur
+        GROUP BY reach.start
+    )
+    """
+
+
+def install_artifact_derivation_view(duckdb_con) -> None:
+    """Attach ``_artifact_derivation`` (edges + per-down_node derived_stale). 0011.
+
+    Each row is one ``artifact_derivation`` edge annotated with
+    ``down_derived_stale`` — the transitive derived-staleness of the edge's
+    downstream node (same closure as the ``derived_stale`` column on
+    ``_cohort_artifacts``). Uses ``_derived_stale_cte(self_safe=True)`` so it
+    reads only base tables and is independent of the other view installers.
+
+    Silent no-op on pre-0011 projects (no artifact_derivation table) or pre-0010
+    projects (the CTE references reference_usage / reference_artifacts).
+    """
+    sql = f"""
+        CREATE VIEW "_artifact_derivation" AS
+        WITH RECURSIVE {_derived_stale_cte(self_safe=True)}
+        SELECT e.down_node, e.up_node,
+               COALESCE(d.derived_stale, FALSE) AS down_derived_stale
+        FROM proj.artifact_derivation e
+        LEFT JOIN derived d ON d.node = e.down_node
+    """
+    try:
+        duckdb_con.execute(sql)
+    except Exception:
+        # Pre-0011 (no artifact_derivation) or pre-0010 (no reference tables) —
+        # skip so `query` still works on older projects.
+        pass
+
+
 __all__ = [
     "DEFAULT_CONSENT_INCLUDE",
     "DEFAULT_QC_EXCLUDE",
@@ -306,6 +459,7 @@ __all__ = [
     "build_active_assay_sql",
     "exclusion_breakdown",
     "install_active_views",
+    "install_artifact_derivation_view",
     "install_cohort_artifact_view",
     "install_reference_usage_view",
 ]

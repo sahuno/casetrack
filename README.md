@@ -292,6 +292,9 @@ and exact SQL.
 | `migrate-cohort` | **v0.7** — additive: create the cohort-artifact tables on a pre-0009 project   |
 | `references`     | **v0.8** — list reference artifacts + read-time ref-staleness (`--stale-only`, `--fmt`) (proposal 0010) |
 | `migrate-references` | **v0.8** — additive: create the reference-artifact tables on a pre-0010 project |
+| `derived-from`   | **v0.9** — declare a derivation edge between two lineage nodes (`cohort:`, `reference:`, `analysis:`) (proposal 0011) |
+| `derivation`     | **v0.9** — inspect the full derivation graph / derived-stale state (`--node`, `--stale-only`, `--fmt`) (proposal 0011) |
+| `migrate-derivation` | **v0.9** — additive: create the `artifact_derivation` table on a pre-0011 project |
 
 `casetrack <cmd> --help` for the full option list on any subcommand.
 
@@ -488,6 +491,7 @@ Upgrade-path commands (`migrate-qc`, `migrate-project-id`, `recover`) bypass the
 | `casetrack_query` | `project_id`, `sql` (SELECT / WITH only) | Rows as JSON |
 | `casetrack_cohort_artifacts` | `project_id`, `stale_only?` | Cohort artifacts + input-staleness (proposal 0009) |
 | `casetrack_references` | `project_id`, `stale_only?` | Reference artifacts + ref-staleness (proposal 0010) |
+| `casetrack_derivation` | `project_id`, `stale_only?` | Derivation graph + derived-staleness (proposal 0011) |
 
 Install the optional dependency + wire it into Claude Desktop:
 

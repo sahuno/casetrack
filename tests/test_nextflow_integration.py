@@ -193,8 +193,8 @@ def test_module_declares_cohort_process():
 
 def test_cohort_process_inputs_outputs():
     """`casetrack_append_cohort` takes the (analysis, run_tag, artifact,
-    inputs_tsv, stats_json, uses_references) fan-in tuple and re-emits
-    (analysis, run_tag)."""
+    inputs_tsv, stats_json, uses_references, derived_from) fan-in tuple and
+    re-emits (analysis, run_tag)."""
     src = (NF_DIR / "casetrack.nf").read_text()
     m = re.search(
         r"process\s+casetrack_append_cohort\s*\{(?P<body>.*?)^\}",
@@ -204,7 +204,8 @@ def test_cohort_process_inputs_outputs():
     body = m.group("body")
     assert re.search(
         r"tuple\s+val\(analysis\),\s*val\(run_tag\),\s*path\(artifact\),"
-        r"\s*path\(inputs_tsv\),\s*path\(stats_json\),\s*val\(uses_references\)",
+        r"\s*path\(inputs_tsv\),\s*path\(stats_json\),\s*val\(uses_references\),"
+        r"\s*val\(derived_from\)",
         body,
     )
     assert re.search(r"output:\s*\n\s*tuple\s+val\(analysis\),\s*val\(run_tag\)", body)
@@ -213,6 +214,48 @@ def test_cohort_process_inputs_outputs():
     assert "append-cohort" in body
     assert "--inputs-from" in body
     assert "--uses-references" in body
+    assert "--derived-from" in body
+
+
+def test_cohort_process_derived_from_flag_present_when_set():
+    """When derived_from_arg is non-empty the rendered command includes --derived-from."""
+    src = (NF_DIR / "casetrack.nf").read_text()
+    raw_script = _extract_script(src, "casetrack_append_cohort")
+    rendered = _render_script(raw_script, {
+        "params.casetrack_bin":         "casetrack",
+        "params.casetrack_project_dir": "/proj",
+        "params.casetrack_extra":       "",
+        "analysis":                     "call",
+        "run_tag":                      "v1",
+        "artifact":                     "/x/call.vcf.gz",
+        "inputs_tsv":                   "/x/inputs.txt",
+        "stats_arg":                    "",
+        "uses_references_arg":          "",
+        # non-empty derived_from_arg — as Nextflow would resolve it
+        "derived_from_arg":             "--derived-from 'cohort:joint@v1'",
+    })
+    assert "--derived-from" in rendered
+    assert "cohort:joint@v1" in rendered
+
+
+def test_cohort_process_derived_from_flag_absent_when_empty():
+    """When derived_from_arg is empty ([] input) --derived-from is NOT emitted."""
+    src = (NF_DIR / "casetrack.nf").read_text()
+    raw_script = _extract_script(src, "casetrack_append_cohort")
+    rendered = _render_script(raw_script, {
+        "params.casetrack_bin":         "casetrack",
+        "params.casetrack_project_dir": "/proj",
+        "params.casetrack_extra":       "",
+        "analysis":                     "call",
+        "run_tag":                      "v1",
+        "artifact":                     "/x/call.vcf.gz",
+        "inputs_tsv":                   "/x/inputs.txt",
+        "stats_arg":                    "",
+        "uses_references_arg":          "",
+        # empty derived_from_arg — as Nextflow would resolve it when derived_from = []
+        "derived_from_arg":             "",
+    })
+    assert "--derived-from" not in rendered
 
 
 def _extract_script(src: str, process_name: str) -> str:
@@ -272,6 +315,8 @@ def test_nextflow_cohort_command_runs_end_to_end(tmp_path: Path):
         "stats_arg":                    f"--stats '{stats_json}'",
         # uses_references_arg: no refs in this test — empty resolves to no flag.
         "uses_references_arg":          "",
+        # derived_from_arg: no derivation edges in this test — omit flag.
+        "derived_from_arg":             "",
     })
     remaining = re.findall(r"\$\{[^}]+\}", rendered)
     assert not remaining, f"unsubstituted placeholders: {remaining}"
@@ -331,6 +376,7 @@ def test_nextflow_cohort_command_stats_optional(tmp_path: Path):
         "inputs_tsv":                   str(inputs_tsv),
         "stats_arg":                    "",   # no stats → no --stats flag
         "uses_references_arg":          "",   # no refs → no --uses-references flag
+        "derived_from_arg":             "",   # no derivation → no --derived-from flag
     })
     remaining = re.findall(r"\$\{[^}]+\}", rendered)
     assert not remaining, f"unsubstituted placeholders: {remaining}"
@@ -368,6 +414,9 @@ def test_cohort_subworkflow_shape():
     assert "collectFile" in src
     assert re.search(r"\btake:", src)
     assert re.search(r"\bemit:", src)
+    # proposal 0011: subworkflow accepts and passes through ch_derived_from.
+    assert "ch_derived_from" in src
+    assert "derived_from" in src
 
 
 def test_nextflow_module_command_with_allow_new(

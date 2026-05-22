@@ -18,6 +18,11 @@ from casetrack_qc.cohort_artifacts_cli import (
 )
 from casetrack_qc.migrate import cmd_migrate_qc
 from casetrack_qc.reference_artifacts_cli import cmd_migrate_references, cmd_references
+from casetrack_qc.artifact_derivation_cli import (
+    cmd_derived_from,
+    cmd_derivation,
+    cmd_migrate_derivation,
+)
 
 
 def build_qc_subparsers(subparsers) -> None:
@@ -154,6 +159,9 @@ def build_qc_subparsers(subparsers) -> None:
     p_appc.add_argument("--uses-references", dest="uses_references", default=None,
                         help="[v0.8] Comma-separated reference keys this cohort "
                              "output consumed (e.g. genome,dbsnp)")
+    p_appc.add_argument("--derived-from", dest="derived_from", default=None,
+                        help="[v0.9] Comma-separated upstream node-refs this artifact "
+                             "derives from (e.g. cohort:joint@v1,reference:pon)")
 
     # ── migrate-cohort ──
     p_migc = subparsers.add_parser(
@@ -194,6 +202,38 @@ def build_qc_subparsers(subparsers) -> None:
     p_refs.add_argument("--stale-only", dest="stale_only", action="store_true",
                         help="Show only outputs whose used reference version is stale")
 
+    # ── migrate-derivation ── (proposal 0011)
+    p_migd = subparsers.add_parser(
+        "migrate-derivation",
+        help="[v0.9] Additive: create the artifact_derivation table on a pre-0011 project",
+    )
+    p_migd.add_argument("--project-dir", required=True)
+    p_migd.add_argument("--dry-run", action="store_true",
+                        help="Print the plan, make no changes")
+
+    # ── derived-from ── (proposal 0011)
+    p_dfrom = subparsers.add_parser(
+        "derived-from",
+        help="[v0.9] Record a derived-from edge between two lineage nodes",
+    )
+    p_dfrom.add_argument("--project-dir", required=True)
+    p_dfrom.add_argument("--downstream", required=True,
+                         help="Canonical node-ref of the derived output")
+    p_dfrom.add_argument("--upstream", action="append", required=True,
+                         help="Canonical node-ref of a source artifact (repeatable)")
+
+    # ── derivation ── (proposal 0011)
+    p_deriv = subparsers.add_parser(
+        "derivation",
+        help="[v0.9] List derivation edges + per-node derived-staleness",
+    )
+    p_deriv.add_argument("--project-dir", required=True)
+    p_deriv.add_argument("--node", default=None,
+                         help="Inspect one node's up/downstream + root-cause chain")
+    p_deriv.add_argument("--fmt", choices=["table", "tsv", "json"], default="table")
+    p_deriv.add_argument("--stale-only", dest="stale_only", action="store_true",
+                         help="Show only derived-stale outputs")
+
 
 def qc_command_dispatch() -> dict:
     """Command-name → function map that ``casetrack.main()`` merges into its own."""
@@ -208,4 +248,7 @@ def qc_command_dispatch() -> dict:
         "cohort-artifacts": cmd_cohort_artifacts,
         "migrate-references": cmd_migrate_references,
         "references": cmd_references,
+        "migrate-derivation": cmd_migrate_derivation,
+        "derived-from": cmd_derived_from,
+        "derivation": cmd_derivation,
     }

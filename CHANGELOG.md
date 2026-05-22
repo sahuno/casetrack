@@ -4,6 +4,69 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-05-21
+
+Artifact-to-artifact lineage — a generic `derived-from` edge between any two
+lineage nodes (cohort artifact, reference artifact, or sample-level output),
+making staleness transitive across a multi-hop DAG and surfacing a third
+`derived_stale` flag orthogonal to 0009's `stale` and 0010's `ref_stale`.
+See [proposal 0011](docs/proposals/0011-artifact-to-artifact-lineage.md).
+
+### Added
+
+- **`artifact_derivation` table** — one additive sibling table, mirroring the
+  0009/0010 ethos. Columns: `down_node TEXT`, `up_node TEXT` (canonical
+  node-ref strings over three types: `cohort:<analysis>@<run_tag>`,
+  `reference:<ref_key>`, `analysis:<entity_level>/<entity_id>/<analysis>`),
+  `note TEXT`, `recorded_at TEXT`. The three-level core, 0009, and 0010 tables
+  are untouched.
+- **`casetrack derived-from`** — declare that one artifact derives from
+  another (`derived-from --down cohort:joint_vcf@v1 --up cohort:pon@v1`).
+  Cycle-guards the new edge at insert time; logs `artifact_derivation_link` to
+  `provenance.jsonl`.
+- **`casetrack derivation`** — inspect the full derivation graph for any node
+  or the whole project (`--node NODE`, `--stale-only`, `--fmt table|tsv|json`).
+  Shows upstream/downstream edges and the derived-staleness state with named
+  reasons.
+- **`casetrack migrate-derivation`** — additive, idempotent: create the
+  `artifact_derivation` table on a pre-0011 project (mirrors
+  `migrate-cohort`/`migrate-references`).
+- **`--derived-from` on `append` and `append-cohort`** — record derivation
+  edges at result-registration time without a separate `derived-from` call.
+- **TOML `[references.<key>].derived_from`** — declare that a reference
+  artifact is derived from another node; `schema apply` syncs the edge into
+  `artifact_derivation`.
+- **`derived_stale` — third orthogonal staleness flag**: a node is
+  `derived_stale` when any upstream node it derives from is stale by *any*
+  cause (input-stale, ref-stale, or derived-stale — recursively). Computed
+  at read time via visited-set traversal with a cycle guard; stored flag never written.
+  A node can be any combination of `stale` / `ref_stale` / `derived_stale`.
+- **`_artifact_derivation` DuckDB view** — exposed in `casetrack query` for
+  SQL-level lineage exploration.
+- **`derived_stale` on `_cohort_artifacts`** — the `_cohort_artifacts` DuckDB
+  view gains a `derived_stale` column alongside `stale` and `ref_stale`.
+- **`casetrack_derivation` MCP tool** — AI-agent-facing tool that returns the
+  derivation graph and derived-staleness for a project, so an agent does not
+  need to hand-write the recursive SQL walk.
+- **Nextflow `--derived-from` passthrough** — `casetrack_append_cohort` and
+  `casetrack_append_project` gain an optional `derived_from` input (the
+  `[]`-means-none pattern) so pipelines can register derivation edges in the
+  same fan-in step.
+- **`validate` invariants** — two new checks: (a) dangling node-refs (an edge
+  references a node that no longer exists in any table); (b) acyclicity of the
+  full `artifact_derivation` graph.
+
+### Notes
+
+- `derived_stale` is read-time and reversible: resolving the root cause
+  (censor → uncensor, version revert, edge removal) immediately clears it
+  without a migration.
+- The inspect command is `derivation` (not `lineage`) because `casetrack
+  lineage` is already taken by proposal 0006's assay-merge subsystem
+  (`add-batch` / `link-sources`).
+- History in `provenance.jsonl` (`artifact_derivation_link` action); the
+  table holds only current edges.
+
 ## [0.8.0] — 2026-05-21
 
 Reference artifacts — versioned, per-file external inputs (genome, annotation,

@@ -93,7 +93,7 @@ SQLITE_BUSY_TIMEOUT_MS = 30000
 # Casetrack version stamped into project_meta.casetrack_version on init
 # (proposal 0005 Part B). Reflects the release that created the row, so
 # future schema migrations can decide whether the row needs touch-ups.
-_CASETRACK_VERSION = "0.8.0"
+_CASETRACK_VERSION = "0.9.0"
 
 # project_meta DDL — proposal 0005 §6.1. CHECK constraint mirrors the
 # Python-side _PROJECT_ID_PATTERN so a hand-edit of the SQLite file can't
@@ -574,6 +574,26 @@ def _validate_references(references: dict) -> None:
                 f"[references.{ref_key}] kind={kind!r} must be one of "
                 f"{list(REFERENCE_KINDS)}"
             )
+        # Proposal 0011: optional derived_from — list of upstream node-ref strings.
+        df = spec.get("derived_from")
+        if df is not None:
+            if not isinstance(df, list) or not all(isinstance(x, str) for x in df):
+                raise SchemaError(
+                    f"[references.{ref_key}] derived_from must be a list of node-refs"
+                )
+            # Validate node-ref format at schema-load time (like kind above), so a
+            # malformed ref fails loudly here instead of being silently warn-skipped
+            # at `schema apply` write time.
+            from casetrack_qc.artifact_derivation import (
+                LineageNode as _LineageNode, DerivationError as _DerivErr,
+            )
+            for entry in df:
+                try:
+                    _LineageNode.parse(entry)
+                except _DerivErr as exc:
+                    raise SchemaError(
+                        f"[references.{ref_key}] derived_from {entry!r}: {exc}"
+                    ) from exc
 
 
 def _validate_level(level: str, spec: dict) -> None:
@@ -1551,6 +1571,9 @@ def cmd_init_project(args):
     from casetrack_qc.reference_artifacts import (
         ensure_reference_schema as _ensure_reference_schema,
     )
+    from casetrack_qc.artifact_derivation import (
+        ensure_derivation_schema as _ensure_derivation_schema,
+    )
 
     conn = open_project_db(db_path)
     qc_ddl: list[str] = []
@@ -1563,6 +1586,8 @@ def cmd_init_project(args):
             _ensure_cohort_artifacts_schema(conn)
             # Proposal 0010: reference-artifact sibling tables, same init txn.
             _ensure_reference_schema(conn)
+            # Proposal 0011: artifact_derivation sibling table, same init txn.
+            _ensure_derivation_schema(conn)
             # v0.6 Part B: write the project_meta row in the same
             # transaction as the QC schema so init is atomic.
             write_project_meta(
@@ -4335,6 +4360,7 @@ class _AppendOnCensored(Exception):
 
 def cmd_append_project(args):
     """Attach analysis results to rows at --level, extending the schema as needed."""
+    from casetrack_qc.artifact_derivation import DerivationError as _ADDerivationError
     project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     from casetrack_lifecycle.gate import assert_not_archived as _assert_not_archived
     _assert_not_archived(
@@ -4575,6 +4601,13 @@ def cmd_append_project(args):
                     entity_ids=list(tsv_keys), transaction_id=txn_id,
                     override_refs=_override,
                 )
+            if getattr(args, "derived_from", None):
+                from casetrack_qc.artifact_derivation_cli import record_derivation_edges
+                _ups = [s.strip() for s in args.derived_from.split(",") if s.strip()]
+                for _eid in tsv_keys:
+                    record_derivation_edges(
+                        conn, down=f"analysis:{level}/{_eid}/{analysis}",
+                        ups=_ups, transaction_id=txn_id)
     except _MissingKeys as e:
         conn.close()
         preview = sorted(e.missing)[:5]
@@ -4606,6 +4639,10 @@ def cmd_append_project(args):
         conn.close()
         print(f"Error: append aborted — {type(e).__name__}: {e}", file=sys.stderr)
         sys.exit(1)
+    except _ADDerivationError as e:
+        conn.close()
+        print(f"Error: --derived-from: {e}", file=sys.stderr)
+        sys.exit(2)
     finally:
         if conn:
             conn.close()
@@ -4627,6 +4664,10 @@ def cmd_append_project(args):
         "schema_v_after": schema["project"]["schema_v"],
         "autoflag_events": [e["qc_event_id"] for e in autoflag_emitted],
         "run_tag": inferred_run_tag,
+        "derived_from": (
+            [s.strip() for s in args.derived_from.split(",") if s.strip()]
+            if getattr(args, "derived_from", None) else []
+        ),
     })
 
     # One `censor` provenance entry per autoflag event, all sharing the
@@ -4848,12 +4889,34 @@ def _schema_apply(project_dir: Path, schema: dict, issues: list[dict]) -> None:
         from casetrack_qc.reference_artifacts import (
             ensure_reference_schema, sync_references_from_toml,
         )
+        # Proposal 0011: derivation imports alongside the 0010 ones.
+        from casetrack_qc.artifact_derivation import (
+            ensure_derivation_schema as _ensure_deriv,
+            record_edge as _record_edge,
+            DerivationError as _DerivErr,
+        )
         txn_id = _new_transaction_id()
         conn = open_project_db(project_dir / PROJECT_DB_NAME)
         try:
             with begin_immediate(conn):
                 ensure_reference_schema(conn)
                 ref_changes = sync_references_from_toml(conn, references)
+                # Proposal 0011: materialize [references.<key>].derived_from edges.
+                # _ensure_deriv here doubles as the implicit migration path for a
+                # pre-0011 project (same posture as ensure_reference_schema above);
+                # `migrate-derivation` remains the explicit, no-[references] route.
+                _ensure_deriv(conn)
+                for ref_key, spec in references.items():
+                    for up in (spec.get("derived_from") or []):
+                        try:
+                            _record_edge(conn, down=f"reference:{ref_key}", up=up,
+                                         transaction_id=txn_id)
+                        except _DerivErr as e:
+                            print(
+                                f"Warning: skipping derived_from edge "
+                                f"reference:{ref_key} <- {up}: {e}",
+                                file=sys.stderr,
+                            )
         finally:
             conn.close()
         for ch in ref_changes:
@@ -5673,6 +5736,19 @@ def cmd_dashboard_project(args):
             qc_info["reference_stale"] = [
                 o for o in _ra_stale(conn) if o["state"] == "STALE"
             ]
+
+        # Proposal 0011: derivation-edge section with derived-stale badges.
+        # Degrades silently when absent (pre-0011 / no artifact_derivation table).
+        from casetrack_qc.artifact_derivation import (
+            derivation_schema_exists as _ad_exists,
+            all_derived_stale as _ad_all,
+            list_edges as _ad_edges,
+        )
+        if _ad_exists(conn):
+            qc_info["derivation_edges"] = _ad_edges(conn)
+            qc_info["derivation_stale"] = [
+                r for r in _ad_all(conn) if r["state"] == "STALE"
+            ]
     finally:
         conn.close()
 
@@ -5914,6 +5990,8 @@ def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
 
   {_references_html(qc_info)}
 
+  {_derivation_html(qc_info)}
+
   <h2>Patients</h2>
   {"".join(body_sections) if body_sections
      else '<p class="muted">No patients registered yet.</p>'}
@@ -6019,6 +6097,51 @@ def _references_html(qc_info: dict | None) -> str:
     )
 
 
+def _derivation_html(qc_info: dict | None) -> str:
+    """Render the derivation section (proposal 0011) with derived-stale badges.
+
+    Returns "" when no derivation edges exist so pre-0011 projects render
+    identically to before.
+    """
+    if not qc_info:
+        return ""
+    edges = qc_info.get("derivation_edges") or []
+    if not edges:
+        return ""
+    esc = html.escape
+    stale = qc_info.get("derivation_stale") or []
+    n_stale = len(stale)
+    rows = "".join(
+        f"<tr><td>{esc(e['down_node'])}</td>"
+        f"<td>{esc(e['up_node'])}</td></tr>"
+        for e in edges
+    )
+    if stale:
+        stale_items = "".join(
+            f"<li><span class='qc-chip qc-chip-amber'>DERIVED-STALE</span> "
+            f"{esc(r['node'])} "
+            f"<small class='muted'>{esc('; '.join(r['reasons']))}</small></li>"
+            for r in stale
+        )
+        stale_block = f"<ul>{stale_items}</ul>"
+    else:
+        stale_block = "<p class='muted'>None derived-stale.</p>"
+    if n_stale:
+        badge = f'<span class="qc-chip qc-chip-amber">{n_stale} derived-stale node(s)</span>'
+    else:
+        badge = '<span class="qc-chip qc-chip-grey">0 derived-stale</span>'
+    return (
+        f"<h2>Derivation <span class='muted'>({len(edges)} edge(s), "
+        f"{n_stale} derived-stale)</span></h2>"
+        f"{badge}"
+        f"{stale_block}"
+        "<table><thead><tr>"
+        "<th>derived node</th><th>derives from</th>"
+        "</tr></thead><tbody>"
+        f"{rows}</tbody></table>"
+    )
+
+
 def _qc_excluded_html(qc_info: dict | None) -> str:
     if not qc_info:
         return ""
@@ -6111,6 +6234,13 @@ def _prepare_v03_query_connection(db_path: Path):
     # Proposal 0010: `_reference_usage` view with derived current_version /
     # is_stale. No-op on pre-0010 projects.
     _install_reference_usage_view(con)
+    # Proposal 0011: `_artifact_derivation` view + `derived_stale` on
+    # `_cohort_artifacts`. Installed last; uses base-table direct-staleness
+    # (self_safe) so it does not depend on the views above. No-op pre-0011/0010.
+    from casetrack_qc.reader import (
+        install_artifact_derivation_view as _install_artifact_derivation_view,
+    )
+    _install_artifact_derivation_view(con)
     return con
 
 
@@ -6415,6 +6545,23 @@ def cmd_export_project(args):
                         out_path = output / f"{tbl}{ext}"
                     _write_df(df_ref, out_path)
                     written.append((tbl, out_path, len(df_ref)))
+
+        # Proposal 0011: artifact_derivation table. Auto for XLSX.
+        include_deriv = getattr(args, "include_derivation", False) or (
+            ext == ".xlsx" and not args.sql and shape != "joined"
+        )
+        if include_deriv:
+            from casetrack_qc.artifact_derivation import (
+                derivation_schema_exists as _deriv_exists,
+            )
+            if _deriv_exists(conn):
+                df_d = pd.read_sql_query("SELECT * FROM artifact_derivation", conn)
+                if prefix_mode:
+                    out_path = Path(f"{prefix_base}.artifact_derivation{ext}")
+                else:
+                    out_path = output / f"artifact_derivation{ext}"
+                _write_df(df_d, out_path)
+                written.append(("artifact_derivation", out_path, len(df_d)))
     finally:
         conn.close()
 
@@ -7044,6 +7191,14 @@ def cmd_status_project(args):
         finally:
             conn5.close()
 
+    # Proposal 0011: surface derivation edges + derived-stale outputs.
+    if args.fmt in (None, "table"):
+        conn6 = open_project_db(project_dir / PROJECT_DB_NAME)
+        try:
+            _emit_derivation_section(conn6)
+        finally:
+            conn6.close()
+
 
 def _emit_references_section(conn: sqlite3.Connection) -> None:
     """Print a references summary with staleness, when any exist (proposal 0010 §6.4).
@@ -7071,6 +7226,29 @@ def _emit_references_section(conn: sqlite3.Connection) -> None:
         else:
             who = f"cohort_artifact:{o['artifact_id']}"
         print(f"  [STALE] {who}  ({'; '.join(o['reasons'])})")
+
+
+def _emit_derivation_section(conn: sqlite3.Connection) -> None:
+    """Print a derivation summary with derived-staleness (proposal 0011 §6.5).
+
+    Self-contained block appended to the human status view. No-ops on pre-0011
+    projects.
+    """
+    from casetrack_qc.artifact_derivation import (
+        derivation_schema_exists as _deriv_exists,
+        list_edges as _list_edges,
+        all_derived_stale as _all_derived_stale,
+    )
+    if not _deriv_exists(conn):
+        return
+    edges = _list_edges(conn)
+    if not edges:
+        return
+    stale = [r for r in _all_derived_stale(conn) if r["state"] == "STALE"]
+    print("\n=== Derivation (proposal 0011) ===")
+    print(f"  {len(edges)} edge(s); {len(stale)} derived-stale output(s)")
+    for r in stale:
+        print(f"  [STALE] {r['node']}  ({'; '.join(r['reasons'])})")
 
 
 def _emit_cohort_artifacts_section(conn: sqlite3.Connection) -> None:
@@ -7630,6 +7808,81 @@ def cmd_validate_project(args):
                     f"reference_usage references unknown ref_key {ref_key!r} "
                     f"(removed from [references]?)"
                 )
+
+        # 7. Proposal 0011: dangling derivation edges + acyclicity.
+        from casetrack_qc.artifact_derivation import (
+            derivation_schema_exists as _deriv_exists,
+            list_edges as _list_edges, _all_upstreams as _combined_upstreams,
+            LineageNode as _LineageNode, DerivationError as _DerivErr,
+        )
+        if _deriv_exists(conn):
+            def _resolves(node: str) -> bool:
+                try:
+                    n = _LineageNode.parse(node)
+                except _DerivErr:
+                    return False
+                if n.scope == "cohort":
+                    return conn.execute(
+                        "SELECT 1 FROM cohort_artifacts WHERE analysis=? AND run_tag=?",
+                        (n.analysis, n.run_tag)).fetchone() is not None
+                if n.scope == "reference":
+                    return conn.execute(
+                        "SELECT 1 FROM reference_artifacts WHERE ref_key=?",
+                        (n.ref_key,)).fetchone() is not None
+                # analysis: accept if the entity row exists at its level
+                tbl = {"patient": "patients", "specimen": "specimens",
+                       "assay": "assays"}.get(n.entity_level)
+                col = {"patient": "patient_id", "specimen": "specimen_id",
+                       "assay": "assay_id"}.get(n.entity_level)
+                if not tbl:
+                    return False
+                return conn.execute(
+                    f"SELECT 1 FROM {tbl} WHERE {col}=?",
+                    (n.entity_id,)).fetchone() is not None
+
+            seen_nodes: set = set()
+            for e in _list_edges(conn):
+                for node in (e["down_node"], e["up_node"]):
+                    if node not in seen_nodes:
+                        seen_nodes.add(node)
+                        if not _resolves(node):
+                            issues.append(
+                                f"artifact_derivation: dangling node-ref {node!r} "
+                                f"(no matching artifact/reference/entity)")
+
+            # acyclicity: iterative (explicit-stack) DFS over the COMBINED upstream
+            # edge set (0011 derivation ∪ 0010 reference_usage — same set the
+            # write-time guard uses, so cross-table cycles are caught here too).
+            # Iterative, not recursive, so a deep chain can't RecursionError the
+            # validate command. Colour GREY on push, BLACK on pop; a GREY hit is a
+            # back-edge (reported once). A node merely pointing INTO a cycle is not
+            # itself flagged — only the actual back-edge is.
+            WHITE, GREY, BLACK = 0, 1, 2
+            color: dict = {}
+
+            def _iter_dfs(start: str) -> None:
+                color[start] = GREY
+                stack = [(start, iter(_combined_upstreams(conn, start)))]
+                while stack:
+                    node, it = stack[-1]
+                    descended = False
+                    for up in it:
+                        c = color.get(up, WHITE)
+                        if c == GREY:
+                            issues.append(
+                                f"artifact_derivation: cycle through {node!r} -> {up!r}")
+                        elif c == WHITE:
+                            color[up] = GREY
+                            stack.append((up, iter(_combined_upstreams(conn, up))))
+                            descended = True
+                            break
+                    if not descended:
+                        color[node] = BLACK
+                        stack.pop()
+
+            for (dn,) in conn.execute("SELECT DISTINCT down_node FROM artifact_derivation"):
+                if color.get(dn, WHITE) == WHITE:
+                    _iter_dfs(dn)
     finally:
         conn.close()
 
@@ -7862,6 +8115,9 @@ Examples:
              "(overrides [analyses.<tool>].uses)")
     p_append.add_argument("--no-track-references", dest="no_track_references",
         action="store_true", help="[v0.8] Skip reference-usage capture for this append")
+    p_append.add_argument("--derived-from", dest="derived_from", default=None,
+        help="[v0.9] Comma-separated upstream node-refs each appended output derives from "
+             "(e.g. cohort:joint@v1,reference:pon)")
     p_append.add_argument(
         "--infer-from-path",
         nargs="?",
@@ -8171,6 +8427,11 @@ Examples:
     p_export.add_argument(
         "--include-references", action="store_true",
         help="[v0.8] Also export reference_artifacts + reference_usage tables "
+             "(auto-enabled for XLSX multi-sheet output)",
+    )
+    p_export.add_argument(
+        "--include-derivation", dest="include_derivation", action="store_true",
+        help="[v0.9] Also export the artifact_derivation table "
              "(auto-enabled for XLSX multi-sheet output)",
     )
 

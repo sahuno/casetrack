@@ -35,6 +35,7 @@ from typing import Any
 from casetrack_mcp.tools import (
     MCPToolError,
     cohort_artifacts_tool,
+    derivation_tool,
     list_projects_tool,
     query_tool,
     references_tool,
@@ -135,8 +136,33 @@ _REFERENCES_SCHEMA: dict[str, Any] = {
 }
 
 
+_DERIVATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "project_id": {
+            "type": "string",
+            "description": (
+                "DNS-label slug identifying a casetrack project in the local "
+                "registry. Call casetrack_list_projects first if unknown."
+            ),
+        },
+        "stale_only": {
+            "type": "boolean",
+            "description": (
+                "When true, return only outputs that are derived-stale because "
+                "an upstream artifact (cohort, reference, or sample output) is "
+                "stale by any cause (0009 input / 0010 ref / 0011 transitive). "
+                "Default false."
+            ),
+        },
+    },
+    "required": ["project_id"],
+    "additionalProperties": False,
+}
+
+
 def _build_server() -> "Server":
-    """Register the two tool handlers against a fresh Server instance."""
+    """Register the tool handlers against a fresh Server instance."""
     if not _MCP_AVAILABLE:
         raise RuntimeError(
             "The `mcp` package is not installed. Run "
@@ -193,6 +219,18 @@ def _build_server() -> "Server":
                 ),
                 inputSchema=_REFERENCES_SCHEMA,
             ),
+            Tool(
+                name="casetrack_derivation",
+                description=(
+                    "List artifact-to-artifact lineage edges (derived-from) and "
+                    "outputs that are derived-stale because an upstream artifact "
+                    "(cohort artifact, reference, or sample output) is stale — "
+                    "transitive across the 0009/0010/0011 cascade. Pass "
+                    "stale_only=true to see only derived-stale outputs. "
+                    "project_id must be a slug from casetrack_list_projects."
+                ),
+                inputSchema=_DERIVATION_SCHEMA,
+            ),
         ]
 
     @app.call_tool()
@@ -211,6 +249,11 @@ def _build_server() -> "Server":
                 )
             elif name == "casetrack_references":
                 payload = references_tool(
+                    arguments.get("project_id"),
+                    stale_only=bool(arguments.get("stale_only", False)),
+                )
+            elif name == "casetrack_derivation":
+                payload = derivation_tool(
                     arguments.get("project_id"),
                     stale_only=bool(arguments.get("stale_only", False)),
                 )

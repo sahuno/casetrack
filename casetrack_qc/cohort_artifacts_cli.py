@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 import casetrack
+from casetrack_qc import artifact_derivation as ad
 from casetrack_qc import cohort_artifacts as ca
 
 
@@ -98,7 +99,14 @@ def cmd_append_cohort(args) -> None:
                                 conn, scope="cohort", artifact_id=art_id,
                                 ref_key=ref_key, version_used=current[ref_key],
                                 transaction_id=txn_id)
-        except ca.CohortArtifactError as e:
+                derived_from = getattr(args, "derived_from", None)
+                if derived_from:
+                    from casetrack_qc.artifact_derivation_cli import record_derivation_edges
+                    ups = [s.strip() for s in derived_from.split(",") if s.strip()]
+                    record_derivation_edges(
+                        conn, down=f"cohort:{args.analysis}@{args.run_tag}",
+                        ups=ups, transaction_id=txn_id)
+        except (ca.CohortArtifactError, ad.DerivationError) as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(2)
 
@@ -115,6 +123,9 @@ def cmd_append_cohort(args) -> None:
                 "artifact_id": art_id,
                 "has_stats": stats_json is not None,
                 "transaction_id": txn_id,
+                "derived_from": [
+                    s.strip() for s in (derived_from or "").split(",") if s.strip()
+                ],
             },
         )
         print(
