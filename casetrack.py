@@ -7012,6 +7012,12 @@ def _explode_samplesheet(df, schema):
     columns and is deduplicated on the level's key column (identical duplicate
     rows collapse — parent rows shared across many assays appear once).
 
+    **Pre-condition**: this function assumes the frame has already been validated
+    by ``_validate_samplesheet`` — specifically, that every level key column is
+    present and that no non-key attribute has conflicting values across rows that
+    share the same key.  When deduplicating, the first row encountered for each
+    key is kept; conflicting attribute values are *not* detected here.
+
     Parameters
     ----------
     df : pandas.DataFrame

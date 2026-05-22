@@ -1,6 +1,6 @@
 # tests/test_register_cohort.py
 """Unit + CLI tests for register-cohort (proposal 0012)."""
-import argparse, subprocess, sys
+import argparse, copy, subprocess, sys
 import pandas as pd
 import pytest
 import casetrack
@@ -47,3 +47,11 @@ def test_explode_dedups_parents():
     assert len(frames["specimen"]) == 3
     assert len(frames["assay"]) == 3
     assert set(frames["specimen"].columns) == {"specimen_id", "patient_id", "tissue_site"}
+
+
+def test_route_columns_ambiguous_schema_raises():
+    bad_schema = copy.deepcopy(SCHEMA)
+    bad_schema["levels"]["specimen"]["columns"]["cohort"] = {"type": "TEXT"}
+    with pytest.raises(ValueError, match="ambiguous"):
+        casetrack._route_samplesheet_columns(
+            ["patient_id", "cohort", "specimen_id", "assay_id"], bad_schema)
