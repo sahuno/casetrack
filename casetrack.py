@@ -6937,6 +6937,108 @@ def _upsert_level(conn, *, level, frame, schema, allow_new, overwrite):
     }
 
 
+def _route_samplesheet_columns(columns, schema):
+    """Map each sample-sheet column to the level(s) whose frame it belongs in.
+
+    Key columns (patient_id/specimen_id/assay_id) and parent-FK columns route to
+    every frame that needs them; a non-key attribute routes to the single level
+    that declares it. Returns {level: [cols in sheet order]} for the 3 levels.
+    Raises ValueError on a column declared at no level (undeclared) or a non-key
+    attribute declared at >1 level (ambiguous).
+
+    Parameters
+    ----------
+    columns : list[str]
+        Ordered list of column names from the wide sample-sheet.
+    schema : dict
+        Parsed casetrack.toml schema dict (must have ``schema["levels"]``).
+
+    Returns
+    -------
+    dict[str, list[str]]
+        ``{level: [col, ...]}`` for each level in LEVEL_ORDER.
+
+    Example
+    -------
+    >>> routed = _route_samplesheet_columns(
+    ...     ["patient_id", "cohort", "specimen_id", "tissue_site", "assay_id", "assay_type"],
+    ...     schema)
+    >>> routed["patient"]
+    ['patient_id', 'cohort']
+    """
+    levels = schema["levels"]
+    keys = {levels[lvl]["key"] for lvl in LEVEL_ORDER}                      # PKs
+    parent_keys = {levels[lvl].get("parent_key") for lvl in LEVEL_ORDER} - {None}
+    cross_level = keys | parent_keys                                        # routed positionally
+
+    # which level declares each non-key attribute (must be exactly one)
+    attr_owner: dict = {}
+    for lvl in LEVEL_ORDER:
+        for col in levels[lvl]["columns"]:
+            if col in cross_level:
+                continue
+            if col in attr_owner:
+                raise ValueError(
+                    f"column {col!r} declared at both "
+                    f"{attr_owner[col]!r} and {lvl!r} levels (ambiguous)"
+                )
+            attr_owner[col] = lvl
+
+    # Validate every input column is declared somewhere
+    col_set = set(columns)
+    for col in columns:
+        if col not in cross_level and col not in attr_owner:
+            raise ValueError(
+                f"column {col!r} is not declared at any level in casetrack.toml; "
+                f"declare it (and run `casetrack schema apply`) first"
+            )
+
+    # Build each level's frame columns: cross-level keys/FKs in schema-declaration
+    # order (so PK always precedes parent FK), then level-specific attributes in
+    # their input-sheet order.
+    routed = {}
+    for lvl in LEVEL_ORDER:
+        lvl_decl = list(levels[lvl]["columns"])          # schema order for this level
+        cross_cols = [c for c in lvl_decl if c in cross_level and c in col_set]
+        attr_cols = [c for c in columns if c in attr_owner and attr_owner[c] == lvl]
+        routed[lvl] = cross_cols + attr_cols
+    return routed
+
+
+def _explode_samplesheet(df, schema):
+    """Split a wide sample-sheet DataFrame into per-level frames, deduped by key.
+
+    Returns ``{level: DataFrame}``. Each frame keeps only that level's routed
+    columns and is deduplicated on the level's key column (identical duplicate
+    rows collapse — parent rows shared across many assays appear once).
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Wide sample-sheet with one row per assay.
+    schema : dict
+        Parsed casetrack.toml schema dict.
+
+    Returns
+    -------
+    dict[str, pandas.DataFrame]
+        ``{level: DataFrame}`` for each level in LEVEL_ORDER.
+
+    Example
+    -------
+    >>> frames = _explode_samplesheet(df, schema)
+    >>> len(frames["patient"])   # 2 patients across 3 rows
+    2
+    """
+    routed = _route_samplesheet_columns(list(df.columns), schema)
+    frames = {}
+    for lvl in LEVEL_ORDER:
+        key_col = schema["levels"][lvl]["key"]
+        sub = df[routed[lvl]].drop_duplicates(subset=[key_col]).reset_index(drop=True)
+        frames[lvl] = sub
+    return frames
+
+
 def cmd_add_metadata_project(args):
     project_dir, schema = _resolve_project(args.project_dir, project_id=getattr(args, "project", None))
     from casetrack_lifecycle.gate import assert_not_archived as _assert_not_archived
