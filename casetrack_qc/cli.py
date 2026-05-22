@@ -163,6 +163,11 @@ def build_qc_subparsers(subparsers) -> None:
     p_appc.add_argument("--derived-from", dest="derived_from", default=None,
                         help="[v0.9] Comma-separated upstream node-refs this artifact "
                              "derives from (e.g. cohort:joint@v1,reference:pon)")
+    p_appc.add_argument("--region-scope", dest="region_scope", default=None,
+                        help="[v0.11] Genomic scope label for this artifact "
+                             "(e.g. genome-wide, promoters_EPDnew, "
+                             "chr17:7565097-7590856). A label matching a "
+                             "registered reference key auto-tracks ref-staleness.")
 
     # ── migrate-cohort ──
     p_migc = subparsers.add_parser(

@@ -22,26 +22,52 @@ from casetrack_qc import artifact_derivation as ad
 from casetrack_qc import cohort_artifacts as ca
 
 
-def _read_inputs(args) -> list[str]:
-    """Collect contributing assay_ids from ``--inputs`` or ``--inputs-from``.
+def _read_inputs(args) -> tuple[list[str], dict[str, str | None]]:
+    """Collect contributing assay_ids + optional roles.
 
-    ``--inputs`` is a comma-separated list. ``--inputs-from`` is a file with one
-    assay_id per line; a leading ``assay_id`` header line is skipped and only the
-    first tab-separated column is read (so a wider TSV works).
+    ``--inputs`` is comma-separated ``assay_id`` or ``assay_id:role`` items.
+    ``--inputs-from`` is a file with one assay_id per line; a leading
+    ``assay_id`` header is skipped, the first tab-separated column is the id,
+    and a ``role`` column (named in the header) is honored when present.
+    Returns ``(ids, roles)`` where ``roles`` maps id -> role (or NULL).
     """
+    roles: dict[str, str | None] = {}
     inputs = getattr(args, "inputs", None)
     if inputs:
-        return [s.strip() for s in inputs.split(",") if s.strip()]
+        ids: list[str] = []
+        for item in (s.strip() for s in inputs.split(",")):
+            if not item:
+                continue
+            if ":" in item:
+                aid, role = item.split(":", 1)
+                aid, role = aid.strip(), role.strip() or None
+            else:
+                aid, role = item, None
+            ids.append(aid)
+            roles[aid] = role
+        return ids, roles
     inputs_from = getattr(args, "inputs_from", None)
     if inputs_from:
-        ids: list[str] = []
-        for line in Path(inputs_from).read_text().splitlines():
+        lines = Path(inputs_from).read_text().splitlines()
+        ids = []
+        role_idx: int | None = None
+        for i, line in enumerate(lines):
             s = line.strip()
-            if not s or s.lower() == "assay_id":
+            if not s:
                 continue
-            ids.append(s.split("\t")[0].strip())
-        return ids
-    return []
+            cols = [c.strip() for c in s.split("\t")]
+            if i == 0 and cols and cols[0].lower() == "assay_id":
+                if "role" in [c.lower() for c in cols]:
+                    role_idx = [c.lower() for c in cols].index("role")
+                continue
+            aid = cols[0]
+            ids.append(aid)
+            roles[aid] = (
+                cols[role_idx] if role_idx is not None and len(cols) > role_idx
+                and cols[role_idx] else None
+            )
+        return ids, roles
+    return [], {}
 
 
 # ── append-cohort ─────────────────────────────────────────────────────────────
@@ -51,7 +77,7 @@ def cmd_append_cohort(args) -> None:
     project_dir, _ = casetrack._resolve_project(args.project_dir)
     db_path = project_dir / casetrack.PROJECT_DB_NAME
 
-    inputs = _read_inputs(args)
+    inputs, roles = _read_inputs(args)
     if not inputs:
         print(
             "Error: no contributing assays — pass --inputs a,b,c or "
@@ -86,15 +112,27 @@ def cmd_append_cohort(args) -> None:
                     checksum=checksum,
                     stats_json=stats_json,
                     created_by=created_by,
+                    region_scope=getattr(args, "region_scope", None),
                 )
-                ca.add_artifact_inputs(conn, art_id, inputs)
+                ca.add_artifact_inputs(conn, art_id, inputs, roles=roles)
+                # Reference-resolve door (proposal 0013): a region_scope that
+                # names a registered ref_key auto-captures a cohort-scope
+                # reference_usage edge, so scope changes drive 0010 ref_stale.
+                # This block subsumes the earlier --uses-references-only capture.
+                from casetrack_qc import reference_artifacts as _ra
+                region_scope = getattr(args, "region_scope", None)
                 refs = getattr(args, "uses_references", None)
-                if refs:
-                    from casetrack_qc import reference_artifacts as _ra
+                ref_keys = [s.strip() for s in (refs or "").split(",") if s.strip()]
+                if region_scope or ref_keys:
                     _ra.ensure_reference_schema(conn)
                     current = {r.ref_key: r.version
                                for r in _ra.list_references(conn)}
-                    for ref_key in [s.strip() for s in refs.split(",") if s.strip()]:
+                    # A region_scope matching a registered key tracks ref-staleness;
+                    # a label-only scope (no matching key) is legal and stores as a
+                    # plain label without capturing any usage edge.
+                    if region_scope and region_scope in current:
+                        ref_keys.append(region_scope)
+                    for ref_key in dict.fromkeys(ref_keys):  # de-dupe, keep order
                         if ref_key in current:
                             _ra.record_usage(
                                 conn, scope="cohort", artifact_id=art_id,
@@ -121,6 +159,8 @@ def cmd_append_cohort(args) -> None:
                 "checksum": checksum,
                 "n_inputs": len(inputs),
                 "inputs": inputs,
+                "roles": roles,
+                "region_scope": getattr(args, "region_scope", None),
                 "artifact_id": art_id,
                 "has_stats": stats_json is not None,
                 "transaction_id": txn_id,
