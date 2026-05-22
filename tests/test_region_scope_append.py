@@ -112,3 +112,31 @@ def test_label_only_scope_captures_no_reference_usage(tmp_path: Path):
         assert st["state"] == "untracked"  # no usage rows captured
     finally:
         conn.close()
+
+
+def test_scope_matching_uses_references_dedups(tmp_path: Path):
+    proj = _project_with_assays(tmp_path)
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        with casetrack.begin_immediate(conn):
+            ra.ensure_reference_schema(conn)
+            ra.sync_references_from_toml(conn, {
+                "promoters_EPDnew": {
+                    "path": "/db/prom.bed", "version": "v1",
+                    "kind": "intervals"}})
+    finally:
+        conn.close()
+    cmd_append_cohort(_append_ns(
+        proj, region_scope="promoters_EPDnew",
+        uses_references="promoters_EPDnew"))
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    try:
+        art = ca.get_artifact_by_key(conn, "dss_dmr", "rt1")
+        n = conn.execute(
+            "SELECT COUNT(*) FROM reference_usage "
+            "WHERE scope='cohort' AND artifact_id = ? AND ref_key = ?",
+            (art.artifact_id, "promoters_EPDnew"),
+        ).fetchone()[0]
+        assert n == 1
+    finally:
+        conn.close()

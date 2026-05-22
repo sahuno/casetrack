@@ -20,6 +20,7 @@ from pathlib import Path
 import casetrack
 from casetrack_qc import artifact_derivation as ad
 from casetrack_qc import cohort_artifacts as ca
+from casetrack_qc import reference_artifacts as _ra
 
 
 def _read_inputs(args) -> tuple[list[str], dict[str, str | None]]:
@@ -94,6 +95,7 @@ def cmd_append_cohort(args) -> None:
     created_by = getattr(args, "created_by", None) or (
         f"manual:{os.environ.get('USER', 'unknown')}"
     )
+    region_scope = getattr(args, "region_scope", None)
     txn_id = casetrack._new_transaction_id()
 
     conn = casetrack.open_project_db(db_path)
@@ -112,15 +114,13 @@ def cmd_append_cohort(args) -> None:
                     checksum=checksum,
                     stats_json=stats_json,
                     created_by=created_by,
-                    region_scope=getattr(args, "region_scope", None),
+                    region_scope=region_scope,
                 )
                 ca.add_artifact_inputs(conn, art_id, inputs, roles=roles)
                 # Reference-resolve door (proposal 0013): a region_scope that
                 # names a registered ref_key auto-captures a cohort-scope
                 # reference_usage edge, so scope changes drive 0010 ref_stale.
                 # This block subsumes the earlier --uses-references-only capture.
-                from casetrack_qc import reference_artifacts as _ra
-                region_scope = getattr(args, "region_scope", None)
                 refs = getattr(args, "uses_references", None)
                 ref_keys = [s.strip() for s in (refs or "").split(",") if s.strip()]
                 if region_scope or ref_keys:
@@ -160,7 +160,7 @@ def cmd_append_cohort(args) -> None:
                 "n_inputs": len(inputs),
                 "inputs": inputs,
                 "roles": roles,
-                "region_scope": getattr(args, "region_scope", None),
+                "region_scope": region_scope,
                 "artifact_id": art_id,
                 "has_stats": stats_json is not None,
                 "transaction_id": txn_id,
