@@ -898,12 +898,13 @@ ln -s /path/to/casetrack/.claude/skills/casetrack ~/.claude/skills/
 ```
 
 Inside the skill bundle:
-- `SKILL.md` — main entry point, < 500 lines
-- `references/patterns.md` — full pattern reference
+- `SKILL.md` — main entry point (rules, dispatch, proposal sections for 0009/0010/0013)
 - `references/toml-example.md` — annotated complete TOML
 - `references/nextflow-integration.md` — `CASETRACK_REGISTER` + publishDir
 - `references/common-queries.md` — SQL recipes for samplesheets, progress, QC
-- `evals/evals.json` — 8 regression test scenarios
+- `references/cohort-artifacts.md` — proposal 0009 deep dive
+- `references/reference-artifacts.md` — proposal 0010 deep dive
+- `evals/evals.json` — regression test scenarios
 
 ### Post-analysis QC hook — `examples/claude/`
 

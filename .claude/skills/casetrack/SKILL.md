@@ -37,6 +37,16 @@ Ask yourself: am I registering an entity (adding a new patient/specimen/assay ro
 
 Always use `--project-dir <path>` (project mode). `--manifest <tsv>` is legacy flat mode — never use it for new work.
 
+**For reference** when you encounter a legacy flat-mode project, the modes differ in every meaningful dimension:
+
+| Feature | Project mode | Flat mode (legacy) |
+|---|---|---|
+| Storage | SQLite | TSV |
+| Schema | TOML-declared | Inferred |
+| Levels | 3 (patient/specimen/assay) | 1 (flat) |
+| QC events | Full system | None |
+| Command flag | `--project-dir .` | `--manifest manifest.tsv` |
+
 ## 2. The 3-level hierarchy (ontology)
 
 ```
@@ -131,7 +141,17 @@ casetrack append \
 
 ## 7. Registering a new cohort from scratch
 
-Canonical sequence for a fresh project:
+Canonical sequence for a fresh project. `casetrack init` creates this layout:
+
+```
+cohort_X/
+├── casetrack.toml    ← schema definition (edit before registering)
+├── casetrack.db      ← SQLite database (gitignored)
+├── provenance.jsonl  ← append-only audit log
+├── data/             ← raw / processed inputs
+├── results/          ← analysis outputs
+└── logs/
+```
 
 ```bash
 # 1. Create project
@@ -281,9 +301,18 @@ See `references/common-queries.md` for query recipes (progress matrix, sampleshe
     └── {tool}/{run_tag}/{patient_id}/{specimen_id}/{assay_id}/  ← summary TSVs, per-run outputs
 ```
 
+The two roots play different roles:
+- **`results/{tool}/{run_tag}/...`** — summary TSVs, trace files, per-run reports. Ephemeral OK.
+- **`data/processed/{genome}/...`** — primary biological files (BAMs, VCFs) indexed in the DB. Persistent; never ephemeral.
+
 The DB stores the `data/processed/` path (from the analysis summary TSV) so downstream tools can find files by query rather than by filesystem scan.
 
-Run tag convention: `{YYYYMMDD}_{genome}_{description}` (e.g. `20260421_hg38_normal_basecalling`).
+**Run tag convention:** `{YYYYMMDD}_{genome}_{description}`. Examples:
+- `20260421_hg38_normal_basecalling`
+- `20260501_hg38_tumor_sort_sv`
+- `20260510_hg38_all_modkit_pileup`
+
+The `run_tag` appears in `results/` paths, the `{analysis}_run_tag` columns in the DB, and Nextflow trace files — it's the primary handle for tracing which pipeline run produced a given DB row.
 
 ## 13. Common pitfalls — quick reference
 
@@ -616,4 +645,3 @@ Default to handling requests directly from this SKILL.md. Read reference files w
 - User needs a specific SQL query (cohort progress matrix, samplesheet generation, QC timeline) → `references/common-queries.md`
 - User is registering or troubleshooting **cohort-level artifacts** (joint VCFs, PoNs, matrices, staleness) → `references/cohort-artifacts.md`
 - User is declaring/bumping/checking **reference artifacts** (genome, GTF, dbSNP, intervals) → `references/reference-artifacts.md`
-- User hits an error not in §13 — full deep-dive patterns file → `references/patterns.md`
