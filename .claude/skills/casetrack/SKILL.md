@@ -260,7 +260,7 @@ mcp__casetrack__casetrack_list_projects
 mcp__casetrack__casetrack_query(project_id="<slug>", sql="...")
 ```
 
-The MCP tool is usually faster inside Claude Code — no shell escaping. `project_id` is the DNS-slug form (e.g. `project-17424`), which is the canonical identifier used across the casetrack CLI, MCP, and any downstream tooling.
+The MCP tool is usually faster inside Claude Code — no shell escaping. `project_id` is the DNS-slug form (e.g. `project-demo`), which is the canonical identifier used across the casetrack CLI, MCP, and any downstream tooling.
 
 For read queries, always prefer the `_active` view over raw tables — it filters out censored entities automatically. Raw tables are for auditing only.
 

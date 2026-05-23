@@ -107,7 +107,7 @@ Every `SUMMARIZE_*` module emits a one-row TSV keyed on the level's ID column. T
 Example (`samtools_sort_summary.tsv`, single row):
 ```tsv
 specimen_id       sorted_bam_path                                                              sorted_bam_size_bytes  n_reads   sort_order
-p17424_1_tumor    /data/processed/hg38/p17424_1/p17424_1_tumor/p17424_1_tumor.hg38.sorted.bam  85134617284            142593118 coordinate
+p_demo_1_tumor    /data/processed/hg38/p_demo_1/p_demo_1_tumor/p_demo_1_tumor.hg38.sorted.bam  85134617284            142593118 coordinate
 ```
 
 After `casetrack append --analysis samtools_sort --overwrite`, the DB gets:

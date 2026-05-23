@@ -2,7 +2,7 @@
 
 Specimen rows × analysis columns (or whichever level the project uses).
 Per-cell glyph aggregation handles the case where a specimen owns several
-assays for the same analysis (project-17424's `dorado` runs per assay,
+assays for the same analysis (project-demo's `dorado` runs per assay,
 collapses to a specimen at `merge`). For ≤4 child entities we render a
 glyph string (e.g. ``●⊘`` = one done, one failed); beyond that we fall back
 to a sparkline-friendly summary.

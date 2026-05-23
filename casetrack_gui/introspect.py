@@ -2,7 +2,7 @@
 
 The GUI cannot hardcode `dorado_basecaller_done` etc. — different cohorts
 declare different analyses (`pileup_5mC_bedmethyl` for the drug-screen
-project, `*_done` timestamps for project-17424). These helpers walk
+project, `*_done` timestamps for project-demo). These helpers walk
 `pragma_table_info` to discover:
 
 - which level (patient / specimen / assay) carries the most analyses → the

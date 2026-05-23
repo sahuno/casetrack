@@ -326,7 +326,7 @@ The `_active` view excludes censored/failed/consent-revoked entities automatical
 casetrack censor \
   --project-dir . \
   --level assay \
-  --id s17424_C_6_1_1_1_1_1 \
+  --id s_demo_C_6_1_1_1_1_1 \
   --kind qc_warn \
   --reason "pod5 rsync incomplete as of 2026-04-21"
 ```
@@ -336,7 +336,7 @@ casetrack censor \
 casetrack uncensor \
   --project-dir . \
   --level assay \
-  --id s17424_C_6_1_1_1_1_1 \
+  --id s_demo_C_6_1_1_1_1_1 \
   --reason "pod5 rsync confirmed complete 2026-04-22"
 ```
 

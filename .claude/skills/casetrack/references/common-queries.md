@@ -90,13 +90,13 @@ Full censor/uncensor history for an entity.
 ```sql
 SELECT event_id, occurred_at, action, kind, reason, resolved_at
 FROM qc_events
-WHERE entity_id = 's17424_C_6_1_1_1_1_1'
+WHERE entity_id = 's_demo_C_6_1_1_1_1_1'
 ORDER BY occurred_at DESC;
 ```
 
 Or use the CLI shortcut:
 ```bash
-casetrack qc-history --project-dir . --id s17424_C_6_1_1_1_1_1
+casetrack qc-history --project-dir . --id s_demo_C_6_1_1_1_1_1
 ```
 
 ## Find orphan specimens / assays (data-integrity check)
@@ -151,12 +151,12 @@ When operating inside Claude Code, the MCP tool is usually faster than shelling 
 ```python
 mcp__casetrack__casetrack_list_projects()
 mcp__casetrack__casetrack_query(
-    project_id="project-17424",
+    project_id="project-demo",
     sql="SELECT condition, COUNT(*) FROM assays GROUP BY condition"
 )
 ```
 
-`project_id` is always the DNS-slug form (e.g. `project-17424`, with hyphens not underscores). Get the exact slug via `casetrack_list_projects` first if unsure.
+`project_id` is always the DNS-slug form (e.g. `project-demo`, with hyphens not underscores). Get the exact slug via `casetrack_list_projects` first if unsure.
 
 ## Views to know
 

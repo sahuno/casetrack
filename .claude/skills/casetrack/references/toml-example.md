@@ -5,8 +5,8 @@ Fully-worked example for a cancer genomics tumor-normal cohort using ONT WGS.
 ```toml
 # ─── Project identity ───────────────────────────────────────────────────────
 [project]
-project_id = "project-17424"     # DNS-label slug; used by casetrack_list_projects (MCP) and registry
-name       = "project_17424"     # human-readable name (underscores ok here)
+project_id = "project-demo"      # DNS-label slug; used by casetrack_list_projects (MCP) and registry
+name       = "project_demo"      # human-readable name (underscores ok here)
 schema_v   = 1                   # auto-bumped by `casetrack schema apply`
 created    = "2026-04-17T12:57:20"
 

@@ -344,7 +344,7 @@ Shipped since original roadmap:
 Remaining long-term:
 - `casetrack-nf-subworkflows` publishes to `nf-core/subworkflows` if the upstream community wants it.
 - Patient-level L1 wrapper when a concrete tool that operates on patient-pooled data lands (ADR-001 D3 deferred).
-- Real-data validation of C1–C4 wrappers (C0 MODKIT_MERGED_TRACKED validated 2026-04-20 against project_17424 chr17).
+- Real-data validation of C1–C4 wrappers (C0 MODKIT_MERGED_TRACKED validated 2026-04-20 against project_demo chr17).
 
 ## Open questions
 

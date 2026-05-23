@@ -345,7 +345,7 @@ def test_link_sources_validates_specimen_id(proj_migrated: Path) -> None:
 
 
 def test_link_sources_from_tsv_bulk(proj_migrated: Path, tmp_path: Path) -> None:
-    """link-sources --from-tsv bulk loads project_17424-style rows.
+    """link-sources --from-tsv bulk loads project_demo-style rows.
 
     Simulates 6 specimens and 12 assays (2 runs per specimen).
     """

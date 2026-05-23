@@ -89,7 +89,7 @@ The two are equivalent in outcome. Mix and match freely.
 ```bash
 # 1. Have a casetrack project with patients/specimens/assays bootstrapped
 #    from a sample sheet (pre-merge BAMs are ASSAYS with bam_path set).
-#    See examples/project_17424/bootstrap.py for a worked example.
+#    See examples/project_demo/bootstrap.py for a worked example.
 
 # 2. Pre-merge QC — one sbatch per assay.
 PROJECT_DIR=/data1/.../cohort \

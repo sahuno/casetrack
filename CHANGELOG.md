@@ -273,7 +273,7 @@ project lifecycle status. Implements proposals
 ### Added
 
 - **Project identity (proposal 0005 Part B).** Every project gets a stable
-  `project_id` (DNS-slug form, e.g. `project-17424`), persisted in a `project_meta`
+  `project_id` (DNS-slug form, e.g. `project-demo`), persisted in a `project_meta`
   row and recorded in a user-level registry at `~/.casetrack/registry.json`.
   `casetrack projects` gains `scan` / `list` / `register` / `deregister`
   subactions. `casetrack migrate-project-id` brings legacy v0.5 projects into the
@@ -397,10 +397,10 @@ One new flag + a worked real-cohort example.
   at assay level → `_active` cascade excludes bad flowcells → `samtools
   merge` at specimen level → downstream analyses (modkit, sniffles, …)
   run on the merged BAM. Ships with a `subset_chr` helper for fast
-  per-chromosome iteration. Verified end-to-end against Project_17424
+  per-chromosome iteration. Verified end-to-end against Project_demo
   (6 patients × 2 flowcells, real ONT data).
-- **`examples/project_17424/`** — bootstrap + README for the MSKCC
-  Project_17424 tumor cohort, wired to the pre-merge-runs pattern.
+- **`examples/project_demo/`** — bootstrap + README for the MSKCC
+  Project_demo tumor cohort, wired to the pre-merge-runs pattern.
 
 ### Changed
 

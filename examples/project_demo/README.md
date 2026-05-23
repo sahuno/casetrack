@@ -1,13 +1,13 @@
-# Project 17424 — MSKCC ONT tumor cohort
+# Demo ONT tumor cohort
 
-Real cohort, 6 patients × 2 pre-merge BAMs each (= 12 flowcell runs).
+Synthetic example, 6 patients × 2 pre-merge BAMs each (= 12 flowcell runs).
 Demonstrates the [pre-merge runs → specimen-level analyses](../patterns/premerge_runs/README.md)
-pattern against production data.
+pattern.
 
 ## Sheet → casetrack mapping
 
-Sample sheet: `sample_sheet.tsv` (symlinked to the live
-`/data1/greenbab/projects/ont/Project_17424/data/metadata/sampleSheet_bam_dedup.tsv`).
+Sample sheet: `sample_sheet.tsv` (replace the example paths with your own
+real BAM locations).
 
 | Sheet column | Where it lands |
 |---|---|
@@ -24,14 +24,14 @@ specimens via `samtools merge` — see below.
 
 ```bash
 # 1. Bootstrap the project.
-python3 examples/project_17424/bootstrap.py \
-    --sample-sheet examples/project_17424/sample_sheet.tsv \
-    --project-dir /data1/greenbab/users/<you>/casetrack_projects/project_17424/
+python3 examples/project_demo/bootstrap.py \
+    --sample-sheet examples/project_demo/sample_sheet.tsv \
+    --project-dir /data1/greenbab/users/<you>/casetrack_projects/project_demo/
 
 # 2. Follow the premerge_runs pattern — pre-merge QC, merge, downstream.
 cd examples/patterns/premerge_runs/
 
-PROJECT_DIR=/data1/.../project_17424/ \
+PROJECT_DIR=/data1/.../project_demo/ \
 SAMTOOLS_CONTAINER=/data1/greenbab/software/images/onttools_v3.10.sif \
 CASETRACK_BIN=$(which casetrack) \
   bash submit_merge_pipeline.sh premerge_flagstat --submit
@@ -43,7 +43,7 @@ PROJECT_DIR=... SAMTOOLS_CONTAINER=... CASETRACK_BIN=... \
 
 # ... and downstream:
 PROJECT_DIR=... SAMTOOLS_CONTAINER=... CASETRACK_BIN=... \
-REF_FASTA=/data1/greenbab/projects/ont/Project_17424/data/ref/GRCh38.fa \
+REF_FASTA=/data1/greenbab/projects/ont/Project_demo/data/ref/GRCh38.fa \
 MODKIT_CONTAINER=/data1/greenbab/software/images/onttools_v3.10.sif \
   bash submit_merge_pipeline.sh modkit_merged --submit
 ```

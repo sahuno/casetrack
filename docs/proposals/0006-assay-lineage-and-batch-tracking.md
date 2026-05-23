@@ -14,24 +14,24 @@ current three-level hierarchy (`patients → specimens → assays`) run-level as
 exist as tracked entities, but their relationship to the specimen-level analysis
 that consumed them is invisible to casetrack.
 
-### Concrete reference case: project_17424
+### Concrete reference case: project_demo
 
 ```
-p17424_6 (patient)
-  └── p17424_6_tumor (specimen)    ← modkit methylation lands here (specimen level)
-        ├── s17424_6_1_1_1_1_1     ← flowcell 1 BAM, 10.9M reads, R10.4.1
-        └── s17424_6_1_2_1_1_1     ← flowcell 2 BAM,  9.9M reads, R10.4.1
+p_demo_6 (patient)
+  └── p_demo_6_tumor (specimen)    ← modkit methylation lands here (specimen level)
+        ├── s_demo_6_1_1_1_1_1     ← flowcell 1 BAM, 10.9M reads, R10.4.1
+        └── s_demo_6_1_2_1_1_1     ← flowcell 2 BAM,  9.9M reads, R10.4.1
 ```
 
 Both run-level assays are already registered with `flowcell_id`, `chemistry`,
 `total_reads`, `mapped_pct`. Methylation results from `MODKIT_MERGED_TRACKED`
-landed on `p17424_6_tumor` (specimen) — modkit pileup reads both BAMs
+landed on `p_demo_6_tumor` (specimen) — modkit pileup reads both BAMs
 simultaneously; no explicit merged BAM artifact is written to disk.
 
 Casetrack currently cannot answer:
 
-- "Which flowcells fed p17424_6_tumor's methylation call?"
-- "If s17424_6_1_1_1_1_1 had a basecalling issue, which specimens are affected?"
+- "Which flowcells fed p_demo_6_tumor's methylation call?"
+- "If s_demo_6_1_1_1_1_1 had a basecalling issue, which specimens are affected?"
 - "Were run1 and run2 from the same reagent lot / library prep batch?"
 - "Across the cohort, which specimens drew from a contaminated flowcell batch?"
 
@@ -71,12 +71,12 @@ entities. It supports two modes:
 
 ```
 Mode A — assay → assay  (explicit merged BAM case)
-  merged_assay_id: "p17424_6_merged"  →  source_assay_id: "s17424_6_1_1_1_1_1"
-  merged_assay_id: "p17424_6_merged"  →  source_assay_id: "s17424_6_1_2_1_1_1"
+  merged_assay_id: "p_demo_6_merged"  →  source_assay_id: "s_demo_6_1_1_1_1_1"
+  merged_assay_id: "p_demo_6_merged"  →  source_assay_id: "s_demo_6_1_2_1_1_1"
 
 Mode B — assay → specimen  (implicit merge / modkit multi-BAM case)
-  consumer_specimen_id: "p17424_6_tumor"  →  source_assay_id: "s17424_6_1_1_1_1_1"
-  consumer_specimen_id: "p17424_6_tumor"  →  source_assay_id: "s17424_6_1_2_1_1_1"
+  consumer_specimen_id: "p_demo_6_tumor"  →  source_assay_id: "s_demo_6_1_1_1_1_1"
+  consumer_specimen_id: "p_demo_6_tumor"  →  source_assay_id: "s_demo_6_1_2_1_1_1"
 ```
 
 The table has nullable `merged_assay_id` and `consumer_specimen_id` — exactly
@@ -89,8 +89,8 @@ shows direct sources only; `--deep` shows transitive provenance.
 
 ### D3 — `casetrack rerun` targets the merged assay, not its sources
 
-If `p17424_6.modkit_done` is null, `rerun --analysis modkit` emits the sbatch
-for `p17424_6`. Source run assays are independent entities. Add
+If `p_demo_6.modkit_done` is null, `rerun --analysis modkit` emits the sbatch
+for `p_demo_6`. Source run assays are independent entities. Add
 `--include-sources` to also emit rerun commands for all direct source assays
 (e.g. to re-basecall after a model update).
 
@@ -101,7 +101,7 @@ sequencing-run level, which maps to `assay`. A patient's specimens can span
 batches — that's the point. `batch_id` is a FK into the new `batches` table.
 Existing rows get `batch_id = NULL` — no migration needed.
 
-**project_17424 note**: the `flowcell_id` column already exists on `assays`
+**project_demo note**: the `flowcell_id` column already exists on `assays`
 and carries the natural batch identifier. `batch_id` can alias `flowcell_id`
 or group multiple flowcells into a named library-prep batch — whichever
 granularity is relevant for QC (reagent lot contamination → prep batch;
@@ -173,11 +173,11 @@ CREATE TABLE IF NOT EXISTS assay_sources (
 );
 ```
 
-**project_17424 example** (Mode B — implicit merge):
+**project_demo example** (Mode B — implicit merge):
 ```sql
 INSERT INTO assay_sources (source_assay_id, consumer_specimen_id)
-VALUES ('s17424_6_1_1_1_1_1', 'p17424_6_tumor'),
-       ('s17424_6_1_2_1_1_1', 'p17424_6_tumor');
+VALUES ('s_demo_6_1_1_1_1_1', 'p_demo_6_tumor'),
+       ('s_demo_6_1_2_1_1_1', 'p_demo_6_tumor');
 ```
 
 ---
@@ -198,26 +198,26 @@ updates the metadata fields that are provided.
 ### `casetrack link-sources`
 
 Links source assays to their downstream consumer — either an explicit merged
-assay (Mode A) or a specimen (Mode B, the project_17424 pattern).
+assay (Mode A) or a specimen (Mode B, the project_demo pattern).
 
 ```bash
 # Mode A — explicit merged BAM assay
 casetrack link-sources \
-    --sources    s17424_6_1_1_1_1_1,s17424_6_1_2_1_1_1 \
-    --merged-id  p17424_6_merged \
+    --sources    s_demo_6_1_1_1_1_1,s_demo_6_1_2_1_1_1 \
+    --merged-id  p_demo_6_merged \
     --project-dir /path/to/proj
 
 # Mode B — implicit merge into specimen (no merged BAM on disk)
 casetrack link-sources \
-    --sources    s17424_6_1_1_1_1_1,s17424_6_1_2_1_1_1 \
-    --specimen   p17424_6_tumor \
+    --sources    s_demo_6_1_1_1_1_1,s_demo_6_1_2_1_1_1 \
+    --specimen   p_demo_6_tumor \
     --project-dir /path/to/proj
 ```
 
 Inserts rows into `assay_sources`. All IDs must exist. Idempotent.
 Provenance: writes a `link_sources` action to `provenance.jsonl`.
 
-**Bulk registration from a TSV** (for project_17424's 12 assays → 6 specimens):
+**Bulk registration from a TSV** (for project_demo's 12 assays → 6 specimens):
 ```bash
 casetrack link-sources --from-tsv links.tsv --project-dir /path/to/proj
 # links.tsv columns: source_assay_id, consumer_specimen_id (or merged_assay_id)
@@ -255,7 +255,7 @@ Shows source assays indented under merged assays in the status table.
 casetrack query --project-dir proj \
     "SELECT a.assay_id, m.source_assay_id FROM assays a
      JOIN assay_merges m ON a.assay_id = m.merged_assay_id
-     WHERE a.specimen_id = 'p17424_6_primary'"
+     WHERE a.specimen_id = 'p_demo_6_primary'"
 ```
 
 DuckDB query mode already works against any table — `assay_merges` and
@@ -278,27 +278,27 @@ casetrack migrate-lineage --project-dir /path/to/proj
 
 Idempotent. Does NOT modify `schema_version` — additive migration only.
 
-**project_17424 quick-start after migration**:
+**project_demo quick-start after migration**:
 ```bash
-casetrack migrate-lineage --project-dir /path/to/project_17424
+casetrack migrate-lineage --project-dir /path/to/project_demo
 
 # Register all 6 specimen→assay links in one pass:
 cat > links.tsv <<TSV
 source_assay_id,consumer_specimen_id
-s17424_1_1_1_1_1_1,p17424_1_tumor
-s17424_1_1_2_1_1_1,p17424_1_tumor
-s17424_2_1_1_1_1_1,p17424_2_tumor
-s17424_2_1_2_1_1_1,p17424_2_tumor
-s17424_3_1_1_1_1_1,p17424_3_tumor
-s17424_3_1_2_1_1_1,p17424_3_tumor
-s17424_4_1_1_1_1_1,p17424_4_tumor
-s17424_4_1_2_1_1_1,p17424_4_tumor
-s17424_5_1_1_1_1_1,p17424_5_tumor
-s17424_5_1_2_1_1_1,p17424_5_tumor
-s17424_6_1_1_1_1_1,p17424_6_tumor
-s17424_6_1_2_1_1_1,p17424_6_tumor
+s_demo_1_1_1_1_1_1,p_demo_1_tumor
+s_demo_1_1_2_1_1_1,p_demo_1_tumor
+s_demo_2_1_1_1_1_1,p_demo_2_tumor
+s_demo_2_1_2_1_1_1,p_demo_2_tumor
+s_demo_3_1_1_1_1_1,p_demo_3_tumor
+s_demo_3_1_2_1_1_1,p_demo_3_tumor
+s_demo_4_1_1_1_1_1,p_demo_4_tumor
+s_demo_4_1_2_1_1_1,p_demo_4_tumor
+s_demo_5_1_1_1_1_1,p_demo_5_tumor
+s_demo_5_1_2_1_1_1,p_demo_5_tumor
+s_demo_6_1_1_1_1_1,p_demo_6_tumor
+s_demo_6_1_2_1_1_1,p_demo_6_tumor
 TSV
-casetrack link-sources --from-tsv links.tsv --project-dir /path/to/project_17424
+casetrack link-sources --from-tsv links.tsv --project-dir /path/to/project_demo
 ```
 
 ---
@@ -351,7 +351,7 @@ process — it's the same "local executor, sqlite write" pattern.
 | O2 | Should `assays.batch_id` be required (non-null) for new assays once `batches` is populated? | No — keep nullable. Different assay types (derived analyses) may not map to a wet-lab batch. |
 | O3 | Is `batches` project-scoped or global? | Project-scoped (lives in the same `casetrack.db`). Cross-project batch comparisons go through `casetrack query` + DuckDB `ATTACH`. |
 | O4 | Should `casetrack add-batch` accept a TSV to bulk-load many batches at once? | Yes — `--from-tsv batches.tsv` with columns `batch_id, prep_date, reagent_lot, operator, notes`. Similarly `link-sources --from-tsv`. |
-| O5 | For project_17424: should `flowcell_id` be auto-populated as `batch_id` during migration? | Opt-in: `--map-flowcell-to-batch` flag on `migrate-lineage` copies `flowcell_id` → `batch_id` for every assay that has a `flowcell_id` and no `batch_id`. Non-destructive. |
+| O5 | For project_demo: should `flowcell_id` be auto-populated as `batch_id` during migration? | Opt-in: `--map-flowcell-to-batch` flag on `migrate-lineage` copies `flowcell_id` → `batch_id` for every assay that has a `flowcell_id` and no `batch_id`. Non-destructive. |
 
 ---
 

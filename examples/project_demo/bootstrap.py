@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""bootstrap.py — populate a casetrack project from Project_17424's
+"""bootstrap.py — populate a casetrack project from Project_demo's
 pre-merge BAM sample sheet.
 
 Sheet schema:
-    patient   — biological subject (p17424_N)
-    sample    — opaque per-flowcell sample ID (s17424_...), one row per BAM
+    patient   — biological subject (p_demo_N)
+    sample    — opaque per-flowcell sample ID (s_demo_...), one row per BAM
     condition — tumor / normal (used to synthesize specimen_id)
     path      — absolute pre-merge BAM path
     genome    — e.g. hg38
@@ -89,7 +89,7 @@ def main():
     for (patient_id, condition), group in sheet.groupby(["patient", "condition"]):
         if _register_if_missing(
             project_dir, "patient", patient_id, parent=None,
-            meta={"reference_source": "MSKCC", "cohort": "project_17424"},
+            meta={"reference_source": "MSKCC", "cohort": "project_demo"},
         ):
             n_p += 1
 
