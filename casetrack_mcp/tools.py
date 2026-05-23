@@ -371,6 +371,7 @@ def cohort_artifacts_tool(project_id: str, *, stale_only: bool = False) -> dict:
                     "run_tag": a.run_tag,
                     "path": a.path,
                     "n_inputs": a.n_inputs,
+                    "region_scope": a.region_scope,
                     "stale": bool(censored),
                     "n_censored_inputs": len(censored),
                     "censored_inputs": censored,

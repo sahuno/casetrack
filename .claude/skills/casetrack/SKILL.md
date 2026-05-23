@@ -28,6 +28,9 @@ Ask yourself: am I registering an entity (adding a new patient/specimen/assay ro
 | List reference artifacts + staleness (v0.8 / proposal 0010) | `casetrack references` | `--project-dir . [--stale-only] [--fmt table\|tsv\|json]` |
 | Add reference-artifact tables to a pre-0010 project (v0.8 / proposal 0010) | `casetrack migrate-references` | `--project-dir . [--dry-run]` |
 | Load all three levels from one wide sample sheet (v0.10 / proposal 0012) | `casetrack register-cohort` | `--project-dir . --samplesheet cohort.tsv [--dry-run] [--overwrite]` |
+| Tag a cohort artifact with a genomic scope label (v0.11 / proposal 0013) | `casetrack append-cohort` | `... --region-scope <label> --inputs assay:role,assay:role` |
+| Filter cohort artifacts by scope (v0.11 / proposal 0013) | `casetrack cohort-artifacts` | `--project-dir . --scope <label> [--fmt table\|tsv\|json]` |
+| Add `region_scope`/`role` columns to a pre-0013 project (v0.11) | `casetrack migrate-region-scope` | `--project-dir . [--dry-run]` |
 | See overall progress | `casetrack status` | `--project-dir .` |
 | Run arbitrary SQL | `casetrack query` | `--project-dir . --sql "..."` |
 | Inspect current DB schema | `casetrack schema show` | `--project-dir .` |
@@ -525,7 +528,86 @@ Projects created by a current `casetrack init` already have the tables (no migra
 
 See `references/reference-artifacts.md` for the full table schema, the staleness algorithm in detail, and worked examples. Proposal: `docs/proposals/0010-reference-artifacts.md` (§6.2 staleness, §7 rejected alternatives).
 
-## 17. When to read the references
+## 17. Region-scoped artifacts (proposal 0013)
+
+Some cohort outputs are **not** genome-wide: a joint VCF restricted to a target panel, a methylation matrix over CpG-island regions, an SV call set on chrX only. The output still spans many assays (so it's a cohort artifact, §15), but it also has a **genomic scope**. v0.11 adds a nullable `region_scope` label on each cohort artifact and a nullable `role` on each input edge, with no new staleness machinery — scope-version bumps ride the existing `ref_stale` flag (§16) via auto-capture.
+
+### What you get
+
+- **`cohort_artifacts.region_scope`** (nullable) — a free-form label: `genome-wide`, a panel key (e.g. `myeloid_panel_v2`), or a raw `chr:start-end` literal.
+- **`cohort_artifact_inputs.role`** (nullable) — a contrast role per input assay (`tumor` / `normal` / …). Descriptive only — not used for staleness.
+- **Reference-resolve auto-capture** — if `region_scope` matches a registered reference key (proposal 0010), `append-cohort` automatically writes a cohort-scope `reference_usage` row pointing at that ref's current version. Bumping the ref's version + `schema apply` then flips the artifact to `ref_stale=True` — same machinery as 0010, zero new code paths.
+
+### How to register
+
+```bash
+# Genome-wide joint VCF, with tumor/normal contrast roles on the inputs:
+casetrack append-cohort --project-dir . \
+  --analysis joint_genotype --run-tag 2026Q2 \
+  --path results/joint_genotype/cohort.2026Q2.vcf.gz \
+  --region-scope genome-wide \
+  --inputs assay_001:tumor,assay_002:normal,assay_003:tumor,assay_004:normal
+
+# Panel-scoped artifact — region_scope matches a [references.myeloid_panel_v2] block,
+# so append auto-captures a cohort-scope reference_usage row at the current version:
+casetrack append-cohort --project-dir . \
+  --analysis joint_genotype --run-tag panel_run_01 \
+  --path results/joint_genotype/cohort.myeloid.vcf.gz \
+  --region-scope myeloid_panel_v2 \
+  --inputs assay_001:tumor,assay_002:normal
+
+# A `role` column in --inputs-from is also accepted:
+casetrack append-cohort --project-dir . \
+  --analysis joint_genotype --run-tag 2026Q2 \
+  --path ... --region-scope genome-wide \
+  --inputs-from inputs.tsv         # tsv columns: assay_id<TAB>role
+```
+
+### How to query
+
+```bash
+# Filter cohort artifacts by scope:
+casetrack cohort-artifacts --project-dir . --scope genome-wide
+casetrack cohort-artifacts --project-dir . --scope myeloid_panel_v2 --fmt tsv
+
+# region_scope is in the `_cohort_artifacts` DuckDB view, plus a derived `scope_ref_key`
+# (= region_scope iff it resolves to a registered reference key, else NULL):
+casetrack query --project-dir . --sql \
+  "SELECT analysis, run_tag, region_scope, scope_ref_key, stale, ref_stale, derived_stale
+     FROM _cohort_artifacts WHERE scope_ref_key IS NOT NULL"
+```
+
+### Migration
+
+Projects created before 0013 need a one-time migration:
+
+```bash
+casetrack migrate-region-scope --project-dir .            # ALTER add region_scope + role
+casetrack migrate-region-scope --project-dir . --dry-run  # print the plan, change nothing
+```
+
+Fully additive: pre-0013 artifacts read as `region_scope = NULL` and inputs as `role = NULL`. No row rewriting; safe to run on any project.
+
+### Surfacing
+
+`region_scope` appears in:
+- `casetrack cohort-artifacts` (table/tsv/json output; NULL → empty in TSV)
+- `casetrack status` (cohort-artifacts section)
+- the HTML dashboard (header + table cells)
+- the `casetrack_cohort_artifacts` MCP tool
+- `casetrack export` (rides along free via `SELECT *`)
+- the `_cohort_artifacts` DuckDB view (presence-guarded across all 3 tiers)
+
+### What 0013 does **not** do (deferred — see proposal §7)
+
+- **A2** — `region_scope` on sample-level analysis rows (A2 alternative).
+- **A3** — scope on **any** lineage node (sample / cohort / reference) generically.
+- **Per-region findings store** — no per-locus result table; cohort artifacts remain whole-output rows.
+- **Interval-tree / overlap queries** — `region_scope` is a free-form label; no `RTree` index, no interval intersection.
+
+Proposal: `docs/proposals/0013-region-scoped-artifacts.md` (§0 = locked decisions; §7 = rejected alternatives).
+
+## 18. When to read the references
 
 Default to handling requests directly from this SKILL.md. Read reference files when:
 

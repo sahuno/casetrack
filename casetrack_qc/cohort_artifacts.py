@@ -42,6 +42,7 @@ def cohort_artifacts_ddl() -> str:
         "    checksum       TEXT,\n"
         "    n_inputs       INTEGER NOT NULL,\n"
         "    stats_json     TEXT,\n"
+        "    region_scope   TEXT,\n"
         "    created_at     TEXT NOT NULL,\n"
         "    created_by     TEXT,\n"
         "    transaction_id TEXT NOT NULL,\n"
@@ -56,6 +57,7 @@ def cohort_artifact_inputs_ddl() -> str:
         "    artifact_id INTEGER NOT NULL "
         "REFERENCES cohort_artifacts(artifact_id) ON DELETE CASCADE,\n"
         "    assay_id    TEXT NOT NULL REFERENCES assays(assay_id) ON DELETE RESTRICT,\n"
+        "    role        TEXT,\n"
         "    PRIMARY KEY (artifact_id, assay_id)\n"
         ")"
     )
@@ -79,6 +81,11 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         (name,),
     ).fetchone()
     return row is not None
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cur = conn.execute(f'PRAGMA table_info("{table}")')
+    return any(row[1] == column for row in cur.fetchall())
 
 
 def cohort_artifacts_schema_exists(conn: sqlite3.Connection) -> bool:
@@ -107,6 +114,40 @@ def ensure_cohort_artifacts_schema(conn: sqlite3.Connection) -> list[str]:
         for idx_ddl in cohort_artifacts_indexes():
             conn.execute(idx_ddl)
             executed.append(idx_ddl)
+    executed.extend(ensure_region_scope_columns(conn))
+    return executed
+
+
+def ensure_region_scope_columns(conn: sqlite3.Connection) -> list[str]:
+    """Add the proposal-0013 columns to existing 0009 tables. Idempotent.
+
+    ``region_scope`` on ``cohort_artifacts`` and ``role`` on
+    ``cohort_artifact_inputs``. No-op (returns ``[]``) when the tables are
+    absent (pre-0009) or the columns already exist (fresh DDL or already
+    migrated). Caller owns the transaction.
+    """
+    executed: list[str] = []
+    if _table_exists(conn, "cohort_artifacts") and not _column_exists(
+        conn, "cohort_artifacts", "region_scope"
+    ):
+        sql = "ALTER TABLE cohort_artifacts ADD COLUMN region_scope TEXT"
+        conn.execute(sql)
+        executed.append(sql)
+    if _table_exists(conn, "cohort_artifact_inputs") and not _column_exists(
+        conn, "cohort_artifact_inputs", "role"
+    ):
+        sql = "ALTER TABLE cohort_artifact_inputs ADD COLUMN role TEXT"
+        conn.execute(sql)
+        executed.append(sql)
+    # Create the grouping index if any column was added and the parent table exists.
+    # IF NOT EXISTS makes this idempotent across partial migrations.
+    if executed and _table_exists(conn, "cohort_artifacts"):
+        idx = (
+            "CREATE INDEX IF NOT EXISTS idx_cohort_artifacts_scope "
+            "ON cohort_artifacts(region_scope)"
+        )
+        conn.execute(idx)
+        executed.append(idx)
     return executed
 
 
@@ -126,6 +167,7 @@ class CohortArtifact:
     checksum: str | None
     n_inputs: int
     stats_json: str | None
+    region_scope: str | None
     created_at: str
     created_by: str | None
     transaction_id: str
@@ -136,7 +178,7 @@ class CohortArtifact:
 
 _ARTIFACT_COLS = (
     "artifact_id, analysis, run_tag, path, checksum, n_inputs, "
-    "stats_json, created_at, created_by, transaction_id"
+    "stats_json, region_scope, created_at, created_by, transaction_id"
 )
 
 
@@ -157,6 +199,7 @@ def insert_artifact(
     transaction_id: str,
     checksum: str | None = None,
     stats_json: str | None = None,
+    region_scope: str | None = None,
     created_by: str | None = None,
     created_at: str | None = None,
 ) -> int:
@@ -165,6 +208,10 @@ def insert_artifact(
     Refuses a duplicate ``(analysis, run_tag)`` with a friendly error rather
     than letting the UNIQUE constraint surface as a raw ``IntegrityError`` —
     a re-genotyping run must use a new ``run_tag`` (proposal 0009 §8.2).
+
+    ``region_scope`` is an optional free-text label for the genomic region
+    this artifact covers (proposal 0013), e.g. ``"promoters_EPDnew"`` or
+    ``"whole_genome"``. ``None`` means whole-genome / unscoped.
     """
     if get_artifact_by_key(conn, analysis, run_tag) is not None:
         raise CohortArtifactError(
@@ -177,22 +224,34 @@ def insert_artifact(
         """
         INSERT INTO cohort_artifacts
             (analysis, run_tag, path, checksum, n_inputs, stats_json,
-             created_at, created_by, transaction_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             region_scope, created_at, created_by, transaction_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (analysis, run_tag, path, checksum, n_inputs, stats_json,
-         created_at, created_by, transaction_id),
+         region_scope, created_at, created_by, transaction_id),
     )
     return cur.lastrowid
 
 
 def add_artifact_inputs(
-    conn: sqlite3.Connection, artifact_id: int, assay_ids: Iterable[str]
+    conn: sqlite3.Connection,
+    artifact_id: int,
+    assay_ids: Iterable[str],
+    roles: dict[str, str | None] | None = None,
 ) -> int:
     """Link contributing assays to an artifact. Returns the number inserted.
 
     Validates every assay exists first so a typo surfaces as a clear error
     instead of a raw FK ``IntegrityError`` mid-loop.
+
+    ``roles`` is an optional mapping of assay_id → role label (proposal 0013),
+    e.g. ``{"A_T": "tumor", "A_N": "normal"}``. Omitted entries (or ``None``
+    for the whole dict) store NULL in the ``role`` column, which is always
+    backward-compatible.
+
+    Because the INSERT uses ``INSERT OR IGNORE``, a second call for the same
+    ``(artifact_id, assay_id)`` pair will silently skip the row and will NOT
+    update an existing role — roles are write-once per input link.
     """
     ids = list(assay_ids)
     for assay_id in ids:
@@ -201,10 +260,11 @@ def add_artifact_inputs(
         ).fetchone()
         if row is None:
             raise CohortArtifactError(f"unknown assay {assay_id!r}")
+    role_map: dict[str, str | None] = roles or {}
     conn.executemany(
-        "INSERT OR IGNORE INTO cohort_artifact_inputs (artifact_id, assay_id) "
-        "VALUES (?, ?)",
-        [(artifact_id, a) for a in ids],
+        "INSERT OR IGNORE INTO cohort_artifact_inputs (artifact_id, assay_id, role) "
+        "VALUES (?, ?, ?)",
+        [(artifact_id, a, role_map.get(a)) for a in ids],
     )
     return len(ids)
 
@@ -242,6 +302,23 @@ def artifact_inputs(conn: sqlite3.Connection, artifact_id: int) -> list[str]:
         (artifact_id,),
     ).fetchall()
     return [r[0] for r in rows]
+
+
+def artifact_input_roles(
+    conn: sqlite3.Connection, artifact_id: int
+) -> dict[str, str | None]:
+    """Map assay_id -> role for one artifact's inputs (role NULL when unset).
+
+    Returns a dict keyed by assay_id with values being the stored role label
+    (proposal 0013) or ``None`` when no role was recorded. The dict is ordered
+    by assay_id (SQLite ORDER BY, Python 3.7+ dict insertion order).
+    """
+    rows = conn.execute(
+        "SELECT assay_id, role FROM cohort_artifact_inputs "
+        "WHERE artifact_id = ? ORDER BY assay_id",
+        (artifact_id,),
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
 
 
 # ── Read-time staleness (proposal 0009 §6.2) ────────────────────────────────
@@ -287,11 +364,13 @@ __all__ = [
     "cohort_artifacts_indexes",
     "cohort_artifacts_schema_exists",
     "ensure_cohort_artifacts_schema",
+    "ensure_region_scope_columns",
     "insert_artifact",
     "add_artifact_inputs",
     "get_artifact",
     "get_artifact_by_key",
     "list_artifacts",
     "artifact_inputs",
+    "artifact_input_roles",
     "artifact_staleness",
 ]

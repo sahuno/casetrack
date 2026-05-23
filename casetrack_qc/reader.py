@@ -205,7 +205,7 @@ def install_active_views(duckdb_con) -> None:
 
 
 def install_cohort_artifact_view(duckdb_con) -> None:
-    """Attach a ``_cohort_artifacts`` DuckDB view (proposal 0009 + 0010).
+    """Attach a ``_cohort_artifacts`` DuckDB view (proposal 0009 + 0010 + 0011 + 0013).
 
     Exposes each cohort artifact with derived columns:
       - ``n_censored_inputs`` — contributing assays currently excluded by the
@@ -216,6 +216,12 @@ def install_cohort_artifact_view(duckdb_con) -> None:
         reference-usage row for this artifact has a stale version. Present only
         on 0010+ projects; absent on pre-0010 projects (view still created
         without the column so ``query`` continues to work).
+      - ``region_scope`` — free-text scope label from ``cohort_artifacts`` (0013);
+        NULL when the artifact is unscoped. NULL on pre-0013 projects (column absent).
+      - ``scope_ref_key`` — the matching ``ref_key`` from ``reference_artifacts``
+        when ``region_scope`` coincides with a declared reference; NULL when the
+        scope is a free-text label or the artifact is unscoped. Always NULL on
+        pre-0010 projects (reference table absent).
 
     Silent no-op on projects without the cohort-artifact tables (pre-0009).
     """
@@ -240,6 +246,23 @@ def install_cohort_artifact_view(duckdb_con) -> None:
               AND (rr.version IS NULL OR rr.version <> ru.version_used)
         )
     """
+    # Proposal 0013: region_scope (cohort_artifacts column) + derived
+    # scope_ref_key (the ref_key it resolves to, NULL when label-only).
+    # Column-presence-guarded so pre-0013 projects keep a working view.
+    try:
+        have_scope = duckdb_con.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_catalog = 'proj' "
+            "  AND table_name = 'cohort_artifacts' "
+            "  AND column_name = 'region_scope'"
+        ).fetchone() is not None
+    except Exception:
+        have_scope = False
+    scope_expr = "ca.region_scope" if have_scope else "CAST(NULL AS VARCHAR)"
+    scope_ref_key_expr = (
+        "(SELECT rr.ref_key FROM proj.reference_artifacts rr "
+        f"WHERE rr.ref_key = {scope_expr})"
+    )
     # Proposal 0011: derived_stale. Joins the recursive transitive closure
     # (derived) computed from BASE TABLES (self_safe=True) so it can be defined
     # inside the very view it would otherwise self-reference.
@@ -249,6 +272,8 @@ def install_cohort_artifact_view(duckdb_con) -> None:
         WITH RECURSIVE {_derived_stale_cte(self_safe=True)}
         SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
                ca.n_inputs, ca.stats_json, ca.created_at,
+               {scope_expr} AS region_scope,
+               {scope_ref_key_expr} AS scope_ref_key,
                {censored_count} AS n_censored_inputs,
                ({censored_count} > 0) AS stale,
                {ref_stale_subquery} AS ref_stale,
@@ -265,16 +290,23 @@ def install_cohort_artifact_view(duckdb_con) -> None:
         CREATE VIEW "_cohort_artifacts" AS
         SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
                ca.n_inputs, ca.stats_json, ca.created_at,
+               {scope_expr} AS region_scope,
+               {scope_ref_key_expr} AS scope_ref_key,
                {censored_count} AS n_censored_inputs,
                ({censored_count} > 0) AS stale,
                {ref_stale_subquery} AS ref_stale
         FROM proj.cohort_artifacts ca
     """
     # Pre-0010 fallback: no ref_stale column, no derived_stale column.
+    # Note: reference_artifacts is absent in this tier, so scope_ref_key cannot
+    # be resolved — emit a typed-NULL placeholder to keep the column shape
+    # consistent with the 0010+ tiers above.
     sql_without_ref_stale = f"""
         CREATE VIEW "_cohort_artifacts" AS
         SELECT ca.artifact_id, ca.analysis, ca.run_tag, ca.path, ca.checksum,
                ca.n_inputs, ca.stats_json, ca.created_at,
+               {scope_expr} AS region_scope,
+               CAST(NULL AS VARCHAR) AS scope_ref_key,
                {censored_count} AS n_censored_inputs,
                ({censored_count} > 0) AS stale
         FROM proj.cohort_artifacts ca

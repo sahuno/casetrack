@@ -6,7 +6,7 @@ Manifest-centric case management CLI for bioinformatics pipelines on HPC (SLURM)
 
 - **Repo**: https://github.com/sahuno/casetrack (private)
 - **Author**: Samuel Ahuno (ekwame001@gmail.com / sahuno@mskcc.org)
-- **Current release**: v0.10.0 — `register-cohort` one-shot wide-sheet loader (proposal 0012)
+- **Current release**: v0.11.0 — region-scoped artifacts + contrast roles (proposal 0013)
 - **Next release**: v1.0 (flat-mode removal)
 - **HPC target**: IRIS @ MSKCC (SLURM, WekaFS shared storage, Apptainer containers)
 
@@ -14,6 +14,7 @@ Manifest-centric case management CLI for bioinformatics pipelines on HPC (SLURM)
 
 | File | What it tells you |
 |---|---|
+| `docs/proposals/0013-region-scoped-artifacts.md` | **The shipped region-scoped-artifacts design.** Nullable `region_scope` on cohort artifacts + nullable `role` on inputs; reference-resolve auto-capture so scope-version bumps drive the existing `ref_stale` flag (no new staleness code). |
 | `docs/proposals/0011-artifact-to-artifact-lineage.md` | **The shipped artifact-lineage design.** Generic `derived-from` edge between any two lineage nodes; transitive `derived_stale` flag; `artifact_derivation` sibling table. §0 = nine locked decisions; §7 = rejected alternatives. |
 | `docs/proposals/0010-reference-artifacts.md` | **The shipped reference-artifacts design.** Versioned upstream inputs (genome, GTF, dbSNP) with read-time downstream staleness via two additive sibling tables. §6.2 = three-state staleness + orthogonality to 0009; §7 = why no 4th level / no version-history table. |
 | `docs/proposals/0009-cohort-level-artifacts.md` | **The shipped cohort-artifacts design.** One output from many assays (joint VCFs, PoNs, cohort matrices) via two additive sibling tables. §7 records *why a 4th hierarchy level was rejected* (Option A vs B). §9 = nothing open; fully implemented. |
@@ -80,6 +81,7 @@ Each `[analyses.<tool>]` declares `uses = [...]`; `append` auto-snapshots the cu
 | reference artifacts (0010) | `references`, `migrate-references` (+ `append`/`append-cohort` `--uses-references`) |
 | derivation / lineage (0011) | `derived-from`, `derivation`, `migrate-derivation` (+ `append`/`append-cohort` `--derived-from`) |
 | cohort registration (0012) | `register-cohort` — load patients + specimens + assays from one wide sample sheet in a single transaction; successor to `migrate` for new projects post-v1.0 |
+| region-scoped artifacts (0013) | `migrate-region-scope` — add `region_scope`/`role` columns; `append-cohort --region-scope` + `--inputs assay:role`; `cohort-artifacts --scope` |
 
 Note: `cohort` (v0.4) is the paired-design *readiness* view; `cohort-artifacts` (0009) lists cohort-level *output artifacts* with staleness — different things.
 

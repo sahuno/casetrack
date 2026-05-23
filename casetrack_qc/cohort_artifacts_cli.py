@@ -1,8 +1,9 @@
 """CLI commands for cohort-level artifacts (proposal 0009 §6.3).
 
-- ``migrate-cohort``    — additive: create the two tables on a pre-0009 project.
-- ``append-cohort``     — register one cohort artifact + its assay lineage.
-- ``cohort-artifacts``  — list artifacts with read-time staleness.
+- ``migrate-cohort``       — additive: create the two tables on a pre-0009 project.
+- ``append-cohort``        — register one cohort artifact + its assay lineage.
+- ``cohort-artifacts``     — list artifacts with read-time staleness.
+- ``migrate-region-scope`` — additive: add region_scope/role columns to a post-0009 / pre-0013 project.
 
 Mirrors the ``casetrack_qc.migrate`` / ``casetrack_qc.cohort`` command style:
 resolve project → open db → one ``begin_immediate`` write → provenance entry.
@@ -19,28 +20,55 @@ from pathlib import Path
 import casetrack
 from casetrack_qc import artifact_derivation as ad
 from casetrack_qc import cohort_artifacts as ca
+from casetrack_qc import reference_artifacts as _ra
 
 
-def _read_inputs(args) -> list[str]:
-    """Collect contributing assay_ids from ``--inputs`` or ``--inputs-from``.
+def _read_inputs(args) -> tuple[list[str], dict[str, str | None]]:
+    """Collect contributing assay_ids + optional roles.
 
-    ``--inputs`` is a comma-separated list. ``--inputs-from`` is a file with one
-    assay_id per line; a leading ``assay_id`` header line is skipped and only the
-    first tab-separated column is read (so a wider TSV works).
+    ``--inputs`` is comma-separated ``assay_id`` or ``assay_id:role`` items.
+    ``--inputs-from`` is a file with one assay_id per line; a leading
+    ``assay_id`` header is skipped, the first tab-separated column is the id,
+    and a ``role`` column (named in the header) is honored when present.
+    Returns ``(ids, roles)`` where ``roles`` maps id -> role (or NULL).
     """
+    roles: dict[str, str | None] = {}
     inputs = getattr(args, "inputs", None)
     if inputs:
-        return [s.strip() for s in inputs.split(",") if s.strip()]
+        ids: list[str] = []
+        for item in (s.strip() for s in inputs.split(",")):
+            if not item:
+                continue
+            if ":" in item:
+                aid, role = item.split(":", 1)
+                aid, role = aid.strip(), role.strip() or None
+            else:
+                aid, role = item, None
+            ids.append(aid)
+            roles[aid] = role
+        return ids, roles
     inputs_from = getattr(args, "inputs_from", None)
     if inputs_from:
-        ids: list[str] = []
-        for line in Path(inputs_from).read_text().splitlines():
+        lines = Path(inputs_from).read_text().splitlines()
+        ids = []
+        role_idx: int | None = None
+        for i, line in enumerate(lines):
             s = line.strip()
-            if not s or s.lower() == "assay_id":
+            if not s:
                 continue
-            ids.append(s.split("\t")[0].strip())
-        return ids
-    return []
+            cols = [c.strip() for c in s.split("\t")]
+            if i == 0 and cols and cols[0].lower() == "assay_id":
+                if "role" in [c.lower() for c in cols]:
+                    role_idx = [c.lower() for c in cols].index("role")
+                continue
+            aid = cols[0]
+            ids.append(aid)
+            roles[aid] = (
+                cols[role_idx] if role_idx is not None and len(cols) > role_idx
+                and cols[role_idx] else None
+            )
+        return ids, roles
+    return [], {}
 
 
 # ── append-cohort ─────────────────────────────────────────────────────────────
@@ -50,7 +78,7 @@ def cmd_append_cohort(args) -> None:
     project_dir, _ = casetrack._resolve_project(args.project_dir)
     db_path = project_dir / casetrack.PROJECT_DB_NAME
 
-    inputs = _read_inputs(args)
+    inputs, roles = _read_inputs(args)
     if not inputs:
         print(
             "Error: no contributing assays — pass --inputs a,b,c or "
@@ -67,6 +95,7 @@ def cmd_append_cohort(args) -> None:
     created_by = getattr(args, "created_by", None) or (
         f"manual:{os.environ.get('USER', 'unknown')}"
     )
+    region_scope = getattr(args, "region_scope", None)
     txn_id = casetrack._new_transaction_id()
 
     conn = casetrack.open_project_db(db_path)
@@ -85,15 +114,25 @@ def cmd_append_cohort(args) -> None:
                     checksum=checksum,
                     stats_json=stats_json,
                     created_by=created_by,
+                    region_scope=region_scope,
                 )
-                ca.add_artifact_inputs(conn, art_id, inputs)
+                ca.add_artifact_inputs(conn, art_id, inputs, roles=roles)
+                # Reference-resolve door (proposal 0013): a region_scope that
+                # names a registered ref_key auto-captures a cohort-scope
+                # reference_usage edge, so scope changes drive 0010 ref_stale.
+                # This block subsumes the earlier --uses-references-only capture.
                 refs = getattr(args, "uses_references", None)
-                if refs:
-                    from casetrack_qc import reference_artifacts as _ra
+                ref_keys = [s.strip() for s in (refs or "").split(",") if s.strip()]
+                if region_scope or ref_keys:
                     _ra.ensure_reference_schema(conn)
                     current = {r.ref_key: r.version
                                for r in _ra.list_references(conn)}
-                    for ref_key in [s.strip() for s in refs.split(",") if s.strip()]:
+                    # A region_scope matching a registered key tracks ref-staleness;
+                    # a label-only scope (no matching key) is legal and stores as a
+                    # plain label without capturing any usage edge.
+                    if region_scope and region_scope in current:
+                        ref_keys.append(region_scope)
+                    for ref_key in dict.fromkeys(ref_keys):  # de-dupe, keep order
                         if ref_key in current:
                             _ra.record_usage(
                                 conn, scope="cohort", artifact_id=art_id,
@@ -120,6 +159,8 @@ def cmd_append_cohort(args) -> None:
                 "checksum": checksum,
                 "n_inputs": len(inputs),
                 "inputs": inputs,
+                "roles": roles,
+                "region_scope": region_scope,
                 "artifact_id": art_id,
                 "has_stats": stats_json is not None,
                 "transaction_id": txn_id,
@@ -148,6 +189,9 @@ def cmd_migrate_cohort(args) -> None:
 
     conn = casetrack.open_project_db(db_path)
     try:
+        # NOTE: this guard only checks table presence. A post-0009/pre-0013 project
+        # (tables exist but lack region_scope/role) is upgraded via `migrate-region-scope`,
+        # not here.
         if ca.cohort_artifacts_schema_exists(conn):
             print("No migration needed — cohort-artifact schema already in place.")
             return
@@ -173,6 +217,66 @@ def cmd_migrate_cohort(args) -> None:
         conn.close()
 
 
+# ── migrate-region-scope ─────────────────────────────────────────────────────
+
+
+def _region_scope_columns_present(conn) -> bool:
+    """True when both 0013 columns already exist on the cohort-artifact tables."""
+    if not ca.cohort_artifacts_schema_exists(conn):
+        return False
+    art_cols = {r[1] for r in conn.execute(
+        'PRAGMA table_info("cohort_artifacts")').fetchall()}
+    in_cols = {r[1] for r in conn.execute(
+        'PRAGMA table_info("cohort_artifact_inputs")').fetchall()}
+    return "region_scope" in art_cols and "role" in in_cols
+
+
+def cmd_migrate_region_scope(args) -> None:
+    """Additive: add region_scope/role columns to a post-0009 / pre-0013 project.
+
+    Mirrors ``cmd_migrate_cohort`` exactly: resolve project → open db → one
+    ``begin_immediate`` write → provenance entry.
+    """
+    # Upgrade path — bypass the legacy gate so we can operate on older projects.
+    project_dir, _ = casetrack._resolve_project(
+        args.project_dir, bypass_legacy_gate=True
+    )
+    db_path = project_dir / casetrack.PROJECT_DB_NAME
+
+    conn = casetrack.open_project_db(db_path)
+    try:
+        if not ca.cohort_artifacts_schema_exists(conn):
+            print(
+                "Error: project has no cohort-artifact schema. Run "
+                f"`casetrack migrate-cohort --project-dir {project_dir}` first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if _region_scope_columns_present(conn):
+            print("No migration needed — region_scope/role columns already present.")
+            return
+        if getattr(args, "dry_run", False):
+            print(
+                "[dry-run] Would add cohort_artifacts.region_scope and "
+                "cohort_artifact_inputs.role (additive ALTER TABLE)."
+            )
+            return
+        txn_id = casetrack._new_transaction_id()
+        with casetrack.begin_immediate(conn):
+            executed = ca.ensure_region_scope_columns(conn)
+        casetrack.log_project_provenance(
+            project_dir,
+            {
+                "action": "migrate_region_scope",
+                "executed_sql": executed,
+                "transaction_id": txn_id,
+            },
+        )
+        print(f"Added region_scope/role columns ({len(executed)} statements).")
+    finally:
+        conn.close()
+
+
 # ── cohort-artifacts (list + staleness) ──────────────────────────────────────
 
 
@@ -188,6 +292,7 @@ def _artifact_rows(conn) -> list[dict]:
                 "run_tag": art.run_tag,
                 "path": art.path,
                 "n_inputs": art.n_inputs,
+                "region_scope": art.region_scope,
                 "stale": len(censored) > 0,
                 "n_censored_inputs": len(censored),
                 "censored_inputs": censored,
@@ -211,6 +316,9 @@ def cmd_cohort_artifacts(args) -> None:
             sys.exit(1)
 
         rows = _artifact_rows(conn)
+        scope = getattr(args, "scope", None)
+        if scope is not None:
+            rows = [r for r in rows if r["region_scope"] == scope]
         if getattr(args, "stale_only", False):
             rows = [r for r in rows if r["stale"]]
 
@@ -218,11 +326,11 @@ def cmd_cohort_artifacts(args) -> None:
         if fmt == "json":
             print(json.dumps(rows, indent=2))
         elif fmt == "tsv":
-            cols = ["artifact_id", "analysis", "run_tag", "n_inputs",
+            cols = ["artifact_id", "analysis", "run_tag", "region_scope", "n_inputs",
                     "stale", "n_censored_inputs", "path"]
             print("#" + "\t".join(cols))
             for r in rows:
-                print("\t".join(str(r[c]) for c in cols))
+                print("\t".join("" if r[c] is None else str(r[c]) for c in cols))
         else:
             if not rows:
                 print("No cohort artifacts.")
@@ -233,6 +341,8 @@ def cmd_cohort_artifacts(args) -> None:
                     f"[{flag}] {r['analysis']}/{r['run_tag']}  "
                     f"id={r['artifact_id']}  inputs={r['n_inputs']}"
                 )
+                if r["region_scope"]:
+                    line += f"  scope={r['region_scope']}"
                 if r["stale"]:
                     line += (
                         f"  censored={r['n_censored_inputs']} "
@@ -243,4 +353,9 @@ def cmd_cohort_artifacts(args) -> None:
         conn.close()
 
 
-__all__ = ["cmd_append_cohort", "cmd_migrate_cohort", "cmd_cohort_artifacts"]
+__all__ = [
+    "cmd_append_cohort",
+    "cmd_migrate_cohort",
+    "cmd_migrate_region_scope",
+    "cmd_cohort_artifacts",
+]
