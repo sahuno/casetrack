@@ -56,6 +56,34 @@
       "prompt": "I have 3 separate casetrack projects on this machine using overlapping patient cohorts: project_demo (ONT WGS), and hypothetically project_demo_b (RNA-seq) and project_demo_c (CITE-seq). I want to find which patient_ids exist in all 3 projects. How would I do this with casetrack? Walk me through the discovery and the queries.",
       "expected_output": "Agent uses `mcp__casetrack__casetrack_list_projects` first to enumerate registered projects, then uses `mcp__casetrack__casetrack_query` against each project to get patient_ids. Notes that the comparison is done client-side (each casetrack project has its own DB; there's no cross-project JOIN built in). Suggests scripting it via Python or shell. Should NOT invent a `casetrack cohort-overlap` command if it doesn't exist; should mention `casetrack cohort` if it knows it.",
       "files": []
+    },
+    {
+      "id": 8,
+      "name": "register-cohort-from-wide-sheet",
+      "prompt": "I have a single wide TSV (cohort.tsv) with one row per assay and columns for patient_id, specimen_id, assay_id, sex, condition, tissue_site, assay_type, and pod5_path — about 24 rows for 6 patients × 2 specimens × 2 assays. I just ran `casetrack init` on a fresh project and my casetrack.toml has the required columns declared on each level. What's the fastest way to load all three levels (patients, specimens, assays) into the DB in one shot?",
+      "expected_output": "Agent uses `casetrack register-cohort --project-dir . --samplesheet cohort.tsv --dry-run` to preview, then runs the same command without `--dry-run` to commit. Identifies this as a v0.10 / proposal 0012 feature. Notes that the entire load happens in a single transaction — patients, specimens, and assays land atomically (no partial state if any row violates a constraint). Should NOT recommend three separate `add-metadata --level patient/specimen/assay` calls as the primary answer (still legal but slower and non-atomic). Should NOT use `append` for entity loading.",
+      "files": []
+    },
+    {
+      "id": 9,
+      "name": "reference-version-bump-staleness",
+      "prompt": "I just edited casetrack.toml to bump my dbSNP reference version from 156 to 157 (the path is the same, just a newer file in place). I ran `casetrack schema apply` to register the new version. Now I want to know: which of my analyses recorded against the old dbSNP version are now stale and need to be re-run? Show me how to query this.",
+      "expected_output": "Agent uses `casetrack references --project-dir . --stale-only` to list reference-stale outputs, or queries the `_reference_usage` view directly (`SELECT * FROM _reference_usage WHERE state = 'STALE'`), or queries `_cohort_artifacts WHERE ref_stale = TRUE` for cohort-level artifacts. Identifies this as proposal 0010 territory. Mentions that ref_stale is read-time and three-state (`fresh` / `STALE` / `untracked`) — staleness is re-derived on every query, not stored. Notes that ref_stale is orthogonal to the input-stale flag (a sample-censor cascade) and the derived_stale flag (transitive across artifact-to-artifact lineage from 0011). Should NOT suggest manually re-running everything; should focus on the specific stale set. Should NOT suggest editing the DB or maintaining a version-history table.",
+      "files": []
+    },
+    {
+      "id": 10,
+      "name": "dmr-cohort-artifact-with-region-scope",
+      "prompt": "I just finished a DSS DMR analysis comparing 4 tumor specimens (T1-T4) against 4 normal specimens (N1-N4) restricted to the EPDnew promoter set. The output is a BED file at /data/processed/hg38/cohort/dmr_promoters.bed.gz. My casetrack.toml already declares `[references.promoters_EPDnew]` with path and version='2026-04-14'. How do I register this DMR run as a cohort artifact such that (a) the tumor/normal design is captured per input and (b) the artifact gets automatically flagged as ref_stale if I later bump the promoters_EPDnew reference?",
+      "expected_output": "Agent uses `casetrack append-cohort --project-dir . --analysis dss_dmr --run-tag <YYYYMMDD>_hg38_promoters --path /data/processed/hg38/cohort/dmr_promoters.bed.gz --region-scope promoters_EPDnew --inputs T1:tumor,T2:tumor,T3:tumor,T4:tumor,N1:normal,N2:normal,N3:normal,N4:normal`. Identifies this as v0.11 / proposal 0013 territory. The critical insight: because `--region-scope promoters_EPDnew` matches a registered `ref_key`, casetrack auto-captures a cohort-scope `reference_usage` row, so the artifact's `ref_stale` flag tracks the panel's version automatically — no separate `--uses-references` flag is needed for that ref. The `assay_id:role` syntax in `--inputs` records the tumor/normal contrast design (descriptive only, not staleness-bearing). Should NOT suggest using `append` (sample-level). May note that listing `promoters_EPDnew` in both `--region-scope` and `--uses-references` is redundant but harmless (idempotent dedup at the `reference_usage` level).",
+      "files": []
+    },
+    {
+      "id": 11,
+      "name": "cohort-artifact-stale-from-censored-input",
+      "prompt": "Last month I registered a joint VCF via `casetrack append-cohort --analysis joint_genotyping --run-tag 20260415_hg38_v1 --inputs A1,A2,A3,A4,A5,A6 --path /data/processed/hg38/cohort/joint.vcf.gz`. Today, assay A3 turned out to have a basecalling quality issue and I censored it with `casetrack censor --level assay --id A3 --kind qc_fail`. Is the joint VCF artifact now stale, and how do I confirm? What's the right next step?",
+      "expected_output": "Agent runs `casetrack cohort-artifacts --project-dir . --stale-only` (or without `--stale-only` to inspect all) and confirms the joint VCF now shows `stale=True` with A3 listed in its censored inputs. Explains that input-staleness is read-time, derived live from the QC/consent cascade — nothing was stored at censor time; the staleness flag is re-derived on every read of the `_cohort_artifacts` view. Notes that the existing artifact row stays in the audit trail; the recommended next step is a new `append-cohort` run with a fresh `run_tag` (e.g. `20260520_hg38_v2`) excluding A3, so both runs coexist in history. Should NOT suggest manually editing the artifact row or deleting it from `cohort_artifacts`. Should NOT confuse this with `ref_stale` (reference-driven, separate flag).",
+      "files": []
     }
   ]
 }
