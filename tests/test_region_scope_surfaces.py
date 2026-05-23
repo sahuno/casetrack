@@ -101,12 +101,14 @@ def test_status_section_omits_scope_when_null(tmp_path: Path, capsys):
     conn = casetrack.open_project_db(proj / "casetrack.db")
     try:
         with casetrack.begin_immediate(conn):
-            conn.executescript(
-                "INSERT INTO patients (patient_id) VALUES ('P1');\n"
+            conn.execute("INSERT INTO patients (patient_id) VALUES ('P1')")
+            conn.execute(
                 "INSERT INTO specimens (specimen_id, patient_id, tissue_site) "
-                "VALUES ('S1', 'P1', 'tumor');\n"
+                "VALUES ('S1', 'P1', 'tumor')"
+            )
+            conn.execute(
                 "INSERT INTO assays (assay_id, specimen_id, assay_type) "
-                "VALUES ('A1', 'S1', 'ONT');"
+                "VALUES ('A1', 'S1', 'ONT')"
             )
     finally:
         conn.close()
