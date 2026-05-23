@@ -8,6 +8,7 @@ setup(
                 "hierarchy and QC / consent tracking (v0.3 / v0.4).",
     author="Samuel Ahuno",
     author_email="sahuno@mskcc.org",
+    license="Apache-2.0",
     py_modules=["casetrack"],
     packages=["casetrack_qc", "casetrack_mcp", "casetrack_lineage", "casetrack_lifecycle", "casetrack_gui"],
     package_data={"casetrack_gui": ["templates/*.html", "static/*"]},
@@ -38,6 +39,7 @@ setup(
     },
     python_requires=">=3.10",
     classifiers=[
+        "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
