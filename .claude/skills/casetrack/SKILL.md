@@ -335,6 +335,13 @@ The `run_tag` appears in `results/` paths, the `{analysis}_run_tag` columns in t
 | Output shows `STALE` after bumping a reference version | Expected — reference version changed | Re-run the analysis with a new `run_tag` once references are stable |
 | Bumped reference content but not the `version` string | Staleness not detected | Staleness keys on version string only; bump `version` in TOML to trigger detection |
 | `casetrack references` on a pre-0010 project | "no such table: reference_artifacts" | Run `casetrack migrate-references` once first |
+| `casetrack derivation` on a pre-0011 project | "no such table: artifact_derivation" | Run `casetrack migrate-derivation` once first |
+| `derived-from` cycle attempted (A → B → A) | `casetrack validate` flags acyclic-invariant violation | Lineage must be a DAG; redesign the chain or rename the offending node |
+| Surprised `derived_stale=False` after censoring an INPUT to an upstream artifact | `derived_stale` propagates artifact→artifact, not from sample-level cascades | The input-censor flips the upstream artifact's `stale=True` (input-stale); `derived_stale` then propagates downstream from there. Check the upstream's `stale` flag first |
+| `register-cohort` errors on a missing column | "no such column: X" during the patient/specimen/assay upsert | The wide TSV's columns must already be declared in TOML at the right level; edit TOML → `schema apply` → re-run |
+| `register-cohort` rejects the whole TSV with a conflict error | Two rows give the same parent ID different values (e.g. patient P1's `sex` differs across rows) | Each parent ID must have consistent values across every row that mentions it; deduplicate or fix the TSV (single-transaction load is atomic, so no partial state lands) |
+| `--region-scope LABEL` but no matching `[references.LABEL]` block | Label stored on the artifact, but `ref_stale` never trips | Expected — label-only scope is opaque. Declare `[references.LABEL]` in TOML first if you want auto-tracking via the reference-resolve door |
+| `append-cohort --region-scope` on a pre-0013 project | "no such column: region_scope" or column silently ignored | Run `casetrack migrate-region-scope` once first |
 
 ## 14. Key command cheatsheet
 
