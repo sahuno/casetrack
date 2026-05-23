@@ -5718,6 +5718,7 @@ def cmd_dashboard_project(args):
                     "analysis": a.analysis,
                     "run_tag": a.run_tag,
                     "n_inputs": a.n_inputs,
+                    "region_scope": a.region_scope,
                     "stale": bool(_stale_map.get(a.artifact_id)),
                     "censored": _stale_map.get(a.artifact_id, []),
                 }
@@ -6044,6 +6045,7 @@ def _cohort_artifacts_html(qc_info: dict | None) -> str:
             f"<td>{esc(a['analysis'])}</td>"
             f"<td class='id'>{esc(a['run_tag'])}</td>"
             f"<td>{a['n_inputs']}</td>"
+            f"<td class='id'>{esc(a.get('region_scope') or '')}</td>"
             f"<td>{badge}</td>"
             f"<td class='id'>{detail}</td>"
             "</tr>"
@@ -6053,7 +6055,7 @@ def _cohort_artifacts_html(qc_info: dict | None) -> str:
         f"{n_stale} STALE)</span></h2>"
         "<table><thead><tr>"
         "<th>analysis</th><th>run_tag</th><th>inputs</th>"
-        "<th>status</th><th>censored inputs</th>"
+        "<th>scope</th><th>status</th><th>censored inputs</th>"
         "</tr></thead><tbody>"
         f"{''.join(rows)}</tbody></table>"
     )
@@ -7667,6 +7669,8 @@ def _emit_cohort_artifacts_section(conn: sqlite3.Connection) -> None:
         censored = stale_map.get(a.artifact_id, [])
         flag = "STALE" if censored else "fresh"
         line = f"  [{flag}] {a.analysis}/{a.run_tag}  inputs={a.n_inputs}"
+        if a.region_scope:
+            line += f"  scope={a.region_scope}"
         if censored:
             line += f"  censored: {', '.join(censored)}"
         print(line)
