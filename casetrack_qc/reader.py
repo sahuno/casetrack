@@ -205,7 +205,7 @@ def install_active_views(duckdb_con) -> None:
 
 
 def install_cohort_artifact_view(duckdb_con) -> None:
-    """Attach a ``_cohort_artifacts`` DuckDB view (proposal 0009 + 0010).
+    """Attach a ``_cohort_artifacts`` DuckDB view (proposal 0009 + 0010 + 0011 + 0013).
 
     Exposes each cohort artifact with derived columns:
       - ``n_censored_inputs`` — contributing assays currently excluded by the
@@ -216,6 +216,12 @@ def install_cohort_artifact_view(duckdb_con) -> None:
         reference-usage row for this artifact has a stale version. Present only
         on 0010+ projects; absent on pre-0010 projects (view still created
         without the column so ``query`` continues to work).
+      - ``region_scope`` — free-text scope label from ``cohort_artifacts`` (0013);
+        NULL when the artifact is unscoped. NULL on pre-0013 projects (column absent).
+      - ``scope_ref_key`` — the matching ``ref_key`` from ``reference_artifacts``
+        when ``region_scope`` coincides with a declared reference; NULL when the
+        scope is a free-text label or the artifact is unscoped. Always NULL on
+        pre-0010 projects (reference table absent).
 
     Silent no-op on projects without the cohort-artifact tables (pre-0009).
     """

@@ -59,6 +59,35 @@ def _project_with_scoped_artifacts(tmp_path: Path) -> Path:
     return proj
 
 
+def test_view_on_pre_0013_db_emits_null_scope_columns(tmp_path: Path):
+    """Pre-0013 project: ``region_scope`` column absent → view still installs
+    and both new columns are NULL for every row.
+
+    Uses Approach A (``ALTER TABLE … DROP COLUMN``); SQLite ≥ 3.35 required.
+    """
+    proj = _project_with_scoped_artifacts(tmp_path)
+    # Simulate a pre-0013 DB by dropping the region_scope column that
+    # cmd_append_cohort wrote.  Approach A: ALTER TABLE DROP COLUMN.
+    conn = casetrack.open_project_db(proj / "casetrack.db")
+    with casetrack.begin_immediate(conn):
+        conn.execute("ALTER TABLE cohort_artifacts DROP COLUMN region_scope")
+    conn.close()
+
+    # The view must install cleanly and return NULL for both scope columns.
+    con = casetrack._prepare_v03_query_connection(proj / "casetrack.db")
+    try:
+        rows = con.execute(
+            'SELECT region_scope, scope_ref_key FROM "_cohort_artifacts"'
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert len(rows) > 0, "expected at least one artifact row"
+    for region_scope, scope_ref_key in rows:
+        assert region_scope is None, f"expected NULL region_scope, got {region_scope!r}"
+        assert scope_ref_key is None, f"expected NULL scope_ref_key, got {scope_ref_key!r}"
+
+
 def test_view_exposes_region_scope_and_scope_ref_key(tmp_path: Path):
     proj = _project_with_scoped_artifacts(tmp_path)
     con = casetrack._prepare_v03_query_connection(proj / "casetrack.db")
