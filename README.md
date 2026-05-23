@@ -338,6 +338,9 @@ and exact SQL.
 | `derivation`     | **v0.9** — inspect the full derivation graph / derived-stale state (`--node`, `--stale-only`, `--fmt`) (proposal 0011) |
 | `migrate-derivation` | **v0.9** — additive: create the `artifact_derivation` table on a pre-0011 project |
 | `register-cohort` | **v0.10** — load patients + specimens + assays from one wide sample sheet in a single transaction; schema-driven column routing, pre-write integrity validation, `--dry-run` preview (proposal 0012) |
+| `append-cohort --region-scope LABEL` | **v0.11** — tag a cohort artifact with a genomic scope label (`genome-wide`, a panel key, or `chr:start-end`); pair with `--inputs assay:role` for contrast roles (proposal 0013) |
+| `cohort-artifacts --scope LABEL` | **v0.11** — filter cohort artifacts by `region_scope` label (proposal 0013) |
+| `migrate-region-scope` | **v0.11** — additive: add `region_scope` / `role` columns on a pre-0013 project |
 
 `casetrack <cmd> --help` for the full option list on any subcommand.
 

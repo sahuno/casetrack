@@ -3,9 +3,9 @@
 | | |
 |---|---|
 | **Author** | Samuel Ahuno ([ekwame001@gmail.com](mailto:ekwame001@gmail.com)) |
-| **Status** | **Draft** |
+| **Status** | **Shipped (v0.11.0)** |
 | **Date** | 2026-05-22 |
-| **Target release** | TBD (post-v0.10; confirm numbering before implementation) |
+| **Target release** | **v0.11.0** |
 | **Depends on** | Proposal 0009 (cohort-level artifacts), Proposal 0010 (reference artifacts) |
 | **Target HPC** | IRIS @ MSKCC (WekaFS, SLURM, Apptainer) |
 

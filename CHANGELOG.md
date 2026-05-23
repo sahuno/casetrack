@@ -4,6 +4,41 @@ All notable changes to `casetrack` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-05-23
+
+Region-scoped artifacts and contrast roles — a genomic scope label on each
+cohort artifact and a contrast role per input assay, with reference-resolve
+auto-capture so scope-version bumps drive the existing `ref_stale` flag. See
+[proposal 0013](docs/proposals/0013-region-scoped-artifacts.md).
+
+### Added
+
+- **`cohort_artifacts.region_scope`** (nullable) — a genomic scope label on
+  each cohort artifact (`genome-wide`, a panel key, or a raw
+  `chr:start-end`).
+- **`cohort_artifact_inputs.role`** (nullable) — contrast role per input
+  (`tumor` / `normal` / …); descriptive, not staleness-bearing.
+- **Reference-resolve door**: a `region_scope` that matches a registered
+  reference key (0010) auto-captures a cohort-scope `reference_usage` edge,
+  so scope-version changes drive the existing `ref_stale` flag — no new
+  staleness code.
+- **`append-cohort --region-scope LABEL`**; `--inputs assay:role` syntax;
+  optional `role` column in `--inputs-from`.
+- **`cohort-artifacts --scope <label>`** filter; `region_scope` in
+  table/tsv/json output (NULL → empty in TSV).
+- **`migrate-region-scope`** — additive ALTER for pre-0013 projects.
+- **`_cohort_artifacts` DuckDB view** gains `region_scope` + derived
+  `scope_ref_key` (presence-guarded across all 3 tiers).
+- `region_scope` surfaced in `status`, the HTML dashboard, the
+  `casetrack_cohort_artifacts` MCP tool, and `export`.
+
+### Notes
+
+- Fully additive and backward-compatible: pre-0013 artifacts read as
+  `region_scope = NULL` and inputs as `role = NULL`.
+- Deferred (proposal 0013 §7): per-region findings store, interval/overlap
+  queries, scope on sample-level analyses (A2), and any-node scope (A3).
+
 ## [0.10.0] — 2026-05-22
 
 One-shot cohort registration from a wide sample sheet — load patients,
