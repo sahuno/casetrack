@@ -32,7 +32,7 @@ Ask yourself: am I registering an entity (adding a new patient/specimen/assay ro
 | Filter cohort artifacts by scope (v0.11 / proposal 0013) | `casetrack cohort-artifacts` | `--project-dir . --scope <label> [--fmt table\|tsv\|json]` |
 | Add `region_scope`/`role` columns to a pre-0013 project (v0.11) | `casetrack migrate-region-scope` | `--project-dir . [--dry-run]` |
 | See overall progress | `casetrack status` | `--project-dir .` |
-| Run arbitrary SQL | `casetrack query` | `--project-dir . --sql "..."` |
+| Run arbitrary SQL | `casetrack query` | `--project-dir . "<SQL>"` (SQL is positional) |
 | Inspect current DB schema | `casetrack schema show` | `--project-dir .` |
 
 Always use `--project-dir <path>` (project mode). `--manifest <tsv>` is legacy flat mode — never use it for new work.
@@ -273,7 +273,7 @@ QC kinds: `qc_fail`, `qc_warn`, `consent_revoked`, `sequencing_run_failed`, `lib
 casetrack status --project-dir .
 
 # Arbitrary SQL
-casetrack query --project-dir . --sql "SELECT ..."
+casetrack query --project-dir . "SELECT ..."
 
 # Via MCP inside Claude Code
 mcp__casetrack__casetrack_list_projects
@@ -404,7 +404,7 @@ casetrack migrate-references --project-dir . [--dry-run]
 
 # Queries
 casetrack status --project-dir .
-casetrack query  --project-dir . --sql "SELECT ... FROM _active WHERE ..."
+casetrack query --project-dir . "SELECT ... FROM _active WHERE ..."
 
 # Validation
 casetrack validate --project-dir .
@@ -626,7 +626,7 @@ casetrack cohort-artifacts --project-dir . --scope myeloid_panel_v2 --fmt tsv
 
 # region_scope is in the `_cohort_artifacts` DuckDB view, plus a derived `scope_ref_key`
 # (= region_scope iff it resolves to a registered reference key, else NULL):
-casetrack query --project-dir . --sql \
+casetrack query --project-dir . \
   "SELECT analysis, run_tag, region_scope, scope_ref_key, stale, ref_stale, derived_stale
      FROM _cohort_artifacts WHERE scope_ref_key IS NOT NULL"
 ```

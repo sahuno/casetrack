@@ -58,7 +58,7 @@ ORDER BY p.patient_id;
 
 Convert to CSV:
 ```bash
-casetrack query --project-dir . --sql "<above>" --fmt csv > pending_normals.csv
+casetrack query --project-dir . --fmt csv "<above>" > pending_normals.csv
 nextflow run main.nf --input pending_normals.csv ...
 ```
 

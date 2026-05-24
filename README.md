@@ -728,7 +728,7 @@ Then any tool that needs work to do queries the DB:
 
 ```bash
 # All normals that are ready to basecall but haven't been
-casetrack query --project hgsoc-2026 --fmt csv --sql "
+casetrack query --project hgsoc-2026 --fmt csv "
   SELECT a.assay_id    AS sample,
          p.patient_id  AS patient,
          s.specimen_id AS specimen,
