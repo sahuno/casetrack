@@ -1,0 +1,33 @@
+{
+  "name": "casetrack",
+  "version": "0.11.0",
+  "description": "Manifest-centric case management for bioinformatics cohorts on HPC: tracks which analyses are done, which samples are usable, and the lineage of cohort / reference / derived artifacts (proposals 0009-0013).",
+  "author": {
+    "name": "Samuel Ahuno",
+    "email": "ekwame001@gmail.com"
+  },
+  "homepage": "https://github.com/sahuno/casetrack",
+  "license": "Apache-2.0",
+
+  "commands": ["./commands/casetrack-status.md"],
+
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/session-start.sh"
+          }
+        ]
+      }
+    ]
+  },
+
+  "mcpServers": {
+    "casetrack": {
+      "command": "casetrack-mcp",
+      "args": []
+    }
+  }
+}
