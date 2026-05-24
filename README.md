@@ -5,6 +5,10 @@
 Answers two questions about a multi-patient, multi-specimen, multi-assay
 cohort: "*is this analysis complete?*" and "*is this sample usable?*"
 
+> **New to casetrack?** Start with the **[15-minute Quickstart](QUICKSTART.md)** —
+> clone → init → register a 3-patient demo cohort → record an analysis →
+> query for pending work. No prior knowledge assumed.
+
 Storage layers, one CLI:
 - **v0.10 (current, alpha)**: `register-cohort` — load patients + specimens
   + assays from one schema-native wide sample sheet in a single transaction
