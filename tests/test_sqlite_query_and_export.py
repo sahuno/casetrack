@@ -148,6 +148,21 @@ def test_query_writes_to_output_file(cohort: Path, tmp_path: Path):
     assert data == [{"n": 3}]
 
 
+def test_query_table_format_on_empty_result_set(cohort: Path, capsys):
+    """Regression: `--fmt table` (the default) over a zero-row project-mode
+    result must not crash. The width-calculation `max(len(c), *generator)`
+    in _emit_query_rows collapsed to `max(int)` and raised TypeError when
+    the per-column generator was empty (no rows). Found while verifying
+    QUICKSTART.md end-to-end."""
+    casetrack.cmd_query(_query_ns(
+        cohort, "SELECT assay_id FROM assays WHERE 1=0", fmt="table",
+    ))
+    out = capsys.readouterr().out
+    # Header row + separator must be present even on empty result.
+    assert "assay_id" in out
+    assert "--------" in out
+
+
 def test_query_bad_sql_exits_two(cohort: Path, capsys):
     with pytest.raises(SystemExit) as excinfo:
         casetrack.cmd_query(_query_ns(cohort, "SELECT * FROM nonexistent"))

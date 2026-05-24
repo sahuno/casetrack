@@ -6289,7 +6289,9 @@ def _emit_query_rows(rows, cols, *, fmt: str, output: str | None) -> None:
             buf.write(sep.join("" if v is None else str(v) for v in r) + "\n")
         text = buf.getvalue()
     else:  # table
-        widths = [max(len(c), *(len(str(v if v is not None else "")) for v in col_vals))
+        # NB: pass max() a list, not *generator — an empty rows set otherwise
+        # collapses to max(int) which raises "'int' object is not iterable".
+        widths = [max([len(c), *(len(str(v if v is not None else "")) for v in col_vals)])
                   for c, col_vals in zip(cols, zip(*rows) if rows else [[] for _ in cols])]
         lines = [
             "  ".join(c.ljust(w) for c, w in zip(cols, widths)),
