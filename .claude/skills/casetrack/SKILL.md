@@ -513,14 +513,32 @@ The staleness reason names the specific reference(s) that changed (`genome: hg38
 5. casetrack references  →  those outputs now show fresh
 ```
 
-### Orthogonality with 0009
+### Orthogonality of the three staleness flags
 
-A cohort artifact (0009) can have **two independent staleness flags**:
+A cohort artifact can carry up to **three independent staleness flags**, derived live on every read. None of them interact — an artifact can be any combination of fresh/stale across all three.
 
-- `input_stale` (0009) — a contributing assay was censored or consent-revoked.
-- `ref_stale` (0010) — a reference version changed since the artifact was built.
+| Flag | Source | Trips when… | Clears when… |
+|---|---|---|---|
+| `stale` (input-stale, 0009) | `cohort_artifact_inputs` + QC cascade | A contributing assay/specimen/patient is censored or consent-revoked | The censor is lifted (`uncensor`) — recomputed at every read |
+| `ref_stale` (0010) | `reference_usage` row's `version_used` vs `reference_artifacts.version` | A reference declared in TOML had its `version` bumped | The analysis is re-run with a new `run_tag` (captures the current version) |
+| `derived_stale` (0011) | `artifact_derivation` traversal | Any upstream node in the derivation DAG is stale by **any** cause (input-stale, ref-stale, or derived-stale — recursive) | Resolving the upstream's cause — recomputed at every read |
 
-Both are derived live; both appear in `casetrack cohort-artifacts` output and the `_cohort_artifacts` DuckDB view. An artifact can be `input_stale`, `ref_stale`, both, or neither — they don't interact.
+**Each cause flips exactly one flag.** A reference bump never trips `stale`. A censored input never trips `ref_stale`. The flags' interaction surfaces only through `derived_stale`: a downstream artifact's `derived_stale=True` covers the case where any upstream node is stale by any cause whatsoever.
+
+Worked example — artifact X with 6 input assays, one declared reference `promoters_EPDnew`, and one upstream artifact U it derives from:
+
+```
+event                                       stale  ref_stale  derived_stale
+─────────────────────────────────────────── ─────  ─────────  ─────────────
+initial — everything fresh                    F       F            F
+censor input assay A3 (QC fail)               T       F            F
+uncensor A3 (rsync completed)                 F       F            F
+bump promoters_EPDnew version in TOML         F       T            F
+upstream U becomes input-stale                F       T            T   ← inherited from U
+restore U + revert promoters bump             F       F            F
+```
+
+All three flags appear as columns in `casetrack cohort-artifacts`, the `_cohort_artifacts` DuckDB view, the `status` section, the HTML dashboard, and the MCP tool. None are stored — every read recomputes them from the underlying tables.
 
 ### Capture paths
 
