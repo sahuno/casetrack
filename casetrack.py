@@ -2850,6 +2850,18 @@ def _render_dashboard_html(manifest, key_col: str, done_cols: list,
   details .missing {{ font-family: ui-monospace, monospace; font-size: 12px;
                       color: var(--muted); margin-top: 4px;
                       word-break: break-all; }}
+  details.section {{ margin: 24px 0 12px 0; }}
+  details.section > summary {{ cursor: pointer; list-style: none;
+                                font-size: 16px; font-weight: 600;
+                                border-bottom: 1px solid var(--border);
+                                padding: 8px 0 6px; margin-bottom: 12px;
+                                color: var(--fg); }}
+  details.section > summary::-webkit-details-marker {{ display: none; }}
+  details.section > summary::before {{ content: "▸ "; color: var(--accent);
+                                        display: inline-block; width: 1em; }}
+  details.section[open] > summary::before {{ content: "▾ "; }}
+  details.section > summary .count {{ font-size: 12px; font-weight: 400;
+                                       color: var(--muted); margin-left: 8px; }}
   .heatmap {{ overflow: auto; border: 1px solid var(--border);
               border-radius: 4px; background: white; }}
   .heatmap table {{ border-collapse: collapse; font-size: 11px; }}
@@ -2891,7 +2903,10 @@ def _render_dashboard_html(manifest, key_col: str, done_cols: list,
 """
 
     # Per-analysis progress
-    analysis_html = ['<h2>Analyses</h2>']
+    analysis_html = [
+        '<details class="section" open>'
+        f'<summary>Analyses<span class="count">({len(per_analysis)})</span></summary>'
+    ]
     if not per_analysis:
         analysis_html.append(
             '<div class="muted">No analyses recorded yet. '
@@ -2914,8 +2929,17 @@ def _render_dashboard_html(manifest, key_col: str, done_cols: list,
                 f'<div class="missing">{missing_str}</div></details>'
             )
 
-    # Heatmap
-    heatmap_html = ['<h2>Per-sample heatmap</h2>']
+    # Heatmap — heaviest section, collapsed by default. Toggle scales gracefully
+    # to larger cohorts where the full table dominates the page.
+    n_samples_disp = len(sample_ids) if sample_ids else 0
+    n_analyses_disp = len(analyses) if analyses else 0
+    heatmap_html = [
+        '</details>'  # close the Analyses section above
+        '<details class="section">'
+        f'<summary>Per-sample heatmap'
+        f'<span class="count">({n_samples_disp} samples × {n_analyses_disp} analyses)</span>'
+        '</summary>'
+    ]
     if done_matrix is None or not sample_ids:
         heatmap_html.append('<div class="muted">Nothing to display.</div>')
     else:
@@ -2937,7 +2961,11 @@ def _render_dashboard_html(manifest, key_col: str, done_cols: list,
         heatmap_html.extend(rows)
 
     # Provenance timeline (reverse chronological, capped)
-    timeline_html = ['<h2>Provenance timeline</h2>']
+    timeline_html = [
+        '</details>'  # close the Heatmap section above
+        '<details class="section" open>'
+        f'<summary>Provenance timeline<span class="count">({len(prov_entries)} events)</span></summary>'
+    ]
     if not prov_entries:
         timeline_html.append('<div class="muted">No provenance log found.</div>')
     else:
@@ -2982,6 +3010,7 @@ def _render_dashboard_html(manifest, key_col: str, done_cols: list,
         timeline_html.append('</ul>')
 
     footer = (
+        '</details>'  # close the Provenance timeline section
         f'<div class="footer">casetrack dashboard · '
         f'manifest: {esc(manifest_path)} · '
         f'schema analyses: {esc(", ".join(schema.keys()) or "—")}</div>'
@@ -5959,6 +5988,18 @@ def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
   table.assays td.missing {{ background: var(--missing-bg); text-align: center; }}
   .badge {{ display: inline-block; background: var(--missing-bg); color: var(--muted);
             padding: 1px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }}
+  details.section {{ margin: 24px 0 12px 0; }}
+  details.section > summary {{ cursor: pointer; list-style: none;
+                                font-size: 16px; font-weight: 600;
+                                border-bottom: 1px solid var(--border);
+                                padding: 8px 0 6px; margin-bottom: 12px;
+                                color: var(--fg); }}
+  details.section > summary::-webkit-details-marker {{ display: none; }}
+  details.section > summary::before {{ content: "▸ "; color: var(--accent);
+                                        display: inline-block; width: 1em; }}
+  details.section[open] > summary::before {{ content: "▾ "; }}
+  details.section > summary .count {{ font-size: 12px; font-weight: 400;
+                                       color: var(--muted); margin-left: 8px; }}
 </style>
 </head>
 <body>
@@ -5981,9 +6022,11 @@ def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
 
   {_qc_chips_html(qc_info)}
 
-  <h2>Per-analysis completion (assay level)</h2>
-  {"".join(per_analysis_html) if per_analysis_html
-     else '<p class="muted">No assay-level analyses recorded yet.</p>'}
+  <details class="section" open>
+    <summary>Per-analysis completion (assay level)<span class="count">({len(per_analysis_html)})</span></summary>
+    {"".join(per_analysis_html) if per_analysis_html
+       else '<p class="muted">No assay-level analyses recorded yet.</p>'}
+  </details>
 
   {_qc_excluded_html(qc_info)}
 
@@ -5993,9 +6036,11 @@ def _render_v03_dashboard_html(*, project_dir: Path, schema: dict,
 
   {_derivation_html(qc_info)}
 
-  <h2>Patients</h2>
-  {"".join(body_sections) if body_sections
-     else '<p class="muted">No patients registered yet.</p>'}
+  <details class="section" open>
+    <summary>Patients<span class="count">({len(patients)})</span></summary>
+    {"".join(body_sections) if body_sections
+       else '<p class="muted">No patients registered yet.</p>'}
+  </details>
 </body></html>
 """
 
@@ -6051,13 +6096,16 @@ def _cohort_artifacts_html(qc_info: dict | None) -> str:
             "</tr>"
         )
     return (
-        f"<h2>Cohort artifacts <span class='muted'>({len(arts)} total, "
-        f"{n_stale} STALE)</span></h2>"
+        '<details class="section" open>'
+        f"<summary>Cohort artifacts"
+        f"<span class='count'>({len(arts)} total, {n_stale} STALE)</span>"
+        "</summary>"
         "<table><thead><tr>"
         "<th>analysis</th><th>run_tag</th><th>inputs</th>"
         "<th>scope</th><th>status</th><th>censored inputs</th>"
         "</tr></thead><tbody>"
         f"{''.join(rows)}</tbody></table>"
+        "</details>"
     )
 
 
@@ -6089,13 +6137,16 @@ def _references_html(qc_info: dict | None) -> str:
     else:
         badge = '<span class="qc-chip qc-chip-grey">all fresh</span>'
     return (
-        f"<h2>References <span class='muted'>({len(refs)} declared, "
-        f"{n_stale} stale output(s))</span></h2>"
+        '<details class="section" open>'
+        f"<summary>References"
+        f"<span class='count'>({len(refs)} declared, {n_stale} stale output(s))</span>"
+        "</summary>"
         f"{badge}"
         "<table><thead><tr>"
         "<th>ref_key</th><th>version</th><th>kind</th>"
         "</tr></thead><tbody>"
         f"{''.join(rows)}</tbody></table>"
+        "</details>"
     )
 
 
@@ -6133,14 +6184,17 @@ def _derivation_html(qc_info: dict | None) -> str:
     else:
         badge = '<span class="qc-chip qc-chip-grey">0 derived-stale</span>'
     return (
-        f"<h2>Derivation <span class='muted'>({len(edges)} edge(s), "
-        f"{n_stale} derived-stale)</span></h2>"
+        '<details class="section" open>'
+        f"<summary>Derivation"
+        f"<span class='count'>({len(edges)} edge(s), {n_stale} derived-stale)</span>"
+        "</summary>"
         f"{badge}"
         f"{stale_block}"
         "<table><thead><tr>"
         "<th>derived node</th><th>derives from</th>"
         "</tr></thead><tbody>"
         f"{rows}</tbody></table>"
+        "</details>"
     )
 
 
@@ -6162,11 +6216,13 @@ def _qc_excluded_html(qc_info: dict | None) -> str:
             "</tr>"
         )
     return (
-        '<h2>Excluded (active QC events)</h2>'
+        '<details class="section" open>'
+        f'<summary>Excluded (active QC events)<span class="count">({len(events)})</span></summary>'
         '<table class="qc-events">'
         '<thead><tr><th>Level</th><th>Entity</th><th>Kind</th>'
         '<th>Source</th><th>Created</th><th>Reason</th></tr></thead>'
         f'<tbody>{"".join(rows)}</tbody></table>'
+        '</details>'
     )
 
 
