@@ -1,7 +1,9 @@
 # Containers for the hgsoc_sim demo
 
-Four images are needed. All are pullable from public registries without auth.
-Total disk: ~300 MB.
+Four images are needed for the default DNA lane; two extras (gffread +
+NanoSim) are needed if you opt into the [real-RNA lane](../README.md#optional-real-rna-lane).
+All are pullable from public registries without auth. Total disk:
+~300 MB (DNA) + ~200 MB (RNA).
 
 ## Recommended pulls (Apptainer — IRIS-style)
 
@@ -79,3 +81,40 @@ per-base accuracy and a different systematic error profile. Badread's
 If you need a faster, container-free fallback, `VISOR LASeR` is still
 invokable from the same container and will produce usable R9.4.1 BAMs —
 swap the Step-2 section of `02_run_visor.sh` accordingly.
+
+## Optional: real-RNA lane (NanoSim)
+
+The default DNA lane (VISOR + Badread) does not cover ONT-RNA. The
+optional RNA lane (scripts `00b` / `00c` / `01b` / `02b`) pulls in two
+extra tools:
+
+```bash
+# gffread — slices the GENCODE GTF per reference slice, extracts transcript FASTAs.
+apptainer pull --dir "$CONTAINER_DIR" \
+    gffread_0.12.7.sif \
+    docker://quay.io/biocontainers/gffread:0.12.7--h9a82719_0
+
+# NanoSim — transcriptome-mode ONT cDNA read simulation.
+apptainer pull --dir "$CONTAINER_DIR" \
+    nanosim_3.2.3.sif \
+    docker://quay.io/biocontainers/nanosim:3.2.3--hdfd78af_2
+```
+
+`minimap2` and `samtools` are re-used from the DNA lane (splice-aware
+mode: `-ax splice -uf -k14`).
+
+**Caveat — chemistry mismatch.** NanoSim ships pre-trained models at
+<https://github.com/bcgsc/NanoSim/tree/master/pre-trained_models>; the
+only human-cDNA model currently available is R9.4.1
+(`human_NA12878_cDNA_Bham1_guppy`), whereas the real HGSOC cohort uses
+R10.4.1. For exercising the casetrack multi-assay QC paths the cDNA-vs-DNA
+distinction matters more than the chemistry generation, so `00c_fetch_nanosim_model.sh`
+downloads that model by default. Override with `NANOSIM_MODEL=…` if you
+have a newer training profile of your own.
+
+Docker fallback:
+
+```bash
+docker pull quay.io/biocontainers/gffread:0.12.7--h9a82719_0
+docker pull quay.io/biocontainers/nanosim:3.2.3--hdfd78af_2
+```

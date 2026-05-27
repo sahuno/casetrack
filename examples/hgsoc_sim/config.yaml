@@ -18,6 +18,18 @@
 #   insertion     - literal insert (alt = sequence string)
 #   inversion     - inversion of the region (length required)
 #   duplication   - tandem dup of the region (length required)
+#
+# Optional per-specimen `rna:` block (real-RNA lane):
+#   Any specimen may carry an `rna:` block. If present, the RNA lane
+#   (scripts 00b/00c/01b/02b) produces a splice-aware ONT-RNA BAM at
+#   cohort/<patient>/<specimen>/rna/sim.srt.bam. Specimens without an
+#   `rna:` block are skipped. Example:
+#
+#       rna:
+#         n_reads: 20000
+#         expression:
+#           gene_multipliers:
+#             BRCA1: 0.1       # drop BRCA1 transcripts 10x (LOF proxy)
 
 reference:
   source_url: "https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.17.fa.gz"
@@ -53,6 +65,12 @@ cohort:
         assay_type: ONT
         coverage: 35
         purity: 70             # 30% normal contamination
+        # Opt-in RNA lane: BRCA1 knocked down 10x to mirror the LOF somatic call above.
+        rna:
+          n_reads: 20000
+          expression:
+            gene_multipliers:
+              BRCA1: 0.1
 
   - patient_id: HGSOC_SIM_02
     # Broken pair — same design as SIM_01, but the normal BAM is deliberately
@@ -68,6 +86,12 @@ cohort:
         assay_type: ONT
         coverage: 25            # will be truncated to ~2x post-sim
         purity: 100
+        # Opt-in RNA lane: low-read count reinforces the broken-library story on the DNA side.
+        rna:
+          n_reads: 2000         # deliberately low — mirrors DNA normal being truncated
+          expression:
+            gene_multipliers:
+              BRCA1: 1.0
       - id_suffix: tumor
         tissue_site: tumor
         assay_type: ONT
