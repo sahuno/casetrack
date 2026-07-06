@@ -14,6 +14,7 @@ Manifest-centric case management CLI for bioinformatics pipelines on HPC (SLURM)
 
 | File | What it tells you |
 |---|---|
+| `docs/proposals/0014-enterprise-provenance-platform.md` | **Vision / exploratory (not shipped).** Enterprise successor platform: one tamper-evident event log projected into reproducibility + catalog/lineage + compliance read models. §3 = greenfield-core-concept-inherited recommendation; §7 = phasing; §8 risk 4 = build-vs-buy catalog wedge; §9 = casetrack→PROV mapping. |
 | `docs/proposals/0013-region-scoped-artifacts.md` | **The shipped region-scoped-artifacts design.** Nullable `region_scope` on cohort artifacts + nullable `role` on inputs; reference-resolve auto-capture so scope-version bumps drive the existing `ref_stale` flag (no new staleness code). |
 | `docs/proposals/0011-artifact-to-artifact-lineage.md` | **The shipped artifact-lineage design.** Generic `derived-from` edge between any two lineage nodes; transitive `derived_stale` flag; `artifact_derivation` sibling table. §0 = nine locked decisions; §7 = rejected alternatives. |
 | `docs/proposals/0010-reference-artifacts.md` | **The shipped reference-artifacts design.** Versioned upstream inputs (genome, GTF, dbSNP) with read-time downstream staleness via two additive sibling tables. §6.2 = three-state staleness + orthogonality to 0009; §7 = why no 4th level / no version-history table. |
